@@ -24,7 +24,7 @@ async def list_stocks(
     high_prob_only: bool = Query(False, description="Filter to probability >= 0.6"),
     min_probability: float = Query(0.0, ge=0.0, le=1.0),
     limit: int = Query(200, ge=1, le=1000),
-    sort: str = Query("overall_score", regex="^(overall_score|probability|market_cap|ticker)$"),
+    sort: str = Query("overall_score", pattern="^(overall_score|probability|market_cap|ticker)$"),
 ):
     """Returns the universe of tracked biotech stocks with their next catalyst."""
     try:
