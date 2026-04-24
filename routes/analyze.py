@@ -95,11 +95,49 @@ class ConsensusRequest(BaseModel):
 
 @router.post("/npv")
 async def analyze_npv(req: NPVRequest):
-    """Synchronous NPV calc — deterministic, fast, returns full breakdown."""
+    """
+    NPV calc. Two-step: 1) estimate drug economics via LLM, 2) compute NPV from economics + market data.
+    Heavy — takes 10-30s via Claude. Consider caching.
+    """
     try:
-        from services.npv_model import compute_npv
-        result = compute_npv(**req.model_dump())
-        return {"ticker": req.ticker, "npv": result}
+        from services.npv_model import compute_npv_estimate, estimate_drug_economics, get_baseline_price
+        from services.database import BiotechDatabase
+        
+        db = BiotechDatabase()
+        rows = db.get_stock(req.ticker)
+        if not rows:
+            raise HTTPException(404, f"Ticker {req.ticker} not found")
+        primary = rows[0]
+        
+        # Step 1: estimate drug economics via Claude (peak sales, multiple, commercial prob)
+        economics = estimate_drug_economics(
+            ticker=req.ticker,
+            company_name=primary.get("company_name", req.ticker),
+            catalyst_type=req.catalyst_type,
+            catalyst_date=primary.get("catalyst_date", ""),
+            description=primary.get("description", ""),
+            market_cap_m=req.market_cap_m or float(primary.get("market_cap") or 0),
+        )
+        
+        # Step 2: get current price + baseline — use market_cap as proxy if no price available
+        current_price = 50.0  # sensible default; frontend may override
+        baseline_price = get_baseline_price(req.ticker) or current_price
+        
+        # Step 3: compute NPV
+        result = compute_npv_estimate(
+            ticker=req.ticker,
+            current_price=current_price,
+            market_cap_m=req.market_cap_m or float(primary.get("market_cap") or 0),
+            p_approval=req.p_commercial or (primary.get("probability") or 0.5),
+            economics=economics,
+            baseline_price=baseline_price,
+            info={"catalyst_type": req.catalyst_type,
+                  "catalyst_date": primary.get("catalyst_date", ""),
+                  "description": primary.get("description", "")},
+        )
+        return {"ticker": req.ticker, "economics": economics, "npv": result}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("NPV compute failed")
         raise HTTPException(500, f"NPV error: {e}")
