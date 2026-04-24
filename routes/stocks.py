@@ -1,9 +1,9 @@
 """
 /stocks routes — universe, detail, news, social, analyst.
+Replaces the Streamlit screener home + detail view.
 """
 import logging
-import json as _json
-from typing import Optional, Any
+from typing import Optional
 from fastapi import APIRouter, HTTPException, Query
 
 from services.database import BiotechDatabase
@@ -19,54 +19,14 @@ def db():
     return _db
 
 
-def _to_jsonable(obj: Any) -> Any:
-    """Recursively convert numpy/pandas/other non-JSON types to plain Python."""
-    try:
-        import numpy as _np
-    except ImportError: _np = None
-    if _np is not None:
-        if isinstance(obj, (_np.integer,)): return int(obj)
-        if isinstance(obj, (_np.floating,)): return float(obj)
-        if isinstance(obj, (_np.ndarray,)): return [_to_jsonable(x) for x in obj.tolist()]
-    if isinstance(obj, dict): return {str(k): _to_jsonable(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)): return [_to_jsonable(x) for x in obj]
-    if isinstance(obj, (bytes, bytearray)): return obj.decode("utf-8", errors="replace")
-    if hasattr(obj, "item"): 
-        try: return obj.item()
-        except Exception: pass
-    # Fallback — if it's not JSON-serializable, stringify
-    try:
-        _json.dumps(obj); return obj
-    except (TypeError, ValueError):
-        return str(obj)
-
-
-def _get_live_price(ticker: str) -> Optional[float]:
-    """Best-effort price fetch via yfinance."""
-    try:
-        import yfinance as yf
-        t = yf.Ticker(ticker)
-        try:
-            fi = t.fast_info
-            p = getattr(fi, "last_price", None) or (fi.get("last_price") if hasattr(fi, "get") else None)
-            if p: return float(p)
-        except Exception: pass
-        info = t.info
-        for k in ("currentPrice", "regularMarketPrice", "previousClose"):
-            v = info.get(k)
-            if v: return float(v)
-    except Exception as e:
-        logger.warning(f"price {ticker}: {e}")
-    return None
-
-
 @router.get("")
 async def list_stocks(
-    high_prob_only: bool = Query(False),
+    high_prob_only: bool = Query(False, description="Filter to probability >= 0.6"),
     min_probability: float = Query(0.0, ge=0.0, le=1.0),
     limit: int = Query(200, ge=1, le=1000),
     sort: str = Query("overall_score", pattern="^(overall_score|probability|market_cap|ticker)$"),
 ):
+    """Returns the universe of tracked biotech stocks with their next catalyst."""
     try:
         rows = db().get_all_stocks()
     except Exception as e:
@@ -76,26 +36,28 @@ async def list_stocks(
     filtered = []
     for r in rows:
         p = r.get("probability") or 0
-        if high_prob_only and p < 0.6: continue
-        if p < min_probability: continue
+        if high_prob_only and p < 0.6:
+            continue
+        if p < min_probability:
+            continue
         filtered.append(r)
 
     reverse = sort != "ticker"
-    filtered.sort(key=lambda x: (x.get(sort) or 0) if sort != "ticker" else x.get("ticker",""), reverse=reverse)
+    filtered.sort(key=lambda x: (x.get(sort) or 0) if sort != "ticker" else x.get("ticker", ""), reverse=reverse)
 
-    return _to_jsonable({
+    return {
         "count": len(filtered),
         "universe_size": len(rows),
         "high_prob_count": sum(1 for r in rows if (r.get("probability") or 0) >= 0.6),
         "stocks": filtered[:limit],
-    })
+    }
 
 
 @router.get("/{ticker}")
-async def get_stock_detail(ticker: str, with_npv: bool = Query(True)):
+async def get_stock_detail(ticker: str):
     """
-    Detail page data. NPV is computed via LLM and takes 10-30s.
-    Pass with_npv=false to skip the NPV call for faster fetches.
+    Full detail for a ticker: price estimates, NPV inputs, all catalysts.
+    Heavy data (news, social, analyst) is on sub-endpoints.
     """
     ticker = ticker.upper().strip()
     try:
@@ -107,44 +69,25 @@ async def get_stock_detail(ticker: str, with_npv: bool = Query(True)):
     if not rows:
         raise HTTPException(404, f"Ticker {ticker} not found in universe")
 
+    # Use the primary catalyst (highest probability)
     rows_sorted = sorted(rows, key=lambda r: r.get("probability") or 0, reverse=True)
     primary = rows_sorted[0]
 
-    current_price = _get_live_price(ticker)
+    # Live price via fetcher (yfinance)
+    current_price = None
+    try:
+        from services.fetcher import create_fetcher
+        fetcher = create_fetcher()
+        p = fetcher.get_current_price(ticker) if hasattr(fetcher, "get_current_price") else None
+        current_price = float(p) if p else None
+    except Exception as e:
+        logger.warning(f"price fetch failed for {ticker}: {e}")
 
-    # NPV (optional + error-wrapped)
+    # NPV estimate — requires current_price, so skip here (heavy LLM call).
+    # Frontend will call POST /analyze/npv explicitly when user opens detail.
     npv_result = None
-    if with_npv:
-        try:
-            from services.npv_model import compute_npv_estimate, estimate_drug_economics, get_baseline_price
-            economics = estimate_drug_economics(
-                ticker=ticker,
-                company_name=primary.get("company_name", ticker),
-                catalyst_type=primary.get("catalyst_type") or "FDA Decision",
-                catalyst_date=primary.get("catalyst_date", ""),
-                description=primary.get("description", ""),
-                market_cap_m=float(primary.get("market_cap") or 0),
-            )
-            baseline_price = get_baseline_price(ticker) or current_price or 50.0
-            price_for_calc = current_price or baseline_price
-            npv_result = compute_npv_estimate(
-                ticker=ticker,
-                current_price=price_for_calc,
-                market_cap_m=float(primary.get("market_cap") or 0),
-                p_approval=float(primary.get("probability") or 0.5),
-                economics=economics,
-                baseline_price=baseline_price,
-                info={
-                    "catalyst_type": primary.get("catalyst_type") or "",
-                    "catalyst_date": primary.get("catalyst_date") or "",
-                    "description": primary.get("description") or "",
-                },
-            )
-        except Exception as e:
-            logger.warning(f"NPV compute failed for {ticker}: {e}")
-            npv_result = {"error": f"{type(e).__name__}: {str(e)[:200]}"}
 
-    return _to_jsonable({
+    return {
         "ticker": ticker,
         "company_name": primary.get("company_name"),
         "industry": primary.get("industry"),
@@ -169,16 +112,29 @@ async def get_stock_detail(ticker: str, with_npv: bool = Query(True)):
             "news_count": primary.get("news_count"),
         },
         "last_updated": primary.get("last_updated"),
-    })
+    }
 
 
 @router.get("/{ticker}/news")
 async def get_stock_news(ticker: str, limit: int = Query(20, ge=1, le=50)):
+    """Recent news articles with sentiment."""
     ticker = ticker.upper().strip()
     try:
         from services.fetcher_news import fetch_all_sources
-        sources = fetch_all_sources(ticker, days_back=30)
-        return _to_jsonable({"ticker": ticker, "count": len(sources), "articles": sources[:limit]})
+        # fetcher_news.fetch_all_sources(ticker, company, catalyst) signature
+        # We don't have company/catalyst here so pass ticker for all 3 to get keyword-based search
+        rows = db().get_stock(ticker)
+        primary = rows[0] if rows else {}
+        sources = fetch_all_sources(
+            ticker,
+            primary.get("company_name", ticker),
+            primary.get("catalyst_type", "")
+        )
+        return {
+            "ticker": ticker,
+            "count": len(sources),
+            "articles": sources[:limit],
+        }
     except Exception as e:
         logger.exception(f"news fetch failed for {ticker}")
         raise HTTPException(500, f"news fetch error: {e}")
@@ -186,11 +142,12 @@ async def get_stock_news(ticker: str, limit: int = Query(20, ge=1, le=50)):
 
 @router.get("/{ticker}/social")
 async def get_stock_social(ticker: str):
+    """StockTwits + Reddit sentiment."""
     ticker = ticker.upper().strip()
     try:
         from services.social_sources import fetch_social_all
         data = fetch_social_all(ticker)
-        return _to_jsonable({"ticker": ticker, "data": data})
+        return {"ticker": ticker, "data": data}
     except Exception as e:
         logger.warning(f"social fetch failed for {ticker}: {e}")
         return {"ticker": ticker, "data": None, "error": str(e)[:200]}
@@ -198,11 +155,12 @@ async def get_stock_social(ticker: str):
 
 @router.get("/{ticker}/analyst")
 async def get_stock_analyst(ticker: str):
+    """Analyst ratings — TipRanks + yfinance consensus."""
     ticker = ticker.upper().strip()
     try:
         from services.authenticated_sources import fetch_analyst_data_all_merged
         data = fetch_analyst_data_all_merged(ticker)
-        return _to_jsonable({"ticker": ticker, "data": data})
+        return {"ticker": ticker, "data": data}
     except Exception as e:
         logger.warning(f"analyst fetch failed for {ticker}: {e}")
         return {"ticker": ticker, "data": None, "error": str(e)[:200]}
