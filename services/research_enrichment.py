@@ -445,7 +445,7 @@ def fetch_all_sources_v2(ticker: str, company: str, catalyst: str = "",
     """
     t0 = time.time()
     
-    from fetcher_news import fetch_all_sources as _base_fetch
+    from services.fetcher_news import fetch_all_sources as _base_fetch
     
     # Run base sources + new sources in parallel
     sources = []
