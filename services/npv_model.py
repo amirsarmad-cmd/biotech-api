@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 # ============================================================
 
 # Multi-provider LLM helper (standalone module, no circular import risk)
-from llm_helper import call_llm_json as _call_llm_json
+from services.llm_helper import call_llm_json as _call_llm_json
 
 
 DEFAULT_NPV_WEIGHTS = {
