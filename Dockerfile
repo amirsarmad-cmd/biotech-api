@@ -15,9 +15,10 @@ COPY . .
 
 # supervisord runs both uvicorn (API) and the background worker
 COPY supervisord.conf /etc/supervisor/conf.d/biotech.conf
+RUN chmod +x /app/start.sh
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app
 
-# $PORT is set by Railway at runtime. Default 8000 for local.
-CMD ["/app/start.sh"]
+# Use sh explicitly so even without exec bit it runs
+CMD ["sh", "/app/start.sh"]
