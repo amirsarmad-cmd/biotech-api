@@ -3,7 +3,7 @@ Universe expansion: pulls biotech/pharma tickers with upcoming catalysts from
 multiple public sources (FDA Calendar, ClinicalTrials.gov).
 
 Usage:
-    from universe import seed_universe
+    # from services.universe import seed_universe  (doc example)
     result = seed_universe(db, fetcher, mode="both", progress_cb=print)
     # result = {"added": 185, "updated": 23, "skipped": 12, "source_counts": {...}}
 """
