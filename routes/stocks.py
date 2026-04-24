@@ -242,6 +242,17 @@ async def get_stock_detail(ticker: str, with_npv: bool = Query(True)):
                     estimate_drug_economics,
                     get_baseline_price,
                 )
+                from services.risk_factors import estimate_risk_factors
+
+                # Fetch yfinance info (needed for sentiment adjustments in NPV)
+                yf_info = {}
+                try:
+                    import yfinance as yf
+                    t = yf.Ticker(ticker)
+                    yf_info = t.info or {}
+                except Exception as e:
+                    logger.warning(f"yfinance info for {ticker}: {e}")
+
                 economics = estimate_drug_economics(
                     ticker=ticker,
                     company_name=primary.get("company_name", ticker),
@@ -252,6 +263,19 @@ async def get_stock_detail(ticker: str, with_npv: bool = Query(True)):
                 )
                 baseline_price = get_baseline_price(ticker) or current_price or 50.0
                 price_for_calc = current_price or baseline_price
+
+                # Fetch 7-factor adverse risk discounts (Section 2B)
+                risk_factors = None
+                try:
+                    risk_factors = estimate_risk_factors(
+                        ticker=ticker,
+                        company_name=primary.get("company_name", ticker),
+                        info=yf_info,
+                    )
+                except Exception as e:
+                    logger.warning(f"risk_factors for {ticker}: {e}")
+
+                # Compute NPV with full info + risk factors → Section 2/2B/3 fields populate
                 npv_result = compute_npv_estimate(
                     ticker=ticker,
                     current_price=price_for_calc,
@@ -259,15 +283,17 @@ async def get_stock_detail(ticker: str, with_npv: bool = Query(True)):
                     p_approval=float(npv_catalyst.get("probability") or 0.5),
                     economics=economics,
                     baseline_price=baseline_price,
-                    info={
+                    info=yf_info,  # full info for sentiment adj
+                    risk_factors=risk_factors,
+                )
+                # Fold economics + catalyst info into result for the frontend
+                if isinstance(npv_result, dict):
+                    npv_result["_economics"] = economics
+                    npv_result["_catalyst_info"] = {
                         "catalyst_type": npv_catalyst.get("catalyst_type") or "",
                         "catalyst_date": npv_catalyst.get("catalyst_date") or "",
                         "description": npv_catalyst.get("description") or "",
-                    },
-                )
-                # Fold economics into result for the frontend
-                if isinstance(npv_result, dict):
-                    npv_result["_economics"] = economics
+                    }
             except Exception as e:
                 logger.warning(f"NPV compute failed for {ticker}: {e}")
                 npv_result = {"error": f"{type(e).__name__}: {str(e)[:200]}"}
@@ -335,3 +361,142 @@ async def get_stock_analyst(ticker: str):
     except Exception as e:
         logger.warning(f"analyst fetch failed for {ticker}: {e}")
         return {"ticker": ticker, "data": None, "error": str(e)[:200]}
+
+
+@router.get("/{ticker}/fundamentals")
+async def get_fundamentals(ticker: str):
+    """
+    Yfinance info + computed fundamentals.
+    Returns: market cap, short %, P/E, cash, revenue, float, 52w range, MAs, beta, etc.
+    """
+    ticker = ticker.upper().strip()
+    try:
+        import yfinance as yf
+        t = yf.Ticker(ticker)
+        info = {}
+        try:
+            info = t.info or {}
+        except Exception as e:
+            logger.warning(f"info fetch {ticker}: {e}")
+
+        # Key fundamentals (compact row)
+        market_cap = info.get("marketCap", 0) or 0
+        short_pct = info.get("shortPercentOfFloat", 0) or 0
+        pe_trailing = info.get("trailingPE") or 0
+        pe_forward = info.get("forwardPE") or 0
+        cash = info.get("totalCash", 0) or 0
+        revenue = info.get("totalRevenue", 0) or 0
+        employees = info.get("fullTimeEmployees", 0) or 0
+
+        # Extended — ownership
+        inst_pct = info.get("heldPercentInstitutions", 0) or 0
+        insider_pct = info.get("heldPercentInsiders", 0) or 0
+        float_shares = info.get("floatShares", 0) or 0
+        shares_out = info.get("sharesOutstanding", 0) or 0
+
+        # Technicals
+        hi52 = info.get("fiftyTwoWeekHigh", 0) or 0
+        lo52 = info.get("fiftyTwoWeekLow", 0) or 0
+        beta = info.get("beta")
+        ma200 = info.get("twoHundredDayAverage", 0) or 0
+        ma50 = info.get("fiftyDayAverage", 0) or 0
+        current_price = info.get("currentPrice") or info.get("regularMarketPrice") or 0
+        pos_52w = None
+        if hi52 and lo52 and current_price and hi52 > lo52:
+            pos_52w = (current_price - lo52) / (hi52 - lo52) * 100
+
+        # Trading activity
+        avg_vol = info.get("averageVolume", 0) or 0
+        avg_vol_10d = info.get("averageDailyVolume10Day", 0) or 0
+        short_ratio = info.get("shortRatio")
+
+        # Financial health
+        debt = info.get("totalDebt", 0) or 0
+        net_income = info.get("netIncomeToCommon", 0) or 0
+        # Approximate cash runway: cash / (quarterly burn)
+        runway_months = None
+        if cash > 0 and net_income < 0:
+            burn_per_quarter = abs(net_income) / 4
+            if burn_per_quarter > 0:
+                runway_months = (cash / burn_per_quarter) * 3
+
+        # Business summary
+        summary = info.get("longBusinessSummary", "")
+
+        return _to_jsonable({
+            "ticker": ticker,
+            "key": {
+                "market_cap": market_cap,
+                "short_pct_of_float": short_pct,
+                "pe_trailing": pe_trailing,
+                "pe_forward": pe_forward,
+                "cash": cash,
+                "revenue_ttm": revenue,
+                "employees": employees,
+                "current_price": current_price,
+            },
+            "ownership": {
+                "institutional_pct": inst_pct,
+                "insider_pct": insider_pct,
+                "float_shares": float_shares,
+                "shares_outstanding": shares_out,
+            },
+            "technicals": {
+                "week_52_high": hi52,
+                "week_52_low": lo52,
+                "week_52_position_pct": pos_52w,
+                "beta": beta,
+                "ma_200": ma200,
+                "ma_50": ma50,
+            },
+            "activity": {
+                "avg_volume_3m": avg_vol,
+                "avg_volume_10d": avg_vol_10d,
+                "short_ratio": short_ratio,
+                "short_pct_float": short_pct,
+            },
+            "financial_health": {
+                "cash": cash,
+                "debt": debt,
+                "revenue_ttm": revenue,
+                "runway_months": runway_months,
+            },
+            "summary": summary,
+        })
+    except Exception as e:
+        logger.exception(f"fundamentals {ticker} failed")
+        raise HTTPException(500, f"fundamentals error: {type(e).__name__}: {str(e)[:200]}")
+
+
+@router.get("/{ticker}/history")
+async def get_history(ticker: str, period: str = Query("2y", pattern="^(1mo|3mo|6mo|1y|2y|5y|max)$")):
+    """
+    Daily price history. Default 2y.
+    Returns: [{date, open, high, low, close, volume}, ...]
+    """
+    ticker = ticker.upper().strip()
+    try:
+        import yfinance as yf
+        t = yf.Ticker(ticker)
+        hist = t.history(period=period)
+        if hist is None or len(hist) == 0:
+            return {"ticker": ticker, "period": period, "count": 0, "history": []}
+        records = []
+        for idx, row in hist.iterrows():
+            records.append({
+                "date": idx.strftime("%Y-%m-%d"),
+                "open": float(row["Open"]) if row["Open"] else None,
+                "high": float(row["High"]) if row["High"] else None,
+                "low": float(row["Low"]) if row["Low"] else None,
+                "close": float(row["Close"]) if row["Close"] else None,
+                "volume": int(row["Volume"]) if row["Volume"] else None,
+            })
+        return _to_jsonable({
+            "ticker": ticker,
+            "period": period,
+            "count": len(records),
+            "history": records,
+        })
+    except Exception as e:
+        logger.exception(f"history {ticker} failed")
+        raise HTTPException(500, f"history error: {type(e).__name__}: {str(e)[:200]}")
