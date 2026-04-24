@@ -21,7 +21,7 @@ import hashlib
 
 # Risk factor integration (optional — falls back if module missing)
 try:
-    from risk_factors import estimate_risk_factors, apply_risk_discount
+    from services.risk_factors import estimate_risk_factors, apply_risk_discount
     RISK_FACTORS_AVAILABLE = True
 except ImportError:
     RISK_FACTORS_AVAILABLE = False
