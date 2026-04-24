@@ -21,7 +21,7 @@ from typing import Dict, Optional
 
 # Import shared LLM helper (standalone module, no circular dependency risk)
 try:
-    from llm_helper import call_llm_json as _call_llm_json
+    from services.llm_helper import call_llm_json as _call_llm_json
 except Exception as _e:
     _call_llm_json = None
     logging.getLogger(__name__).error(f"Could not import llm_helper: {_e}")
