@@ -1,8 +1,8 @@
 """
 Biotech Stock Screener API — FastAPI backend.
-Replaces the Streamlit app with a proper JSON REST API + SSE for streaming LLM.
+Replaces the Streamlit app with JSON REST + Redis-backed async jobs.
 """
-import os, logging
+import os, logging, asyncio, json, traceback, time
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,13 +12,75 @@ from routes import stocks, analyze, jobs as jobs_router, strategies, admin
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
 logger = logging.getLogger("biotech-api")
-
 VERSION = os.getenv("VERSION", "1.0.0")
+
+
+async def _background_worker():
+    """Single-task worker that consumes Redis job queue and runs LLM jobs."""
+    import redis as _redis
+    url = os.getenv("REDIS_URL")
+    if not url:
+        logger.warning("REDIS_URL not set — worker idle")
+        return
+    r = _redis.from_url(url, decode_responses=True)
+    logger.info("background worker started")
+    while True:
+        try:
+            # BRPOP blocks; run in thread to not block the event loop
+            item = await asyncio.to_thread(r.brpop, "biotech-api:job-queue", 5)
+            if not item:
+                continue
+            _, job_id = item
+            await asyncio.to_thread(_process_job, r, job_id)
+        except asyncio.CancelledError:
+            logger.info("background worker cancelled")
+            break
+        except Exception as e:
+            logger.exception(f"worker loop: {e}")
+            await asyncio.sleep(2)
+
+
+def _process_job(r, job_id):
+    key = f"biotech-api:job:{job_id}"
+    data = r.hgetall(key)
+    if not data: return
+    job_type = data.get("type")
+    r.hset(key, mapping={"status": "running", "started": time.time()})
+    logger.info(f"[{job_id}] running {job_type}")
+    try:
+        payload = json.loads(data.get("payload","{}"))
+        if job_type == "news-impact":
+            from services.news_npv_impact import analyze_news_npv_impact
+            result = analyze_news_npv_impact(**payload)
+        elif job_type == "consensus":
+            from services.ai_pipeline import run_parallel_only, compute_consensus
+            parallel = run_parallel_only(
+                ticker=payload.get("ticker",""),
+                company_name=payload.get("company_name",""),
+                catalyst_info=payload.get("catalyst_info",{}),
+                drug_info=payload.get("drug_info",{}),
+                sources=payload.get("sources",[]),
+            )
+            cons = compute_consensus(parallel)
+            result = {"parallel": parallel, "consensus": cons}
+        else:
+            raise ValueError(f"unknown job type: {job_type}")
+        r.hset(key, mapping={
+            "status": "completed",
+            "completed": time.time(),
+            "result": json.dumps(result, default=str),
+        })
+        r.expire(key, 3600)
+        logger.info(f"[{job_id}] completed")
+    except Exception as e:
+        err = f"{type(e).__name__}: {str(e)[:400]}"
+        logger.error(f"[{job_id}] failed: {err}")
+        r.hset(key, mapping={"status": "failed", "completed": time.time(), "error": err})
+        r.expire(key, 3600)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: warm DB connection, ensure schema
     logger.info(f"biotech-api {VERSION} starting")
     from services.database import BiotechDatabase
     try:
@@ -27,44 +89,36 @@ async def lifespan(app: FastAPI):
         logger.info("DB schema ensured")
     except Exception as e:
         logger.error(f"DB init failed: {e}")
-    yield
-    # Shutdown
-    logger.info("biotech-api shutting down")
+    # Spawn background worker
+    worker_task = asyncio.create_task(_background_worker())
+    try:
+        yield
+    finally:
+        worker_task.cancel()
+        try:
+            await worker_task
+        except asyncio.CancelledError:
+            pass
+        logger.info("biotech-api shutting down")
 
 
-app = FastAPI(
-    title="Biotech Stock Screener API",
-    description="FDA catalyst screener with LLM-driven NPV analysis and consensus AI",
-    version=VERSION,
-    lifespan=lifespan,
-)
+app = FastAPI(title="Biotech Stock Screener API", version=VERSION, lifespan=lifespan)
 
-# CORS: allow frontend to call the API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 
 
 @app.get("/")
 async def root():
     return {
-        "service": "biotech-api",
-        "version": VERSION,
-        "docs": "/docs",
+        "service": "biotech-api", "version": VERSION, "docs": "/docs",
         "endpoints": [
-            "GET /health",
-            "GET /stocks",
-            "GET /stocks/{ticker}",
-            "GET /stocks/{ticker}/news",
-            "GET /stocks/{ticker}/social",
+            "GET /health", "GET /stocks", "GET /stocks/{ticker}",
+            "GET /stocks/{ticker}/news", "GET /stocks/{ticker}/social",
             "GET /stocks/{ticker}/analyst",
-            "POST /analyze/npv",
-            "POST /analyze/news-impact",
-            "POST /analyze/consensus",
+            "POST /analyze/npv", "POST /analyze/news-impact", "POST /analyze/consensus",
             "GET /jobs/{job_id}",
             "GET /strategies/{ticker}",
             "POST /admin/universe/refresh",
@@ -75,25 +129,21 @@ async def root():
 @app.get("/health")
 async def health():
     from services.database import BiotechDatabase
-    db_ok = False
-    redis_ok = False
+    db_ok = False; redis_ok = False
     try:
         db = BiotechDatabase()
         with db.get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT 1")
-                db_ok = cur.fetchone() is not None
+                cur.execute("SELECT 1"); db_ok = cur.fetchone() is not None
     except Exception as e:
-        logger.warning(f"DB health check failed: {e}")
+        logger.warning(f"DB health: {e}")
     try:
         import redis
         url = os.getenv("REDIS_URL")
         if url:
-            r = redis.from_url(url, socket_connect_timeout=3)
-            r.ping()
-            redis_ok = True
+            r = redis.from_url(url, socket_connect_timeout=3); r.ping(); redis_ok = True
     except Exception as e:
-        logger.warning(f"Redis health check failed: {e}")
+        logger.warning(f"Redis health: {e}")
     return {
         "status": "healthy" if db_ok else "degraded",
         "version": VERSION,
@@ -102,7 +152,6 @@ async def health():
     }
 
 
-# Routes
 app.include_router(stocks.router, prefix="/stocks", tags=["stocks"])
 app.include_router(analyze.router, prefix="/analyze", tags=["analyze"])
 app.include_router(jobs_router.router, prefix="/jobs", tags=["jobs"])
@@ -110,14 +159,11 @@ app.include_router(strategies.router, prefix="/strategies", tags=["strategies"])
 app.include_router(admin.router, prefix="/admin", tags=["admin"])
 
 
-# Catch-all error handler so stack traces don't leak
 @app.exception_handler(Exception)
 async def generic_error(request: Request, exc: Exception):
-    logger.exception(f"Unhandled error on {request.url.path}: {exc}")
-    return JSONResponse(
-        status_code=500,
-        content={"error": type(exc).__name__, "message": str(exc)[:300]},
-    )
+    logger.exception(f"Unhandled on {request.url.path}: {exc}")
+    return JSONResponse(status_code=500,
+        content={"error": type(exc).__name__, "message": str(exc)[:300]})
 
 
 if __name__ == "__main__":
