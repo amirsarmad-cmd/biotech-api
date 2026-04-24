@@ -2,7 +2,8 @@
 /stocks routes — universe, detail, news, social, analyst.
 """
 import logging
-from typing import Optional
+import json as _json
+from typing import Optional, Any
 from fastapi import APIRouter, HTTPException, Query
 
 from services.database import BiotechDatabase
@@ -18,21 +19,42 @@ def db():
     return _db
 
 
+def _to_jsonable(obj: Any) -> Any:
+    """Recursively convert numpy/pandas/other non-JSON types to plain Python."""
+    try:
+        import numpy as _np
+    except ImportError: _np = None
+    if _np is not None:
+        if isinstance(obj, (_np.integer,)): return int(obj)
+        if isinstance(obj, (_np.floating,)): return float(obj)
+        if isinstance(obj, (_np.ndarray,)): return [_to_jsonable(x) for x in obj.tolist()]
+    if isinstance(obj, dict): return {str(k): _to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)): return [_to_jsonable(x) for x in obj]
+    if isinstance(obj, (bytes, bytearray)): return obj.decode("utf-8", errors="replace")
+    if hasattr(obj, "item"): 
+        try: return obj.item()
+        except Exception: pass
+    # Fallback — if it's not JSON-serializable, stringify
+    try:
+        _json.dumps(obj); return obj
+    except (TypeError, ValueError):
+        return str(obj)
+
+
 def _get_live_price(ticker: str) -> Optional[float]:
     """Best-effort price fetch via yfinance."""
     try:
         import yfinance as yf
         t = yf.Ticker(ticker)
+        try:
+            fi = t.fast_info
+            p = getattr(fi, "last_price", None) or (fi.get("last_price") if hasattr(fi, "get") else None)
+            if p: return float(p)
+        except Exception: pass
         info = t.info
         for k in ("currentPrice", "regularMarketPrice", "previousClose"):
             v = info.get(k)
             if v: return float(v)
-        # Fallback: fast_info
-        try:
-            fi = t.fast_info
-            p = fi.get("last_price") if hasattr(fi, "get") else getattr(fi, "last_price", None)
-            if p: return float(p)
-        except Exception: pass
     except Exception as e:
         logger.warning(f"price {ticker}: {e}")
     return None
@@ -61,16 +83,20 @@ async def list_stocks(
     reverse = sort != "ticker"
     filtered.sort(key=lambda x: (x.get(sort) or 0) if sort != "ticker" else x.get("ticker",""), reverse=reverse)
 
-    return {
+    return _to_jsonable({
         "count": len(filtered),
         "universe_size": len(rows),
         "high_prob_count": sum(1 for r in rows if (r.get("probability") or 0) >= 0.6),
         "stocks": filtered[:limit],
-    }
+    })
 
 
 @router.get("/{ticker}")
-async def get_stock_detail(ticker: str):
+async def get_stock_detail(ticker: str, with_npv: bool = Query(True)):
+    """
+    Detail page data. NPV is computed via LLM and takes 10-30s.
+    Pass with_npv=false to skip the NPV call for faster fetches.
+    """
     ticker = ticker.upper().strip()
     try:
         rows = db().get_stock(ticker)
@@ -86,24 +112,39 @@ async def get_stock_detail(ticker: str):
 
     current_price = _get_live_price(ticker)
 
-    # NPV via LLM provider — may take up to 30s
+    # NPV (optional + error-wrapped)
     npv_result = None
-    try:
-        from services.npv_model import compute_npv
-        inputs = dict(
-            ticker=ticker,
-            catalyst_type=primary.get("catalyst_type") or "FDA Decision",
-            peak_sales_b=3.0,
-            multiple=3.5,
-            p_commercial=0.5 if (primary.get("probability") or 0.5) < 0.6 else 0.7,
-            market_cap_m=float(primary.get("market_cap") or 0),
-        )
-        npv_result = compute_npv(**inputs)
-    except Exception as e:
-        logger.warning(f"NPV compute failed for {ticker}: {e}")
-        npv_result = {"error": str(e)[:300]}
+    if with_npv:
+        try:
+            from services.npv_model import compute_npv_estimate, estimate_drug_economics, get_baseline_price
+            economics = estimate_drug_economics(
+                ticker=ticker,
+                company_name=primary.get("company_name", ticker),
+                catalyst_type=primary.get("catalyst_type") or "FDA Decision",
+                catalyst_date=primary.get("catalyst_date", ""),
+                description=primary.get("description", ""),
+                market_cap_m=float(primary.get("market_cap") or 0),
+            )
+            baseline_price = get_baseline_price(ticker) or current_price or 50.0
+            price_for_calc = current_price or baseline_price
+            npv_result = compute_npv_estimate(
+                ticker=ticker,
+                current_price=price_for_calc,
+                market_cap_m=float(primary.get("market_cap") or 0),
+                p_approval=float(primary.get("probability") or 0.5),
+                economics=economics,
+                baseline_price=baseline_price,
+                info={
+                    "catalyst_type": primary.get("catalyst_type") or "",
+                    "catalyst_date": primary.get("catalyst_date") or "",
+                    "description": primary.get("description") or "",
+                },
+            )
+        except Exception as e:
+            logger.warning(f"NPV compute failed for {ticker}: {e}")
+            npv_result = {"error": f"{type(e).__name__}: {str(e)[:200]}"}
 
-    return {
+    return _to_jsonable({
         "ticker": ticker,
         "company_name": primary.get("company_name"),
         "industry": primary.get("industry"),
@@ -128,7 +169,7 @@ async def get_stock_detail(ticker: str):
             "news_count": primary.get("news_count"),
         },
         "last_updated": primary.get("last_updated"),
-    }
+    })
 
 
 @router.get("/{ticker}/news")
@@ -137,7 +178,7 @@ async def get_stock_news(ticker: str, limit: int = Query(20, ge=1, le=50)):
     try:
         from services.fetcher_news import fetch_all_sources
         sources = fetch_all_sources(ticker, days_back=30)
-        return {"ticker": ticker, "count": len(sources), "articles": sources[:limit]}
+        return _to_jsonable({"ticker": ticker, "count": len(sources), "articles": sources[:limit]})
     except Exception as e:
         logger.exception(f"news fetch failed for {ticker}")
         raise HTTPException(500, f"news fetch error: {e}")
@@ -149,7 +190,7 @@ async def get_stock_social(ticker: str):
     try:
         from services.social_sources import fetch_social_all
         data = fetch_social_all(ticker)
-        return {"ticker": ticker, "data": data}
+        return _to_jsonable({"ticker": ticker, "data": data})
     except Exception as e:
         logger.warning(f"social fetch failed for {ticker}: {e}")
         return {"ticker": ticker, "data": None, "error": str(e)[:200]}
@@ -161,7 +202,7 @@ async def get_stock_analyst(ticker: str):
     try:
         from services.authenticated_sources import fetch_analyst_data_all_merged
         data = fetch_analyst_data_all_merged(ticker)
-        return {"ticker": ticker, "data": data}
+        return _to_jsonable({"ticker": ticker, "data": data})
     except Exception as e:
         logger.warning(f"analyst fetch failed for {ticker}: {e}")
         return {"ticker": ticker, "data": None, "error": str(e)[:200]}
