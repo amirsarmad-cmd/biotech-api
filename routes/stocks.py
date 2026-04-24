@@ -83,21 +83,9 @@ async def get_stock_detail(ticker: str):
     except Exception as e:
         logger.warning(f"price fetch failed for {ticker}: {e}")
 
-    # NPV estimates
+    # NPV estimate — requires current_price, so skip here (heavy LLM call).
+    # Frontend will call POST /analyze/npv explicitly when user opens detail.
     npv_result = None
-    try:
-        from services.npv_model import compute_npv
-        inputs = dict(
-            ticker=ticker,
-            catalyst_type=primary.get("catalyst_type") or "FDA Decision",
-            peak_sales_b=3.0,
-            multiple=3.5,
-            p_commercial=0.5 if (primary.get("probability") or 0.5) < 0.6 else 0.7,
-            market_cap_m=float(primary.get("market_cap") or 0),
-        )
-        npv_result = compute_npv(**inputs)
-    except Exception as e:
-        logger.warning(f"NPV compute failed for {ticker}: {e}")
 
     return {
         "ticker": ticker,
