@@ -133,7 +133,15 @@ async def get_stock_news(ticker: str, limit: int = Query(20, ge=1, le=50)):
     ticker = ticker.upper().strip()
     try:
         from services.fetcher_news import fetch_all_sources
-        sources = fetch_all_sources(ticker, days_back=30)
+        # fetcher_news.fetch_all_sources(ticker, company, catalyst) signature
+        # We don't have company/catalyst here so pass ticker for all 3 to get keyword-based search
+        rows = db().get_stock(ticker)
+        primary = rows[0] if rows else {}
+        sources = fetch_all_sources(
+            ticker,
+            primary.get("company_name", ticker),
+            primary.get("catalyst_type", "")
+        )
         return {
             "ticker": ticker,
             "count": len(sources),
