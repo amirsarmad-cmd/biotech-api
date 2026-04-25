@@ -57,14 +57,14 @@ async def get_catalyst_risk_factors(catalyst_id: int, refresh: bool = False):
                         ORDER BY 
                           CASE WHEN catalyst_id = %s THEN 0 ELSE 1 END,
                           CASE WHEN drug_name = %s THEN 0 ELSE 1 END,
-                          last_updated DESC
+                          computed_at DESC
                         LIMIT 1
                     """, (cat["ticker"], catalyst_id, cat["drug_name"], catalyst_id, cat["drug_name"]))
                     cached = cur.fetchone()
                     if cached:
                         # Check freshness — stale after 24h or if news_hash changed
                         from datetime import datetime as _dt, timedelta as _td
-                        age = _dt.now(cached["last_updated"].tzinfo) - cached["last_updated"]
+                        age = _dt.now(cached["computed_at"].tzinfo) - cached["computed_at"]
                         if age < _td(hours=24):
                             return {
                                 "cached": True,
@@ -74,11 +74,11 @@ async def get_catalyst_risk_factors(catalyst_id: int, refresh: bool = False):
                                 "drug_name": cat["drug_name"],
                                 "factors": cached.get("factors") or {},
                                 "prior_crls": cached.get("prior_crls") or [],
-                                "litigation": cached.get("litigation") or [],
-                                "insider": cached.get("insider") or {},
-                                "short": cached.get("short") or {},
-                                "total_discount": cached.get("total_discount", 0),
-                                "last_updated": cached["last_updated"].isoformat(),
+                                "litigation": cached.get("active_litigation") or [],
+                                "insider": cached.get("insider_transactions") or {},
+                                "short": cached.get("short_data") or {},
+                                "total_discount": cached.get("factors", {}).get("total_discount", 0) if isinstance(cached.get("factors"), dict) else 0,
+                                "computed_at": cached["computed_at"].isoformat(),
                             }
                 
                 # 3. Compute fresh
@@ -121,7 +121,7 @@ async def get_catalyst_risk_factors(catalyst_id: int, refresh: bool = False):
                 cur.execute("""
                     INSERT INTO stock_risk_factors 
                         (ticker, catalyst_id, drug_name, factors, prior_crls, litigation,
-                         insider, short, total_discount, last_updated)
+                         insider, short, total_discount, computed_at)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
                     ON CONFLICT (ticker, catalyst_id, drug_name) DO UPDATE SET
                         factors = EXCLUDED.factors,
@@ -130,16 +130,15 @@ async def get_catalyst_risk_factors(catalyst_id: int, refresh: bool = False):
                         insider = EXCLUDED.insider,
                         short = EXCLUDED.short,
                         total_discount = EXCLUDED.total_discount,
-                        last_updated = NOW()
+                        computed_at = NOW()
                 """, (
                     cat["ticker"], catalyst_id, cat.get("drug_name"),
                     Json(factors_json),
                     Json([]),  # prior_crls — TODO: web search for "ticker drug CRL"
-                    Json([]),  # litigation — TODO: SEC EDGAR query
-                    Json({"shortPctFloat": (info.get("shortPercentOfFloat", 0) or 0) * 100,
-                          "insiderHeld": (info.get("heldPercentInsiders", 0) or 0) * 100}),
+                    Json([]),  # active_litigation — TODO: SEC EDGAR query
+                    Json({"insiderHeldPct": (info.get("heldPercentInsiders", 0) or 0) * 100}),
                     Json({"shortPctFloat": (info.get("shortPercentOfFloat", 0) or 0) * 100}),
-                    result.get("total_discount", 0),
+                    "claude",  # llm_provider
                 ))
                 conn.commit()
                 
