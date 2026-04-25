@@ -167,3 +167,55 @@ async def migrate_now():
     except Exception as e:
         logger.exception("migrate_now")
         raise HTTPException(500, f"migrate error: {e}")
+
+
+# ─── Universe seeder (Phase B) ────────────────────────────────────────────
+
+class SeedRequest(BaseModel):
+    max_tickers: int | None = None  # cap for safety; None = use env default
+
+
+@router.post("/universe/v2-seed")
+async def seed_universe_v2(req: SeedRequest):
+    """Run the Phase B universe seeder. LLM cost gated by LLM_ENABLED env var."""
+    try:
+        from services.universe_seeder import run_universe_seed
+        return run_universe_seed(max_tickers=req.max_tickers)
+    except Exception as e:
+        logger.exception("v2-seed")
+        raise HTTPException(500, f"seed error: {e}")
+
+
+@router.get("/universe/v2-spend")
+async def universe_spend():
+    """Inspect current LLM spend + budget for the universe seeder."""
+    try:
+        from services.universe_seeder import get_daily_spend
+        return get_daily_spend()
+    except Exception as e:
+        raise HTTPException(500, f"spend error: {e}")
+
+
+@router.get("/universe/v2-cron-runs")
+async def universe_cron_runs(limit: int = 20):
+    """Show recent cron_runs entries."""
+    try:
+        with _pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT id, job_name, started_at, completed_at, status,
+                           records_processed, records_added, records_updated, errors
+                    FROM cron_runs ORDER BY started_at DESC LIMIT %s
+                """, (limit,))
+                rows = cur.fetchall()
+                cols = ["id", "job_name", "started_at", "completed_at", "status",
+                        "records_processed", "records_added", "records_updated", "errors"]
+                items = []
+                for r in rows:
+                    item = {}
+                    for c, v in zip(cols, r):
+                        item[c] = v.isoformat() if hasattr(v, "isoformat") else v
+                    items.append(item)
+                return {"runs": items}
+    except Exception as e:
+        raise HTTPException(500, f"cron error: {e}")
