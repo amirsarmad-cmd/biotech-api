@@ -1,18 +1,12 @@
 """
 Catalyst-specific risk factors endpoint (Feature #5).
 
-Extends the stock-level risk_factors with drug+indication context for sharper estimates:
-- Drug name, MOA, indication
-- Prior CRLs / AdComm history specifically for THIS drug
-- Recent news around this drug program (not just company-wide)
-
-Cached in stock_risk_factors table (UNIQUE on ticker, catalyst_id, drug_name).
+Drug + indication aware risk factor computation, cached in stock_risk_factors.
 """
 import logging
-from datetime import datetime
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
 import os
+from datetime import datetime, timedelta
+from fastapi import APIRouter, HTTPException
 import psycopg2
 from psycopg2.extras import RealDictCursor, Json
 
@@ -29,14 +23,11 @@ def _pg_conn():
 
 @router.get("/v2/catalysts/{catalyst_id}/risk-factors")
 async def get_catalyst_risk_factors(catalyst_id: int, refresh: bool = False):
-    """Get cached + computed risk factors for a specific catalyst (drug + indication context).
-    
-    Returns the cached entry from stock_risk_factors if recent, otherwise computes fresh.
-    """
+    """Drug-specific risk factors for a catalyst. Cached 24h in stock_risk_factors."""
     try:
         with _pg_conn() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                # 1. Look up the catalyst from catalyst_universe
+                # 1. Look up the catalyst
                 cur.execute("""
                     SELECT id, ticker, company_name, catalyst_type, catalyst_date,
                            drug_name, indication, phase, description
@@ -45,45 +36,41 @@ async def get_catalyst_risk_factors(catalyst_id: int, refresh: bool = False):
                 """, (catalyst_id,))
                 cat = cur.fetchone()
                 if not cat:
-                    raise HTTPException(404, f"Catalyst {catalyst_id} not found or inactive")
+                    raise HTTPException(404, f"Catalyst {catalyst_id} not found")
                 
-                # 2. Check cache
+                # 2. Check cache (computed_at column, freshness 24h)
                 if not refresh:
                     cur.execute("""
                         SELECT * FROM stock_risk_factors
                         WHERE ticker = %s 
                           AND (catalyst_id = %s OR catalyst_id IS NULL)
-                          AND (drug_name = %s OR drug_name IS NULL)
+                          AND (drug_name = %s OR drug_name IS NULL OR %s IS NULL)
                         ORDER BY 
                           CASE WHEN catalyst_id = %s THEN 0 ELSE 1 END,
                           CASE WHEN drug_name = %s THEN 0 ELSE 1 END,
                           computed_at DESC
                         LIMIT 1
-                    """, (cat["ticker"], catalyst_id, cat["drug_name"], catalyst_id, cat["drug_name"]))
+                    """, (cat["ticker"], catalyst_id, cat["drug_name"], cat["drug_name"],
+                          catalyst_id, cat["drug_name"]))
                     cached = cur.fetchone()
-                    if cached:
-                        # Check freshness — stale after 24h or if news_hash changed
-                        from datetime import datetime as _dt, timedelta as _td
-                        age = _dt.now(cached["computed_at"].tzinfo) - cached["computed_at"]
-                        if age < _td(hours=24):
+                    if cached and cached.get("computed_at"):
+                        age = datetime.now(cached["computed_at"].tzinfo) - cached["computed_at"]
+                        if age < timedelta(hours=24):
+                            factors = cached.get("factors") or {}
                             return {
                                 "cached": True,
                                 "age_hours": round(age.total_seconds() / 3600, 1),
                                 "catalyst_id": catalyst_id,
                                 "ticker": cat["ticker"],
-                                "drug_name": cat["drug_name"],
-                                "factors": cached.get("factors") or {},
-                                "prior_crls": cached.get("prior_crls") or [],
-                                "litigation": cached.get("active_litigation") or [],
-                                "insider": cached.get("insider_transactions") or {},
-                                "short": cached.get("short_data") or {},
-                                "total_discount": cached.get("factors", {}).get("total_discount", 0) if isinstance(cached.get("factors"), dict) else 0,
+                                "drug_name": cat.get("drug_name"),
+                                "indication": cat.get("indication"),
+                                "factors": factors,
+                                "total_discount": float(factors.get("total_discount", 0)) if isinstance(factors, dict) else 0,
                                 "computed_at": cached["computed_at"].isoformat(),
                             }
                 
                 # 3. Compute fresh
                 from services.risk_factors import estimate_risk_factors
-                # Pull yfinance info
                 try:
                     import yfinance as yf
                     info = yf.Ticker(cat["ticker"]).info or {}
@@ -91,21 +78,19 @@ async def get_catalyst_risk_factors(catalyst_id: int, refresh: bool = False):
                     info = {}
                 
                 # Build drug-specific context
-                drug_ctx = []
+                drug_ctx_parts = []
                 if cat.get("drug_name"):
-                    drug_ctx.append(f"Drug: {cat['drug_name']}")
+                    drug_ctx_parts.append(f"Drug: {cat['drug_name']}")
                 if cat.get("indication"):
-                    drug_ctx.append(f"Indication: {cat['indication']}")
+                    drug_ctx_parts.append(f"Indication: {cat['indication']}")
                 if cat.get("phase"):
-                    drug_ctx.append(f"Phase: {cat['phase']}")
+                    drug_ctx_parts.append(f"Phase: {cat['phase']}")
                 if cat.get("catalyst_type"):
-                    drug_ctx.append(f"Upcoming catalyst: {cat['catalyst_type']} on {cat['catalyst_date']}")
+                    drug_ctx_parts.append(f"Upcoming: {cat['catalyst_type']} on {cat['catalyst_date']}")
                 if cat.get("description"):
-                    drug_ctx.append(f"Description: {cat['description'][:300]}")
+                    drug_ctx_parts.append(f"Context: {cat['description'][:300]}")
+                ai_context = "\n".join(drug_ctx_parts)
                 
-                ai_context = "\n".join(drug_ctx) if drug_ctx else ""
-                
-                # Compute risks with drug-specific context
                 result = estimate_risk_factors(
                     ticker=cat["ticker"],
                     company_name=cat.get("company_name") or cat["ticker"],
@@ -114,31 +99,28 @@ async def get_catalyst_risk_factors(catalyst_id: int, refresh: bool = False):
                     ai_context=ai_context,
                 )
                 
-                # 4. Cache in stock_risk_factors
-                factors_json = {k: v for k, v in result.items() 
-                                if k not in {"prior_crls", "litigation", "insider", "short", "total_discount"}}
-                
+                # 4. Cache it
                 cur.execute("""
                     INSERT INTO stock_risk_factors 
-                        (ticker, catalyst_id, drug_name, factors, prior_crls, litigation,
-                         insider, short, total_discount, computed_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                        (ticker, catalyst_id, drug_name, factors, prior_crls, active_litigation,
+                         insider_transactions, short_data, computed_at, llm_provider)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s)
                     ON CONFLICT (ticker, catalyst_id, drug_name) DO UPDATE SET
                         factors = EXCLUDED.factors,
                         prior_crls = EXCLUDED.prior_crls,
-                        litigation = EXCLUDED.litigation,
-                        insider = EXCLUDED.insider,
-                        short = EXCLUDED.short,
-                        total_discount = EXCLUDED.total_discount,
-                        computed_at = NOW()
+                        active_litigation = EXCLUDED.active_litigation,
+                        insider_transactions = EXCLUDED.insider_transactions,
+                        short_data = EXCLUDED.short_data,
+                        computed_at = NOW(),
+                        llm_provider = EXCLUDED.llm_provider
                 """, (
                     cat["ticker"], catalyst_id, cat.get("drug_name"),
-                    Json(factors_json),
-                    Json([]),  # prior_crls — TODO: web search for "ticker drug CRL"
-                    Json([]),  # active_litigation — TODO: SEC EDGAR query
+                    Json(result),  # full result as factors json
+                    Json([]),
+                    Json([]),
                     Json({"insiderHeldPct": (info.get("heldPercentInsiders", 0) or 0) * 100}),
                     Json({"shortPctFloat": (info.get("shortPercentOfFloat", 0) or 0) * 100}),
-                    "claude",  # llm_provider
+                    "claude",
                 ))
                 conn.commit()
                 
@@ -147,10 +129,10 @@ async def get_catalyst_risk_factors(catalyst_id: int, refresh: bool = False):
                     "computed_at": datetime.utcnow().isoformat() + "Z",
                     "catalyst_id": catalyst_id,
                     "ticker": cat["ticker"],
-                    "drug_name": cat["drug_name"],
-                    "indication": cat["indication"],
-                    "factors": factors_json,
-                    "total_discount": result.get("total_discount", 0),
+                    "drug_name": cat.get("drug_name"),
+                    "indication": cat.get("indication"),
+                    "factors": result,
+                    "total_discount": float(result.get("total_discount", 0)),
                     "context_used": ai_context,
                 }
     
