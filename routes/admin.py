@@ -196,6 +196,69 @@ async def universe_spend():
         raise HTTPException(500, f"spend error: {e}")
 
 
+@router.get("/universe/v2-debug-gemini/{ticker}")
+async def debug_gemini(ticker: str):
+    """Show raw Gemini response for one ticker — for debugging extraction."""
+    import os
+    from google import genai
+    from google.genai import types
+    from datetime import date, timedelta
+    
+    GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+    if not GOOGLE_API_KEY:
+        raise HTTPException(500, "GOOGLE_API_KEY not set")
+    
+    today = date.today()
+    six_months = today + timedelta(days=183)
+    prompt = f"""You are a biotech catalyst analyst. Extract REAL upcoming non-earnings catalysts for {ticker} expected between {today.isoformat()} and {six_months.isoformat()}.
+
+CRITICAL: Use ONLY real factual data. No placeholders.
+
+For each catalyst:
+- catalyst_type: "FDA Decision" | "AdComm" | "Phase 3 Readout" | "Phase 2 Readout" | "Phase 1 Readout" | "Clinical Trial" | "Partnership" | "BLA submission" | "NDA submission"
+- catalyst_date: ISO date
+- date_precision: "exact" | "quarter" | "half" | "year"
+- description: 1-sentence factual description
+- drug_name: real drug name (no placeholders)
+- indication: specific medical condition
+- phase: "Phase 1" | "Phase 2" | "Phase 3" | "BLA" | "NDA" | null
+- confidence_score: 0.0-1.0
+
+Return ONLY a JSON object with format: {{"catalysts": [...]}}
+"""
+    
+    try:
+        client = genai.Client(api_key=GOOGLE_API_KEY)
+        config = types.GenerateContentConfig(
+            max_output_tokens=2000,
+            temperature=0.1,
+            tools=[types.Tool(google_search=types.GoogleSearch())],
+        )
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=config,
+        )
+        raw = response.text or ""
+        # also try to expose grounding metadata
+        metadata = {}
+        try:
+            if response.candidates and response.candidates[0].grounding_metadata:
+                gm = response.candidates[0].grounding_metadata
+                metadata["grounding_chunks"] = len(gm.grounding_chunks or [])
+                metadata["search_queries"] = list(gm.web_search_queries or [])
+        except Exception:
+            pass
+        return {
+            "ticker": ticker,
+            "raw_response": raw,
+            "raw_length": len(raw),
+            "metadata": metadata,
+        }
+    except Exception as e:
+        return {"ticker": ticker, "error": f"{type(e).__name__}: {e}"}
+
+
 @router.delete("/universe/v2-mock-clear")
 async def clear_mock_catalysts(confirm: bool = False, source: str = "mock"):
     """Delete catalyst rows with given source. Pass confirm=true to execute. source='all' wipes everything."""
