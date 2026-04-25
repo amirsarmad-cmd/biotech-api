@@ -439,3 +439,134 @@ async def clean_junk_catalysts(confirm: bool = False):
                 }
     except Exception as e:
         raise HTTPException(500, f"clean error: {e}")
+
+
+# ============================================================
+# Market cap backfill — yfinance batch fetch for V2 universe tickers
+# ============================================================
+
+@router.post("/marketcap/backfill")
+async def backfill_market_cap(
+    limit: int = 100,
+    only_missing: bool = True,
+    dry_run: bool = False,
+):
+    """Pull market cap (and current price) from yfinance for V2 catalyst_universe
+    tickers and UPSERT into screener_stocks.market_cap.
+    
+    Args:
+      limit: max tickers per call (default 100). yfinance is rate-limited; batches.
+      only_missing: only fetch tickers where market_cap is NULL or 0 (default True)
+      dry_run: report what would change but don't write
+    
+    Returns: {fetched, written, errors, results: [{ticker, market_cap, current_price}]}
+    """
+    try:
+        import yfinance as yf
+        from services.database import BiotechDatabase
+        db = BiotechDatabase()
+
+        # 1. Find target tickers
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            if only_missing:
+                cur.execute("""
+                    SELECT DISTINCT cu.ticker
+                    FROM catalyst_universe cu
+                    LEFT JOIN screener_stocks ss ON ss.ticker = cu.ticker
+                    WHERE (ss.market_cap IS NULL OR ss.market_cap = 0)
+                      AND cu.ticker IS NOT NULL
+                      AND cu.ticker != ''
+                    ORDER BY cu.ticker
+                    LIMIT %s
+                """, (limit,))
+            else:
+                cur.execute("""
+                    SELECT DISTINCT ticker FROM catalyst_universe
+                    WHERE ticker IS NOT NULL AND ticker != ''
+                    ORDER BY ticker
+                    LIMIT %s
+                """, (limit,))
+            tickers = [r[0] for r in cur.fetchall()]
+
+        if not tickers:
+            return {"fetched": 0, "written": 0, "errors": 0, "results": [],
+                    "note": "no tickers needing backfill"}
+
+        # 2. Batch yfinance fetch
+        results = []
+        errors = 0
+        for ticker in tickers:
+            try:
+                t = yf.Ticker(ticker)
+                info = t.info or {}
+                mcap = info.get("marketCap") or 0  # in USD
+                price = info.get("currentPrice") or info.get("regularMarketPrice") or 0
+                company = info.get("longName") or info.get("shortName") or ticker
+                industry = info.get("industry") or "Biotechnology"
+                if mcap == 0:
+                    # Try fast_info as fallback
+                    try:
+                        fi = getattr(t, "fast_info", None)
+                        if fi:
+                            mcap = (fi.get("marketCap") if hasattr(fi, "get") else getattr(fi, "market_cap", 0)) or 0
+                            price = price or (fi.get("lastPrice") if hasattr(fi, "get") else getattr(fi, "last_price", 0))
+                    except Exception:
+                        pass
+                results.append({
+                    "ticker": ticker,
+                    "market_cap_m": round(mcap / 1_000_000, 2) if mcap else 0,
+                    "market_cap_b": round(mcap / 1_000_000_000, 3) if mcap else 0,
+                    "current_price": price,
+                    "company_name": company,
+                    "industry": industry,
+                })
+            except Exception as e:
+                errors += 1
+                results.append({"ticker": ticker, "error": str(e)[:100]})
+
+        # 3. UPSERT into screener_stocks
+        written = 0
+        if not dry_run:
+            with db.get_conn() as conn:
+                cur = conn.cursor()
+                for r in results:
+                    if "error" in r or not r.get("market_cap_m"):
+                        continue
+                    try:
+                        # screener_stocks UNIQUE on (ticker, catalyst_type, catalyst_date)
+                        # Use empty string defaults for the catalyst_type/date if needed
+                        cur.execute("""
+                            INSERT INTO screener_stocks
+                                (ticker, company_name, industry, market_cap,
+                                 catalyst_type, catalyst_date, probability,
+                                 description, last_updated)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW()::text)
+                            ON CONFLICT (ticker, catalyst_type, catalyst_date) DO UPDATE SET
+                                company_name = EXCLUDED.company_name,
+                                industry = EXCLUDED.industry,
+                                market_cap = EXCLUDED.market_cap,
+                                last_updated = NOW()::text
+                        """, (
+                            r["ticker"], r.get("company_name", r["ticker"]),
+                            r.get("industry", "Biotechnology"),
+                            r["market_cap_m"] / 1000,  # screener_stocks.market_cap is in $B
+                            "", "", 0.5,
+                            f"yfinance backfill — current_price ${r.get('current_price', 0)}",
+                        ))
+                        written += 1
+                    except Exception as e:
+                        errors += 1
+                        r["upsert_error"] = str(e)[:100]
+                conn.commit()
+
+        return {
+            "fetched": len(tickers),
+            "written": written if not dry_run else 0,
+            "errors": errors,
+            "dry_run": dry_run,
+            "results": results,
+        }
+    except Exception as e:
+        logger.exception("market cap backfill failed")
+        raise HTTPException(500, f"backfill error: {e}")
