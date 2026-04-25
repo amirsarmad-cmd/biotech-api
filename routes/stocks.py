@@ -27,15 +27,23 @@ def db():
 
 def _to_jsonable(obj: Any) -> Any:
     """Recursively convert numpy/pandas/other non-JSON types to plain Python."""
+    import math
     try:
         import numpy as _np
     except ImportError:
         _np = None
+    # Filter NaN/Infinity which aren't JSON-compliant
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
     if _np is not None:
         if isinstance(obj, (_np.integer,)):
             return int(obj)
         if isinstance(obj, (_np.floating,)):
-            return float(obj)
+            v = float(obj)
+            if math.isnan(v) or math.isinf(v):
+                return None
+            return v
         if isinstance(obj, (_np.ndarray,)):
             return [_to_jsonable(x) for x in obj.tolist()]
     if isinstance(obj, dict):
