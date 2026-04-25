@@ -334,6 +334,66 @@ def _call_openai_extract(ticker: str, company_name: str) -> List[Dict]:
     return out
 
 
+def _extract_first_json_object(text: str) -> str:
+    """
+    Pull the first complete JSON object out of a possibly-noisy LLM response.
+    Handles markdown fences, duplicated outputs, and trailing prose.
+    """
+    if not text:
+        return ""
+    
+    # Strip markdown fences (```json ... ``` or ``` ... ```)
+    if "```" in text:
+        # Try to find content between first ``` and matching close
+        start = text.find("```")
+        # Skip the language specifier line
+        nl = text.find("\n", start)
+        if nl > 0:
+            inner_start = nl + 1
+            close = text.find("```", inner_start)
+            if close > 0:
+                text = text[inner_start:close]
+            else:
+                text = text[inner_start:]
+    
+    # Find first { and matching close brace via depth counter
+    text = text.strip()
+    if not text.startswith("{") and not text.startswith("["):
+        # find first { or [
+        b = text.find("{")
+        s = text.find("[")
+        first = min(p for p in [b, s] if p >= 0) if (b >= 0 or s >= 0) else -1
+        if first < 0:
+            return ""
+        text = text[first:]
+    
+    # Walk depth — first complete object/array wins
+    open_ch = text[0]
+    close_ch = "}" if open_ch == "{" else "]"
+    depth = 0
+    in_string = False
+    escape = False
+    for i, ch in enumerate(text):
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == '"' and not escape:
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == open_ch:
+            depth += 1
+        elif ch == close_ch:
+            depth -= 1
+            if depth == 0:
+                return text[: i + 1]
+    return text  # incomplete, return what we have
+
+
 def _call_gemini_extract(ticker: str, company_name: str) -> List[Dict]:
     """Call Gemini 2.5 Flash with Google Search grounding for real-time biotech facts."""
     from google import genai
@@ -343,8 +403,8 @@ def _call_gemini_extract(ticker: str, company_name: str) -> List[Dict]:
     prompt = _build_extraction_prompt(ticker, company_name)
     
     config = types.GenerateContentConfig(
-        max_output_tokens=2000,
-        temperature=0.1,  # low for factual extraction
+        max_output_tokens=8000,         # generous so JSON isn't truncated mid-output
+        temperature=0.1,                # low for factual extraction
     )
     if GEMINI_GROUNDING:
         # Enable Google Search as a tool — model decides when to use it
@@ -357,18 +417,20 @@ def _call_gemini_extract(ticker: str, company_name: str) -> List[Dict]:
     )
     
     text = response.text or ""
-    # Strip markdown fences if present
     text = text.strip()
-    if text.startswith("```"):
-        # Remove first line ```json or ``` and last line ```
-        lines = text.split("\n")
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        text = "\n".join(lines)
     
-    parsed = json.loads(text) if text else {}
+    # Gemini sometimes returns duplicated outputs concatenated. Find the FIRST complete JSON object.
+    text = _extract_first_json_object(text)
+    
+    if not text:
+        logger.warning(f"[gemini] {ticker} returned empty/unparseable text")
+        return []
+    
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as e:
+        logger.warning(f"[gemini] {ticker} JSON decode failed: {e}; first 200 chars: {text[:200]}")
+        return []
     if isinstance(parsed, dict):
         for k in ("catalysts", "results", "data", "items"):
             if k in parsed and isinstance(parsed[k], list):
