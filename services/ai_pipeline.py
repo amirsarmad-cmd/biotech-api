@@ -1,6 +1,6 @@
 """Fastest AI pipeline: 3 models FULLY PARALLEL, return immediately. Optional consensus pass."""
 import os, re, logging, time as _time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 logger = logging.getLogger(__name__)
 
 def _extract_probability(text):
@@ -166,6 +166,7 @@ def run_parallel_only(context, question="", subfactor_weights=None, progress_cb=
     if progress_cb: progress_cb(5, "🟣🔵🟢 3 models analysing in parallel...")
 
     results = {}
+    OVERALL_TIMEOUT = 70  # seconds
     with ThreadPoolExecutor(max_workers=3) as ex:
         futs = {
             ex.submit(_call_claude, prompt): "claude",
@@ -173,17 +174,38 @@ def run_parallel_only(context, question="", subfactor_weights=None, progress_cb=
             ex.submit(_call_gpt, prompt): "gpt",
         }
         done_count = 0
-        for fut in as_completed(futs, timeout=70):
-            name = futs[fut]
-            try:
-                results[name] = fut.result(timeout=5)
-                done_count += 1
-                elapsed = _time.time() - t0
-                logger.info(f"  {name} ready at {elapsed:.1f}s")
-                if progress_cb: progress_cb(20 + done_count*25, f"✅ {name} ready at {elapsed:.0f}s")
-            except Exception as e:
-                results[name] = f"**{name} failed:** {e}"
-                logger.warning(f"  {name} failed: {e}")
+        # Tolerate partial completion: if 1 provider hangs past timeout,
+        # use the 2 that finished rather than failing everything.
+        try:
+            for fut in as_completed(futs, timeout=OVERALL_TIMEOUT):
+                name = futs[fut]
+                try:
+                    results[name] = fut.result(timeout=5)
+                    done_count += 1
+                    elapsed = _time.time() - t0
+                    logger.info(f"  {name} ready at {elapsed:.1f}s")
+                    if progress_cb: progress_cb(20 + done_count*25, f"✅ {name} ready at {elapsed:.0f}s")
+                except Exception as e:
+                    results[name] = f"**{name} failed:** {e}"
+                    logger.warning(f"  {name} failed: {e}")
+        except FuturesTimeoutError:
+            logger.warning(f"parallel: {OVERALL_TIMEOUT}s overall timeout reached — using {done_count}/3 results")
+        # After main loop (either completed or timed out): salvage any
+        # remaining-but-already-done futures, mark the rest as timed out.
+        for fut, name in futs.items():
+            if name in results:
+                continue
+            if fut.done():
+                try:
+                    results[name] = fut.result(timeout=1)
+                    done_count += 1
+                    logger.info(f"  {name} salvaged after main loop")
+                except Exception as e:
+                    results[name] = f"**{name} failed:** {e}"
+            else:
+                fut.cancel()
+                results[name] = f"**{name} failed:** timed out after {OVERALL_TIMEOUT}s and was cancelled"
+                logger.warning(f"  {name} cancelled (still running at timeout)")
 
     claude_out = results.get("claude", "")
     gemini_out = results.get("gemini", "")
