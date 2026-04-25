@@ -237,15 +237,126 @@ class BiotechDatabase:
             conn.close()
 
     def get_all_stocks(self) -> List[Dict]:
+        """Return one row per ticker — the nearest upcoming catalyst from catalyst_universe.
+        
+        V2: Reads from catalyst_universe (full IBB+XBI ETF coverage). For each ticker,
+        picks the closest future catalyst as the 'primary'. Falls back to screener_stocks
+        for legacy tickers not yet seeded into V2.
+        """
         conn = self._conn()
         try:
             cur = conn.cursor()
-            cur.execute("SELECT * FROM screener_stocks ORDER BY overall_score DESC")
-            cols = [d[0] for d in cur.description]
-            return [dict(zip(cols, r)) for r in cur.fetchall()]
+            
+            # Pick nearest future catalyst per ticker from catalyst_universe
+            cur.execute("""
+                WITH ranked AS (
+                    SELECT 
+                        ticker, company_name, catalyst_type, catalyst_date::TEXT AS catalyst_date,
+                        description, drug_name, indication, phase, confidence_score,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY ticker 
+                            ORDER BY 
+                              CASE WHEN catalyst_date >= CURRENT_DATE THEN 0 ELSE 1 END,
+                              catalyst_date ASC,
+                              confidence_score DESC NULLS LAST
+                        ) AS rn
+                    FROM catalyst_universe
+                    WHERE status = 'active' 
+                      AND catalyst_date IS NOT NULL
+                      AND (drug_name IS NOT NULL OR indication IS NOT NULL)
+                )
+                SELECT ticker, company_name, catalyst_type, catalyst_date,
+                       description, drug_name, indication, phase, confidence_score
+                FROM ranked WHERE rn = 1
+            """)
+            v2_cols = [d[0] for d in cur.description]
+            v2_rows = [dict(zip(v2_cols, r)) for r in cur.fetchall()]
+            
+            # Fetch market_cap and other metadata from screener_stocks (legacy table — fallback)
+            v2_tickers = {r["ticker"] for r in v2_rows}
+            cur.execute("SELECT ticker, market_cap, industry, news_count, sentiment_score FROM screener_stocks")
+            legacy = {r[0]: {"market_cap": r[1] or 0, "industry": r[2] or "Biotechnology",
+                            "news_count": r[3] or 0, "sentiment_score": r[4] or 0} 
+                      for r in cur.fetchall()}
+            
+            # Build canonical rows
+            results = []
+            
+            # Phase-based default probability
+            def _prob_from_catalyst(catalyst_type: str, phase: str | None) -> float:
+                t = (catalyst_type or "").lower()
+                p = (phase or "").lower()
+                if "fda decision" in t or "pdufa" in t: return 0.65
+                if "phase 3" in t or "phase iii" in p: return 0.50
+                if "phase 2" in t or "phase ii" in p: return 0.45
+                if "phase 1" in t or "phase i" in p: return 0.40
+                if "adcomm" in t: return 0.55
+                if "bla" in t or "nda" in t: return 0.55
+                if "partnership" in t: return 0.50
+                if "clinical trial" in t: return 0.45
+                return 0.40
+            
+            from datetime import date as _date, datetime as _dt
+            today = _date.today()
+            
+            for v2 in v2_rows:
+                ticker = v2["ticker"]
+                meta = legacy.get(ticker, {"market_cap": 0, "industry": "Biotechnology",
+                                          "news_count": 0, "sentiment_score": 0})
+                
+                # Compute days until catalyst
+                try:
+                    cat_date = _dt.strptime(v2["catalyst_date"], "%Y-%m-%d").date()
+                    days = (cat_date - today).days
+                except Exception:
+                    days = 365
+                
+                prob = _prob_from_catalyst(v2["catalyst_type"], v2.get("phase"))
+                
+                # Overall score: probability × proximity factor × confidence
+                # Proximity: 1.0 for today, 0.5 for 180 days out
+                proximity = max(0.1, 1 - (days / 365)) if days >= 0 else 0.3
+                conf = float(v2.get("confidence_score") or 0.7)
+                overall_score = prob * proximity * conf * 1.4  # multiplier so scores are 0-1 range
+                
+                results.append({
+                    "ticker": ticker,
+                    "company_name": v2.get("company_name") or ticker,
+                    "industry": meta["industry"],
+                    "market_cap": float(meta["market_cap"]),
+                    "catalyst_type": v2.get("catalyst_type") or "Unknown",
+                    "catalyst_date": v2["catalyst_date"],
+                    "probability": prob,
+                    "description": v2.get("description") or "",
+                    "drug_name": v2.get("drug_name"),
+                    "indication": v2.get("indication"),
+                    "phase": v2.get("phase"),
+                    "news_count": int(meta["news_count"]),
+                    "sentiment_score": float(meta["sentiment_score"]),
+                    "overall_score": min(1.0, overall_score),
+                    "last_updated": today.isoformat(),
+                })
+            
+            # Add legacy screener_stocks tickers that aren't in V2 universe yet
+            cur.execute("SELECT * FROM screener_stocks WHERE ticker NOT IN %s",
+                        (tuple(v2_tickers) if v2_tickers else ("__none__",),))
+            legacy_cols = [d[0] for d in cur.description]
+            for r in cur.fetchall():
+                results.append(dict(zip(legacy_cols, r)))
+            
+            results.sort(key=lambda x: x.get("overall_score") or 0, reverse=True)
+            return results
         except Exception as e:
             logger.error(f"get_all_stocks: {e}")
-            return []
+            # Fallback: pure legacy
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT * FROM screener_stocks ORDER BY overall_score DESC")
+                cols = [d[0] for d in cur.description]
+                return [dict(zip(cols, r)) for r in cur.fetchall()]
+            except Exception as e2:
+                logger.error(f"get_all_stocks fallback: {e2}")
+                return []
         finally:
             conn.close()
 
