@@ -724,6 +724,94 @@ def get_seed_universe() -> List[Dict]:
         {"ticker": "ZBIO", "company_name": "Zenas BioPharma", "source": "seed"},
         {"ticker": "ZIMV", "company_name": "ZimVie Inc", "source": "seed"},
         {"ticker": "ZYXI", "company_name": "Zynex Medical", "source": "seed"},
+        # ── IBB + XBI ETF members added Apr 2026 — completing index coverage ──
+        {"ticker": "ARGX", "company_name": "ARGENX SE ADR", "source": "etf_ibb_xbi"},
+        {"ticker": "ONC", "company_name": "BEONE MEDICINES AG", "source": "etf_ibb_xbi"},
+        {"ticker": "MEDP", "company_name": "MEDPACE HOLDINGS INC", "source": "etf_ibb_xbi"},
+        {"ticker": "PCVX", "company_name": "VAXCYTE INC", "source": "etf_ibb_xbi"},
+        {"ticker": "CRL", "company_name": "CHARLES RIVER LABORATORIES INTERNA", "source": "etf_ibb_xbi"},
+        {"ticker": "ABVX", "company_name": "ABIVAX AMERICAN DEPOSITARY SHARES", "source": "etf_ibb_xbi"},
+        {"ticker": "TEM", "company_name": "TEMPUS AI INC CLASS A", "source": "etf_ibb_xbi"},
+        {"ticker": "SYRE", "company_name": "SPYRE THERAPEUTICS INC", "source": "etf_ibb_xbi"},
+        {"ticker": "BRKR", "company_name": "BRUKER CORP", "source": "etf_ibb_xbi"},
+        {"ticker": "IBRX", "company_name": "IMMUNITYBIO INC", "source": "etf_ibb_xbi"},
+        {"ticker": "ORKA", "company_name": "ORUKA THERAPEUTICS INC", "source": "etf_ibb_xbi"},
+        {"ticker": "VCYT", "company_name": "VERACYTE INC", "source": "etf_ibb_xbi"},
+        {"ticker": "TXG", "company_name": "10X GENOMICS INC CLASS A", "source": "etf_ibb_xbi"},
+        {"ticker": "GPCR", "company_name": "STRUCTURE THERAPEUTICS ADR INC", "source": "etf_ibb_xbi"},
+        {"ticker": "EWTX", "company_name": "EDGEWISE THERAPEUTICS INC", "source": "etf_ibb_xbi"},
+        {"ticker": "CAI", "company_name": "CARIS LIFE SCIENCES INC", "source": "etf_ibb_xbi"},
+        {"ticker": "NAMS", "company_name": "NEWAMSTERDAM PHARMA NV", "source": "etf_ibb_xbi"},
+        {"ticker": "DFTX", "company_name": "DEFINIUM THERAPEUTICS INC", "source": "etf_ibb_xbi"},
+        {"ticker": "ADPT", "company_name": "ADAPTIVE BIOTECHNOLOGIES CORP", "source": "etf_ibb_xbi"},
+        {"ticker": "IRON", "company_name": "DISC MEDICINE INC", "source": "etf_ibb_xbi"},
+        {"ticker": "ZLAB", "company_name": "ZAI LABORATORY ADR REPRESENTING LT", "source": "etf_ibb_xbi"},
+        {"ticker": "GRAL", "company_name": "GRAIL INC", "source": "etf_ibb_xbi"},
+        {"ticker": "MLYS", "company_name": "MINERALYS THERAPEUTICS INC", "source": "etf_ibb_xbi"},
+        {"ticker": "INBX", "company_name": "INHIBRX BIOSCIENCES INC", "source": "etf_ibb_xbi"},
+        {"ticker": "NUVB", "company_name": "NUVATION BIO INC CLASS A", "source": "etf_ibb_xbi"},
+        {"ticker": "GRFS", "company_name": "GRIFOLS ADR REPRESENTING ONE NON-V", "source": "etf_ibb_xbi"},
+        {"ticker": "MESO", "company_name": "MESOBLAST ADR REPRESENTING LTD", "source": "etf_ibb_xbi"},
+        {"ticker": "SION", "company_name": "SIONNA THERAPEUTICS INC", "source": "etf_ibb_xbi"},
+        {"ticker": "GLUE", "company_name": "MONTE ROSA THERAPEUTICS INC", "source": "etf_ibb_xbi"},
+        {"ticker": "FTRE", "company_name": "FORTREA HOLDINGS INC", "source": "etf_ibb_xbi"},
+        {"ticker": "MBX", "company_name": "MBX BIOSCIENCES INC", "source": "etf_ibb_xbi"},
+        {"ticker": "XNCR", "company_name": "XENCOR INC", "source": "etf_ibb_xbi"},
+        {"ticker": "GHRS", "company_name": "GH RESEARCH PLC", "source": "etf_ibb_xbi"},
+        {"ticker": "BCAX", "company_name": "BICARA THERAPEUTICS INC", "source": "etf_ibb_xbi"},
+        {"ticker": "AVBP", "company_name": "ARRIVENT BIOPHARMA INC", "source": "etf_ibb_xbi"},
+        {"ticker": "STVN", "company_name": "STEVANATO GROUP", "source": "etf_ibb_xbi"},
+        {"ticker": "ANRO", "company_name": "ALTO NEUROSCIENCE INC", "source": "etf_ibb_xbi"},
+        {"ticker": "PHVS", "company_name": "PHARVARIS N V NV", "source": "etf_ibb_xbi"},
+        {"ticker": "MAZE", "company_name": "MAZE THERAPEUTICS INC", "source": "etf_ibb_xbi"},
+        {"ticker": "SEPN", "company_name": "SEPTERNA INC", "source": "etf_ibb_xbi"},
+        {"ticker": "ABUS", "company_name": "ARBUTUS BIOPHARMA CORP", "source": "etf_ibb_xbi"},
+        {"ticker": "ZVRA", "company_name": "ZEVRA THERAPEUTICS INC", "source": "etf_ibb_xbi"},
+        {"ticker": "ABSI", "company_name": "ABSCI CORP", "source": "etf_ibb_xbi"},
+        {"ticker": "SPRY", "company_name": "ARS PHARMACEUTICALS INC", "source": "etf_ibb_xbi"},
+        {"ticker": "BIOA", "company_name": "BIOAGE LABS INC", "source": "etf_ibb_xbi"},
+        {"ticker": "FULC", "company_name": "FULCRUM THERAPEUTICS INC", "source": "etf_ibb_xbi"},
+        {"ticker": "FDMT", "company_name": "4D MOLECULAR THERAPEUTICS INC", "source": "etf_ibb_xbi"},
+        {"ticker": "CATX", "company_name": "PERSPECTIVE THERAPEUTICS INC", "source": "etf_ibb_xbi"},
+        {"ticker": "BBOT", "company_name": "BRIDGEBIO ONCOLOGY THERAPEUTICS IN", "source": "etf_ibb_xbi"},
+        {"ticker": "CADL", "company_name": "CANDEL THERAPEUTICS INC", "source": "etf_ibb_xbi"},
+        {"ticker": "ALVO", "company_name": "ALVOTECH SA", "source": "etf_ibb_xbi"},
+        {"ticker": "LXEO", "company_name": "LEXEO THERAPEUTICS INC", "source": "etf_ibb_xbi"},
+        {"ticker": "MRVI", "company_name": "MARAVAI LIFESCIENCES HOLDINGS INC", "source": "etf_ibb_xbi"},
+        {"ticker": "CTNM", "company_name": "CONTINEUM THERAPEUTICS INC CLASS A", "source": "etf_ibb_xbi"},
+        {"ticker": "AURA", "company_name": "AURA BIOSCIENCES INC", "source": "etf_ibb_xbi"},
+        {"ticker": "NGNE", "company_name": "NEUROGENE INC", "source": "etf_ibb_xbi"},
+        {"ticker": "DNA", "company_name": "GINKGO BIOWORKS HOLDINGS INC CLASS", "source": "etf_ibb_xbi"},
+        {"ticker": "FLGT", "company_name": "FULGENT GENETICS INC", "source": "etf_ibb_xbi"},
+        {"ticker": "KYTX", "company_name": "KYVERNA THERAPEUTICS INC", "source": "etf_ibb_xbi"},
+        {"ticker": "TECX", "company_name": "TECTONIC THERAPEUTIC INC", "source": "etf_ibb_xbi"},
+        {"ticker": "AUTL", "company_name": "AUTOLUS THERAPEUTICS ADR PLC", "source": "etf_ibb_xbi"},
+        {"ticker": "LENZ", "company_name": "LENZ THERAPEUTICS INC", "source": "etf_ibb_xbi"},
+        {"ticker": "CCCC", "company_name": "C4 THERAPEUTICS INC", "source": "etf_ibb_xbi"},
+        {"ticker": "OABI", "company_name": "OMNIAB INC", "source": "etf_ibb_xbi"},
+        {"ticker": "CRBU", "company_name": "CARIBOU BIOSCIENCES INC", "source": "etf_ibb_xbi"},
+        {"ticker": "NBP", "company_name": "NOVABRIDGE BIOSCIENCES ADR", "source": "etf_ibb_xbi"},
+        {"ticker": "VYGR", "company_name": "VOYAGER THERAPEUTICS INC", "source": "etf_ibb_xbi"},
+        {"ticker": "LYEL", "company_name": "LYELL IMMUNOPHARMA INC", "source": "etf_ibb_xbi"},
+        {"ticker": "FHTX", "company_name": "FOGHORN THERAPEUTICS INC", "source": "etf_ibb_xbi"},
+        {"ticker": "SGMT", "company_name": "SAGIMET BIOSCIENCES INC SERIES A", "source": "etf_ibb_xbi"},
+        {"ticker": "NMRA", "company_name": "NEUMORA THERAPEUTICS INC", "source": "etf_ibb_xbi"},
+        {"ticker": "QTRX", "company_name": "QUANTERIX CORP", "source": "etf_ibb_xbi"},
+        {"ticker": "TRAX", "company_name": "FIRST TRACKS BIOTHERAPEUTICS INC", "source": "etf_ibb_xbi"},
+        {"ticker": "AARD", "company_name": "AARDVARK THERAPEUTICS INC", "source": "etf_ibb_xbi"},
+        {"ticker": "MENS", "company_name": "JYONG BIOTECH LTD", "source": "etf_ibb_xbi"},
+        {"ticker": "AKE", "company_name": "AKERO THERAPEUTICS CVR", "source": "etf_ibb_xbi"},
+        {"ticker": "TKNO", "company_name": "ALPHA TEKNOVA INC", "source": "etf_ibb_xbi"},
+        {"ticker": "ADRO", "company_name": "CHINOOK THERAPEUTICS INC", "source": "etf_ibb_xbi"},
+        {"ticker": "THRD", "company_name": "THIRD HARMONIC BIO INC", "source": "etf_ibb_xbi"},
+        {"ticker": "CRGX", "company_name": "CARGO THERAPEUTICS INC", "source": "etf_ibb_xbi"},
+        {"ticker": "DNTH", "company_name": "DIANTHUS THERAPEUTICS INC", "source": "etf_ibb_xbi"},
+        {"ticker": "PVLA", "company_name": "PALVELLA THERAPEUTICS INC", "source": "etf_ibb_xbi"},
+        {"ticker": "SLS", "company_name": "SELLAS LIFE SCIENCES GROUP I", "source": "etf_ibb_xbi"},
+        {"ticker": "CMPX", "company_name": "COMPASS THERAPEUTICS INC", "source": "etf_ibb_xbi"},
+        {"ticker": "PURR", "company_name": "HYPERLIQUID STRATEGIES", "source": "etf_ibb_xbi"},
+        {"ticker": "IVVD", "company_name": "INVIVYD INC", "source": "etf_ibb_xbi"},
+        {"ticker": "DMRA", "company_name": "DAMORA THERAPEUTICS INC", "source": "etf_ibb_xbi"},
     
     ]
     return SEED_TICKERS
@@ -1375,7 +1463,7 @@ def write_catalysts_to_db(catalysts: List[Dict], conn) -> Dict:
 # ────────────────────────────────────────────────────────────
 # Top-level orchestration
 # ────────────────────────────────────────────────────────────
-def run_universe_seed(max_tickers: Optional[int] = None) -> Dict:
+def run_universe_seed(max_tickers: Optional[int] = None, start_idx: int = 0) -> Dict:
     """
     Main entry point. Run from /admin/universe/v2-seed endpoint or cron.
     Returns a summary dict with counts + cost incurred + errors.
@@ -1403,6 +1491,8 @@ def run_universe_seed(max_tickers: Optional[int] = None) -> Dict:
         logger.warning(f"cron_runs insert failed: {e}")
     
     universe = get_seed_universe()
+    if start_idx > 0:
+        universe = universe[start_idx:]
     cap = max_tickers or MAX_TICKERS_PER_RUN
     universe = universe[:cap]
     
