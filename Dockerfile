@@ -1,5 +1,6 @@
 # biotech-api: FastAPI backend
 FROM python:3.11-slim
+LABEL BUILD_TS_BUST=1777152679
 
 WORKDIR /app
 
