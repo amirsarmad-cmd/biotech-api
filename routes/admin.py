@@ -196,6 +196,22 @@ async def universe_spend():
         raise HTTPException(500, f"spend error: {e}")
 
 
+@router.delete("/universe/v2-mock-clear")
+async def clear_mock_catalysts(confirm: bool = False):
+    """Delete all rows where source='mock'. Pass confirm=true to execute."""
+    if not confirm:
+        raise HTTPException(400, "Pass ?confirm=true to delete mock rows")
+    try:
+        with _pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM catalyst_universe WHERE source='mock' RETURNING id")
+                deleted = len(cur.fetchall())
+                conn.commit()
+                return {"deleted": deleted}
+    except Exception as e:
+        raise HTTPException(500, f"clear error: {e}")
+
+
 @router.get("/universe/v2-cron-runs")
 async def universe_cron_runs(limit: int = 20):
     """Show recent cron_runs entries."""
