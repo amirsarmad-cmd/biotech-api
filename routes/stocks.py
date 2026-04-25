@@ -332,7 +332,16 @@ async def get_stock_news(ticker: str, limit: int = Query(20, ge=1, le=50)):
     ticker = ticker.upper().strip()
     try:
         from services.fetcher_news import fetch_all_sources
-        sources = fetch_all_sources(ticker, days_back=30)
+        # Look up company name + catalyst from DB
+        rows = db().get_stock(ticker) or []
+        if rows:
+            primary = sorted(rows, key=lambda r: r.get("probability") or 0, reverse=True)[0]
+            company = primary.get("company_name") or ticker
+            catalyst = primary.get("catalyst_type") or ""
+        else:
+            company = ticker
+            catalyst = ""
+        sources = fetch_all_sources(ticker, company, catalyst) or []
         return _to_jsonable({"ticker": ticker, "count": len(sources), "articles": sources[:limit]})
     except Exception as e:
         logger.exception(f"news fetch failed for {ticker}")
