@@ -133,7 +133,7 @@ Return ONLY the JSON object."""
         
         if _call_llm_json is None:
             raise RuntimeError("LLM helper unavailable")
-        result, err = _call_llm_json(prompt, max_tokens=1500)
+        result, err = _call_llm_json(prompt, max_tokens=1500, feature="risk_factors", ticker=ticker)
         if result is None:
             raise RuntimeError(f"All LLM providers failed: {err}")
         

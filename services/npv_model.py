@@ -133,7 +133,7 @@ GUIDANCE:
 
 Return ONLY the JSON object."""
         
-        result, err = _call_llm_json(prompt, max_tokens=1200)
+        result, err = _call_llm_json(prompt, max_tokens=1200, feature="npv_legacy", ticker=ticker)
         if result is None:
             raise RuntimeError(f"All LLM providers failed: {err}")
         result["error"] = None
@@ -641,7 +641,7 @@ If your structured numbers imply unrealistic peak (e.g. >$10B for label expansio
 Return ONLY the JSON object."""
 
     try:
-        result, err = _call_llm_json(prompt, max_tokens=1800)
+        result, err = _call_llm_json(prompt, max_tokens=1800, feature="npv_v2", ticker=ticker)
         if result is None:
             raise RuntimeError(f"All LLM providers failed: {err}")
 

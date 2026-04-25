@@ -248,7 +248,7 @@ def analyze_news_npv_impact(
             news_block=news_block,
         )
         
-        data, err = _call_llm_json(prompt, max_tokens=2500, temperature=0.2)
+        data, err = _call_llm_json(prompt, max_tokens=2500, temperature=0.2, feature="news_impact", ticker=ticker)
         
         if data is None:
             return {
