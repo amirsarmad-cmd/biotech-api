@@ -14,3 +14,5 @@ anthropic>=0.20.0
 openai>=1.0.0
 google-genai>=0.8.0
 yfinance>=0.2.0
+alembic>=1.13.0
+sqlalchemy>=2.0.0
