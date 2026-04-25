@@ -93,11 +93,8 @@ async def add_to_shortlist(req: AddRequest):
             ticker=req.ticker.upper().strip(),
             company_name=req.company_name,
             initial_price=req.initial_price,
-            catalyst_type=req.catalyst_type,
-            catalyst_date=req.catalyst_date,
-            initial_probability=req.initial_probability,
             initial_score=req.initial_score,
-            notes=req.notes,
+            initial_sentiment=0,
         )
         if not ok:
             raise HTTPException(500, "Failed to add to shortlist")
