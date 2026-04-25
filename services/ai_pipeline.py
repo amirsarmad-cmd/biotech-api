@@ -109,42 +109,97 @@ Output:
 
 Under 300 words. Fast synthesis — no duplication."""
 
-def _call_claude(prompt, max_tok=2500):
+def _call_claude(prompt, max_tok=2500, feature="ai_pipeline", ticker=None):
+    import time as _t
+    t0 = _t.time()
+    model = "claude-sonnet-4-5"
     try:
         import anthropic
         client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY",""), timeout=55.0)
-        msg = client.messages.create(model="claude-sonnet-4-5", max_tokens=max_tok,
+        msg = client.messages.create(model=model, max_tokens=max_tok,
             messages=[{"role":"user","content":prompt}])
+        try:
+            from services.llm_usage import record_usage
+            usage = getattr(msg, "usage", None)
+            record_usage(provider="anthropic", model=model, feature=feature, ticker=ticker,
+                         tokens_input=getattr(usage, "input_tokens", 0) or 0 if usage else 0,
+                         tokens_output=getattr(usage, "output_tokens", 0) or 0 if usage else 0,
+                         duration_ms=int((_t.time()-t0)*1000), status="success")
+        except Exception: pass
         return msg.content[0].text
     except Exception as e:
+        try:
+            from services.llm_usage import record_usage
+            record_usage(provider="anthropic", model=model, feature=feature, ticker=ticker,
+                         tokens_input=0, tokens_output=0,
+                         duration_ms=int((_t.time()-t0)*1000), status="error",
+                         error_message=str(e)[:300])
+        except Exception: pass
         return f"**Claude error:** {e}"
 
-def _call_gemini(prompt):
+def _call_gemini(prompt, feature="ai_pipeline", ticker=None):
+    import time as _t
+    t0 = _t.time()
     last_err = None
+    last_model = None
     for model in ["gemini-2.5-flash", "gemini-2.5-pro"]:
+        last_model = model
         for attempt in range(2):
             try:
                 from google import genai as google_genai
                 client = google_genai.Client(api_key=os.getenv("GOOGLE_API_KEY",""))
                 r = client.models.generate_content(model=model, contents=prompt)
+                try:
+                    from services.llm_usage import record_usage
+                    usage = getattr(r, "usage_metadata", None)
+                    record_usage(provider="google", model=model, feature=feature, ticker=ticker,
+                                 tokens_input=getattr(usage, "prompt_token_count", 0) or 0 if usage else 0,
+                                 tokens_output=getattr(usage, "candidates_token_count", 0) or 0 if usage else 0,
+                                 duration_ms=int((_t.time()-t0)*1000), status="success")
+                except Exception: pass
                 return r.text
             except Exception as e:
                 last_err = str(e)
                 if "503" in last_err or "UNAVAILABLE" in last_err:
                     _time.sleep(2); continue
                 else: break
+    try:
+        from services.llm_usage import record_usage
+        record_usage(provider="google", model=last_model, feature=feature, ticker=ticker,
+                     tokens_input=0, tokens_output=0,
+                     duration_ms=int((_t.time()-t0)*1000), status="error",
+                     error_message=(last_err or "")[:300])
+    except Exception: pass
     return f"**Gemini error:** {last_err}"
 
-def _call_gpt(prompt):
+def _call_gpt(prompt, feature="ai_pipeline", ticker=None):
+    import time as _t
+    t0 = _t.time()
+    model = "gpt-4o"
     try:
         from openai import OpenAI
         client = OpenAI(api_key=os.getenv("OPENAI_API_KEY",""), timeout=55.0)
-        resp = client.chat.completions.create(model="gpt-4o", max_tokens=2500,
+        resp = client.chat.completions.create(model=model, max_tokens=2500,
             messages=[
                 {"role":"system","content":"You are a senior biotech investment analyst. Be quantitative."},
                 {"role":"user","content":prompt}])
+        try:
+            from services.llm_usage import record_usage
+            usage = getattr(resp, "usage", None)
+            record_usage(provider="openai", model=model, feature=feature, ticker=ticker,
+                         tokens_input=getattr(usage, "prompt_tokens", 0) or 0 if usage else 0,
+                         tokens_output=getattr(usage, "completion_tokens", 0) or 0 if usage else 0,
+                         duration_ms=int((_t.time()-t0)*1000), status="success")
+        except Exception: pass
         return resp.choices[0].message.content
     except Exception as e:
+        try:
+            from services.llm_usage import record_usage
+            record_usage(provider="openai", model=model, feature=feature, ticker=ticker,
+                         tokens_input=0, tokens_output=0,
+                         duration_ms=int((_t.time()-t0)*1000), status="error",
+                         error_message=str(e)[:300])
+        except Exception: pass
         return f"**GPT error:** {e}"
 
 def run_parallel_only(context, question="", subfactor_weights=None, progress_cb=None):
