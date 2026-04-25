@@ -444,3 +444,29 @@ async def universe_cron_runs(limit: int = 20):
                 return {"runs": items}
     except Exception as e:
         raise HTTPException(500, f"cron error: {e}")
+
+
+
+@router.delete("/universe/v2-clean-junk")
+async def clean_junk_catalysts(confirm: bool = False):
+    """Delete catalyst_universe rows where both drug_name AND indication are NULL.
+    These are partial extractions from the LLM that aren't useful for downstream NPV/risk analysis.
+    """
+    if not confirm:
+        raise HTTPException(400, "Pass ?confirm=true to delete junk rows")
+    try:
+        with _pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    DELETE FROM catalyst_universe 
+                    WHERE drug_name IS NULL AND indication IS NULL 
+                    RETURNING id, ticker, catalyst_type
+                """)
+                deleted = cur.fetchall()
+                conn.commit()
+                return {
+                    "deleted": len(deleted),
+                    "samples": [{"id": r[0], "ticker": r[1], "type": r[2]} for r in deleted[:5]]
+                }
+    except Exception as e:
+        raise HTTPException(500, f"clean error: {e}")
