@@ -949,86 +949,162 @@ def _call_openai_extract(ticker: str, company_name: str) -> List[Dict]:
 
 def _extract_first_json_object(text: str) -> str:
     """
-    Pull the first complete JSON object out of a possibly-noisy LLM response.
+    Pull the best JSON object out of a possibly-noisy LLM response.
     
     Robust against:
     - Markdown fences (```json ... ```)
-    - Gemini's duplicated outputs (response contains the same JSON twice, sometimes
-      with the first one truncated mid-stream — depth counter on raw text gets confused)
+    - Gemini's duplicated outputs: response contains TWO JSON blocks separated by
+      ``` markers, where the FIRST is often truncated mid-stream and the SECOND is
+      the model's retry. Splitting on fence boundaries lets us try each block
+      independently.
     - Mixed prose + JSON
     - Mid-stream truncation
     
-    Strategy: strip ALL ``` markers first, then try every `{` position as a start
-    candidate and return the first one that produces a valid balanced object.
+    Strategy:
+      1. Split on ``` markers to isolate fenced blocks
+      2. For each block (and the unfenced raw text as fallback), try every `{`
+         position and return the first one producing valid JSON with 'catalysts' key
+      3. Prefer object containing 'catalysts' key, then longest valid object
     """
     import json as _json
     if not text:
         return ""
     
-    # Strip ALL markdown fence markers entirely (not just the outer ones).
-    # This handles the case where Gemini returns: ```json\n{...truncated...}\n```json\n{...full...}\n```
-    cleaned = text.replace("```json", "").replace("```JSON", "").replace("```", "")
-    cleaned = cleaned.strip()
+    # Build list of segments to try. Each segment is processed independently —
+    # critical for handling Gemini's truncate-and-retry duplication pattern.
+    segments = []
     
-    if not cleaned:
-        return ""
+    # Split on ``` markers (with or without 'json' specifier)
+    import re as _re
+    parts = _re.split(r'```(?:json|JSON)?', text)
+    for p in parts:
+        p = p.strip()
+        if p:
+            segments.append(p)
     
-    # Try every '{' position as a start candidate. Return the first one that produces
-    # valid JSON via balanced-brace extraction.
-    candidates = []
-    pos = 0
-    while True:
-        idx = cleaned.find("{", pos)
-        if idx < 0:
-            break
-        candidates.append(idx)
-        pos = idx + 1
-        if len(candidates) > 20:  # safety cap
-            break
+    # Also include the raw text (in case there are no fences at all)
+    if not segments or text.strip() not in segments:
+        segments.append(text.strip())
     
-    # Collect ALL valid JSON candidates, then prefer one with 'catalysts' key
+    # For each segment, find all valid JSON objects and score them
     valid_candidates = []
-    for start in candidates:
-        candidate = _try_extract_balanced(cleaned[start:], "{", "}")
-        if candidate:
+    for segment in segments:
+        # Find all { positions in this segment as candidate starts
+        positions = []
+        pos = 0
+        while True:
+            idx = segment.find("{", pos)
+            if idx < 0:
+                break
+            positions.append(idx)
+            pos = idx + 1
+            if len(positions) > 30:
+                break
+        
+        for start in positions:
+            candidate = _try_extract_balanced(segment[start:], "{", "}")
+            if not candidate:
+                continue
             try:
                 parsed = _json.loads(candidate)
-                # Score: prefer dicts with 'catalysts' (or other expected) key
-                score = 0
-                if isinstance(parsed, dict):
-                    for k in ("catalysts", "results", "data", "items"):
-                        if k in parsed and isinstance(parsed[k], list):
-                            score = 1000 + len(parsed[k]) * 10
-                            break
-                    if score == 0:
-                        score = len(candidate)  # fallback: longest valid
-                valid_candidates.append((score, candidate))
             except _json.JSONDecodeError:
                 continue
+            # ONLY accept candidates that contain a recognized list key.
+            # Single nested objects like {"catalyst_type": "..."} don't have it
+            # and would lead to 0 catalysts being parsed downstream.
+            if isinstance(parsed, dict):
+                for k in ("catalysts", "results", "data", "items"):
+                    if k in parsed and isinstance(parsed[k], list):
+                        score = 1000 + len(parsed[k]) * 10
+                        valid_candidates.append((score, candidate))
+                        break
     
-    # Pick highest-scoring
     if valid_candidates:
         valid_candidates.sort(key=lambda t: -t[0])
         return valid_candidates[0][1]
     
-    # Try array-form too
-    pos = 0
-    while True:
-        idx = cleaned.find("[", pos)
-        if idx < 0:
-            break
-        candidate = _try_extract_balanced(cleaned[idx:], "[", "]")
-        if candidate:
-            try:
-                _json.loads(candidate)
-                return candidate
-            except _json.JSONDecodeError:
-                pass
-        pos = idx + 1
-        if pos > len(cleaned):
-            break
+    # Fallback 1: array-form
+    for segment in segments:
+        pos = 0
+        while True:
+            idx = segment.find("[", pos)
+            if idx < 0:
+                break
+            candidate = _try_extract_balanced(segment[idx:], "[", "]")
+            if candidate:
+                try:
+                    _json.loads(candidate)
+                    return candidate
+                except _json.JSONDecodeError:
+                    pass
+            pos = idx + 1
+            if pos > len(segment):
+                break
+    
+    # Fallback 2: extract complete items from truncated arrays
+    # (handles Gemini's mid-stream truncation cleanly)
+    for segment in segments:
+        rebuilt = _extract_items_from_truncated_array(segment)
+        if rebuilt:
+            return rebuilt
     
     return ""
+
+
+def _extract_items_from_truncated_array(text: str) -> str:
+    """Extract complete JSON objects from a truncated catalyst array.
+    
+    When LLM response is truncated mid-array (common with token limits),
+    extract whatever complete objects exist and wrap them in a valid JSON.
+    
+    Returns a valid JSON string like '{"catalysts": [...]}' or empty string.
+    """
+    import json as _json
+    
+    # Find the catalyst array opening
+    items = []
+    pos = 0
+    
+    # Look for the pattern: "catalysts": [ or just [ at start
+    arr_start = -1
+    for marker in ['"catalysts":', "'catalysts':"]:
+        idx = text.find(marker)
+        if idx >= 0:
+            # Find the [ after it
+            arr_start = text.find("[", idx)
+            if arr_start >= 0:
+                break
+    
+    if arr_start < 0:
+        # Try just [ as fallback
+        arr_start = text.find("[")
+        if arr_start < 0:
+            return ""
+    
+    # Now extract complete {...} objects after the [
+    pos = arr_start + 1
+    while pos < len(text):
+        # Find next {
+        obj_start = text.find("{", pos)
+        if obj_start < 0:
+            break
+        obj = _try_extract_balanced(text[obj_start:], "{", "}")
+        if not obj:
+            break  # can't extract complete object
+        try:
+            parsed_obj = _json.loads(obj)
+            if isinstance(parsed_obj, dict) and parsed_obj:
+                items.append(parsed_obj)
+        except _json.JSONDecodeError:
+            break
+        pos = obj_start + len(obj)
+        if len(items) > 30:  # safety cap
+            break
+    
+    if not items:
+        return ""
+    
+    return _json.dumps({"catalysts": items})
 
 
 def _try_extract_balanced(text: str, open_ch: str, close_ch: str) -> str:
