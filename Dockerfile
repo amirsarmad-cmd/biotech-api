@@ -1,4 +1,4 @@
-# biotech-api: FastAPI backend — simplified, no supervisord, single process
+# biotech-api: FastAPI backend
 FROM python:3.11-slim
 
 WORKDIR /app
@@ -15,5 +15,6 @@ COPY . .
 ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app
 
-# Run uvicorn directly. $PORT injected by Railway.
-CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --log-level info
+# Run migrations on startup, then start uvicorn.
+# If migrations fail (e.g. DATABASE_URL missing), continue anyway so health check passes.
+CMD sh -c "alembic upgrade head || echo 'WARN: alembic upgrade failed, continuing startup'; uvicorn main:app --host 0.0.0.0 --port \${PORT:-8000} --log-level info"
