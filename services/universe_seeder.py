@@ -1232,6 +1232,84 @@ def _canonicalize_drug(name: Optional[str]) -> Optional[str]:
 # ────────────────────────────────────────────────────────────
 # DB writer
 # ────────────────────────────────────────────────────────────
+def _normalize_catalyst_date(date_str: str):
+    """Normalize various date formats to YYYY-MM-DD with date_precision tracking.
+    
+    Handles:
+      '2026-08-15' -> ('2026-08-15', 'exact')
+      '2026-08'    -> ('2026-08-15', 'month')   # mid-month
+      '2026-Q3'    -> ('2026-08-15', 'quarter') # mid-quarter
+      'Q3 2026'    -> ('2026-08-15', 'quarter')
+      '2026-08-Q2' -> ('2026-08-15', 'quarter')
+      '2026'       -> ('2026-06-30', 'year')    # mid-year
+      'mid-2026'   -> ('2026-06-30', 'year')
+      'late 2026'  -> ('2026-10-31', 'year')
+      'H1 2026'    -> ('2026-03-31', 'year')
+      'Jun 2026'   -> ('2026-06-15', 'month')
+      'June 2026'  -> ('2026-06-15', 'month')
+    
+    Returns (iso_date | None, precision_label).
+    """
+    import re as _re
+    if not date_str:
+        return None, "exact"
+    s = str(date_str).strip()
+    
+    # Already valid YYYY-MM-DD
+    if _re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+        return s, "exact"
+    
+    # Quarter formats: 2026-Q3, Q3 2026, Q3-2026, 2026Q3
+    qmatch = _re.search(r"(\d{4}).*?Q([1-4])|Q([1-4]).*?(\d{4})", s, _re.IGNORECASE)
+    if qmatch:
+        if qmatch.group(1):
+            year = int(qmatch.group(1))
+            q = int(qmatch.group(2))
+        else:
+            year = int(qmatch.group(4))
+            q = int(qmatch.group(3))
+        mid_quarter = {1: "02-15", 2: "05-15", 3: "08-15", 4: "11-15"}
+        return f"{year}-{mid_quarter[q]}", "quarter"
+    
+    # YYYY-MM (no day): mid-month
+    mmatch = _re.fullmatch(r"(\d{4})-(\d{2})", s)
+    if mmatch:
+        year, month = mmatch.group(1), mmatch.group(2)
+        return f"{year}-{month}-15", "month"
+    
+    # YYYY only: mid-year
+    ymatch = _re.fullmatch(r"(\d{4})", s)
+    if ymatch:
+        return f"{ymatch.group(1)}-06-30", "year"
+    
+    # Season: early/mid/late, H1/H2, first/second half + year
+    season_match = _re.search(r"(early|mid|late|H1|H2|first half|second half)\W+(\d{4})", s, _re.IGNORECASE)
+    if season_match:
+        word = season_match.group(1).lower()
+        year = int(season_match.group(2))
+        date_map = {
+            "early": "03-31", "first half": "03-31", "h1": "03-31",
+            "mid": "06-30",
+            "late": "10-31", "second half": "10-31", "h2": "10-31",
+        }
+        for k, v in date_map.items():
+            if k in word:
+                return f"{year}-{v}", "year"
+        return f"{year}-06-30", "year"
+    
+    # Month name: Jun 2026, June 2026
+    month_names = {"jan":"01","feb":"02","mar":"03","apr":"04","may":"05","jun":"06",
+                   "jul":"07","aug":"08","sep":"09","oct":"10","nov":"11","dec":"12"}
+    mname_match = _re.search(r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\W+(\d{4})", s, _re.IGNORECASE)
+    if mname_match:
+        m_str = mname_match.group(1)[:3].lower()
+        year = mname_match.group(2)
+        return f"{year}-{month_names[m_str]}-15", "month"
+    
+    # Could not parse — return None to skip this catalyst
+    return None, "exact"
+
+
 def write_catalysts_to_db(catalysts: List[Dict], conn) -> Dict:
     """
     Upsert catalysts into catalyst_universe.
