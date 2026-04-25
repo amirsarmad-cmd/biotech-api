@@ -155,7 +155,10 @@ def get_daily_spend() -> Dict:
         "budget_usd": DAILY_LLM_BUDGET_USD,
         "remaining_usd": round(DAILY_LLM_BUDGET_USD - _daily_spend, 4),
         "llm_enabled": LLM_ENABLED,
-        "model": LLM_MODEL_OPENAI,
+        "provider": LLM_PROVIDER,
+        "model_primary": LLM_MODEL_GEMINI if LLM_PROVIDER == "gemini" else LLM_MODEL_OPENAI,
+        "model_fallback": LLM_MODEL_OPENAI,
+        "grounding": GEMINI_GROUNDING,
     }
 
 
@@ -507,7 +510,7 @@ def run_universe_seed(max_tickers: Optional[int] = None) -> Dict:
     cap = max_tickers or MAX_TICKERS_PER_RUN
     universe = universe[:cap]
     
-    logger.info(f"[universe_seed] LLM_ENABLED={LLM_ENABLED} model={LLM_MODEL} processing {len(universe)} tickers (cap={cap})")
+    logger.info(f"[universe_seed] LLM_ENABLED={LLM_ENABLED} provider={LLM_PROVIDER} processing {len(universe)} tickers (cap={cap})")
     
     total_added = 0
     total_updated = 0
