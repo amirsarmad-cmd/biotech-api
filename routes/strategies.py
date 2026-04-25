@@ -14,6 +14,17 @@ def _to_jsonable(obj: Any) -> Any:
         if isinstance(obj, (_np.integer,)): return int(obj)
         if isinstance(obj, (_np.floating,)): return float(obj)
         if isinstance(obj, (_np.ndarray,)): return [_to_jsonable(x) for x in obj.tolist()]
+    # pandas DataFrame → list of records
+    try:
+        import pandas as _pd
+        if isinstance(obj, _pd.DataFrame):
+            return [_to_jsonable(rec) for rec in obj.to_dict(orient="records")]
+        if isinstance(obj, _pd.Series):
+            return _to_jsonable(obj.to_dict())
+        if isinstance(obj, _pd.Timestamp):
+            return obj.isoformat()
+    except ImportError:
+        pass
     if isinstance(obj, dict): return {str(k): _to_jsonable(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)): return [_to_jsonable(x) for x in obj]
     if isinstance(obj, (bytes, bytearray)): return obj.decode("utf-8", errors="replace")
