@@ -96,11 +96,28 @@ class ConsensusRequest(BaseModel):
 @router.post("/npv")
 async def analyze_npv(req: NPVRequest):
     """
-    NPV calc. Two-step: 1) estimate drug economics via LLM, 2) compute NPV from economics + market data.
-    Heavy — takes 10-30s via Claude. Consider caching.
+    NPV calc — V2 with structured drug economics + true rNPV.
+    
+    Pipeline:
+    1. Look up `catalyst_npv_cache` first (fast path) — return if fresh
+    2. Pull/compute structured drug economics (population, pricing, penetration,
+       LOE) via `fetch_or_compute_drug_economics_v2`. Reads/writes
+       `drug_economics_cache`.
+    3. Run BOTH legacy multiple-based NPV AND new year-by-year rNPV.
+    4. Persist final payload to `catalyst_npv_cache`.
+    
+    Response shape (additive, backward compatible):
+      { ticker, economics: <legacy>, npv: <legacy>,
+        economics_v2: <structured fields + cache flag>,
+        rnpv: <year-by-year discounted CF>,
+        from_cache: bool }
     """
     try:
-        from services.npv_model import compute_npv_estimate, estimate_drug_economics, get_baseline_price
+        from services.npv_model import (
+            compute_npv_estimate, estimate_drug_economics, get_baseline_price,
+            fetch_or_compute_drug_economics_v2, compute_rnpv_full,
+            load_npv_defaults_from_db, _params_hash, get_npv_cached, write_npv_cached,
+        )
         from services.database import BiotechDatabase
         
         db = BiotechDatabase()
@@ -108,34 +125,110 @@ async def analyze_npv(req: NPVRequest):
         if not rows:
             raise HTTPException(404, f"Ticker {req.ticker} not found")
         primary = rows[0]
+        company_name = primary.get("company_name", req.ticker)
+        catalyst_date = primary.get("catalyst_date", "") or ""
+        description = primary.get("description", "") or ""
+        market_cap_m = req.market_cap_m or float(primary.get("market_cap") or 0)
         
-        # Step 1: estimate drug economics via Claude (peak sales, multiple, commercial prob)
-        economics = estimate_drug_economics(
-            ticker=req.ticker,
-            company_name=primary.get("company_name", req.ticker),
-            catalyst_type=req.catalyst_type,
-            catalyst_date=primary.get("catalyst_date", ""),
-            description=primary.get("description", ""),
-            market_cap_m=req.market_cap_m or float(primary.get("market_cap") or 0),
+        # Try to extract drug name from description (best-effort)
+        drug_name = primary.get("drug_name") or ""
+        if not drug_name and description:
+            # Heuristic: first parenthetical generic name, else first capitalized word
+            import re as _re
+            m = _re.search(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b', description[:200])
+            drug_name = m.group(1) if m else f"{req.ticker}_{req.catalyst_type}"
+        
+        # ---- Cache key based on inputs ----
+        cache_payload = {
+            "ticker": req.ticker, "catalyst_type": req.catalyst_type,
+            "catalyst_date": catalyst_date, "drug_name": drug_name,
+            "discount_rate": req.discount_rate, "tax_rate": req.tax_rate,
+            "cogs_pct": req.cogs_pct, "p_approval": req.p_commercial,
+            "time_to_peak_years": req.time_to_peak_years,
+            "loe_dropoff_pct": None,  # filled after econ_v2
+        }
+        params_hash_val = _params_hash(cache_payload)
+        
+        cached = get_npv_cached(req.ticker, None, params_hash_val)
+        if cached:
+            cached["from_cache"] = True
+            return cached
+        
+        # ---- Step 1: structured drug economics (V2) ----
+        econ_v2 = fetch_or_compute_drug_economics_v2(
+            ticker=req.ticker, company_name=company_name, drug_name=drug_name,
+            catalyst_type=req.catalyst_type, catalyst_date=catalyst_date,
+            description=description, market_cap_m=market_cap_m,
         )
         
-        # Step 2: get current price + baseline — use market_cap as proxy if no price available
-        current_price = 50.0  # sensible default; frontend may override
+        # ---- Step 2: legacy NPV (kept for back-compat / sanity check) ----
+        # Build legacy economics from V2 if possible, else call legacy LLM
+        if econ_v2.get("peak_sales_usd_b"):
+            legacy_economics = {
+                "peak_sales_usd_b": econ_v2.get("peak_sales_usd_b"),
+                "peak_sales_year": econ_v2.get("peak_sales_year"),
+                "peak_sales_rationale": (econ_v2.get("llm_rationale", "") or "")[:300],
+                "multiple": 3.5,  # legacy default; rNPV doesn't use this
+                "multiple_rationale": "Default — V2 uses year-by-year DCF instead",
+                "commercial_success_prob": econ_v2.get("commercial_success_prob", 0.6),
+                "commercial_success_rationale": "From structured V2 estimate",
+                "first_in_class": econ_v2.get("first_in_class", False),
+                "competitive_intensity": econ_v2.get("competitive_intensity", "medium"),
+                "error": econ_v2.get("error"),
+            }
+        else:
+            # V2 produced no peak sales — fall back to legacy LLM call
+            legacy_economics = estimate_drug_economics(
+                ticker=req.ticker, company_name=company_name,
+                catalyst_type=req.catalyst_type, catalyst_date=catalyst_date,
+                description=description, market_cap_m=market_cap_m,
+            )
+        
+        # ---- Step 3: compute legacy NPV envelope ----
+        current_price = float(primary.get("current_price") or 50.0)
         baseline_price = get_baseline_price(req.ticker) or current_price
+        p_approval = req.p_commercial or float(primary.get("probability") or 0.5)
         
-        # Step 3: compute NPV
-        result = compute_npv_estimate(
-            ticker=req.ticker,
-            current_price=current_price,
-            market_cap_m=req.market_cap_m or float(primary.get("market_cap") or 0),
-            p_approval=req.p_commercial or (primary.get("probability") or 0.5),
-            economics=economics,
-            baseline_price=baseline_price,
+        legacy_npv = compute_npv_estimate(
+            ticker=req.ticker, current_price=current_price,
+            market_cap_m=market_cap_m, p_approval=p_approval,
+            economics=legacy_economics, baseline_price=baseline_price,
             info={"catalyst_type": req.catalyst_type,
-                  "catalyst_date": primary.get("catalyst_date", ""),
-                  "description": primary.get("description", "")},
+                  "catalyst_date": catalyst_date,
+                  "description": description},
         )
-        return {"ticker": req.ticker, "economics": economics, "npv": result}
+        
+        # ---- Step 4: true rNPV (V2) — year-by-year ----
+        weights_override = {}
+        if req.discount_rate is not None:
+            weights_override["discount_rate"] = req.discount_rate
+        if req.tax_rate is not None:
+            weights_override["tax_rate"] = req.tax_rate
+        if req.cogs_pct is not None:
+            weights_override["cogs_pct"] = req.cogs_pct
+        
+        rnpv = compute_rnpv_full(
+            econ_v2=econ_v2, p_approval=p_approval,
+            market_cap_m=market_cap_m,
+            weights=weights_override or None,
+        )
+        
+        # ---- Step 5: persist to cache ----
+        result_payload = {
+            "ticker": req.ticker,
+            "drug_name": drug_name,
+            "economics": legacy_economics,
+            "npv": legacy_npv,
+            "economics_v2": econ_v2,
+            "rnpv": rnpv,
+            "from_cache": False,
+        }
+        try:
+            write_npv_cached(req.ticker, None, params_hash_val, result_payload, ttl_days=1)
+        except Exception as e:
+            logger.warning(f"NPV cache write failed (non-fatal): {e}")
+        
+        return result_payload
     except HTTPException:
         raise
     except Exception as e:
