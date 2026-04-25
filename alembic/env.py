@@ -39,7 +39,10 @@ def run_migrations_online() -> None:
         poolclass=pool.NullPool,
     )
     with connectable.connect() as connection:
-        context.configure(connection=connection)
+        context.configure(
+            connection=connection,
+            version_table="alembic_version_biotech",   # isolate from other apps sharing this DB
+        )
         with context.begin_transaction():
             context.run_migrations()
 
