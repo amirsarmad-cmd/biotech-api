@@ -1230,6 +1230,7 @@ def _call_gemini_extract(ticker: str, company_name: str) -> List[Dict]:
     """Call Gemini 2.5 Flash with Google Search grounding for real-time biotech facts."""
     from google import genai
     from google.genai import types
+    import time as _t
     
     client = genai.Client(api_key=GOOGLE_API_KEY)
     prompt = _build_extraction_prompt(ticker, company_name)
@@ -1242,13 +1243,42 @@ def _call_gemini_extract(ticker: str, company_name: str) -> List[Dict]:
         # Enable Google Search as a tool — model decides when to use it
         config.tools = [types.Tool(google_search=types.GoogleSearch())]
     
-    response = client.models.generate_content(
-        model=LLM_MODEL_GEMINI,
-        contents=prompt,
-        config=config,
-    )
+    t0 = _t.time()
+    status = "success"
+    err_msg = None
+    tokens_in = 0
+    tokens_out = 0
+    text = ""
+    try:
+        response = client.models.generate_content(
+            model=LLM_MODEL_GEMINI,
+            contents=prompt,
+            config=config,
+        )
+        text = response.text or ""
+        usage = getattr(response, "usage_metadata", None)
+        if usage:
+            tokens_in = getattr(usage, "prompt_token_count", 0) or 0
+            tokens_out = getattr(usage, "candidates_token_count", 0) or 0
+    except Exception as e:
+        status = "error"
+        err_msg = str(e)[:300]
+        logger.warning(f"[gemini] {ticker} call failed: {err_msg}")
+    finally:
+        try:
+            from services.llm_usage import record_usage
+            record_usage(
+                provider="google", model=LLM_MODEL_GEMINI,
+                feature="universe_seeder", ticker=ticker,
+                tokens_input=tokens_in, tokens_output=tokens_out,
+                duration_ms=int((_t.time() - t0) * 1000),
+                status=status, error_message=err_msg,
+            )
+        except Exception:
+            pass
     
-    text = response.text or ""
+    if status == "error":
+        return []
     text = text.strip()
     
     # Gemini sometimes returns duplicated outputs concatenated. Find the FIRST complete JSON object.

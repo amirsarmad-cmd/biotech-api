@@ -846,6 +846,9 @@ def build_strategy(strategy_key: str, chain: Dict, position_value: float = 10000
 def get_ai_strategy_commentary(ticker: str, strategy_result: Dict,
                                 stock_context: str = "") -> str:
     """Claude-generated commentary on strategy fit for the catalyst."""
+    import time as _t
+    t0 = _t.time()
+    model = "claude-sonnet-4-5"
     try:
         import anthropic, os
         client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY",""), timeout=35.0)
@@ -871,10 +874,29 @@ In 120 words or less, explain:
 3. One adjustment to consider if the trade moves against you
 
 Be concrete and direct."""
-        msg = client.messages.create(model="claude-sonnet-4-5", max_tokens=400,
+        msg = client.messages.create(model=model, max_tokens=400,
             messages=[{"role":"user","content":prompt}])
+        try:
+            from services.llm_usage import record_usage
+            usage = getattr(msg, "usage", None)
+            record_usage(provider="anthropic", model=model,
+                         feature="strategy_commentary", ticker=ticker,
+                         tokens_input=getattr(usage, "input_tokens", 0) or 0 if usage else 0,
+                         tokens_output=getattr(usage, "output_tokens", 0) or 0 if usage else 0,
+                         duration_ms=int((_t.time() - t0) * 1000), status="success")
+        except Exception:
+            pass
         return msg.content[0].text
     except Exception as e:
+        try:
+            from services.llm_usage import record_usage
+            record_usage(provider="anthropic", model=model,
+                         feature="strategy_commentary", ticker=ticker,
+                         tokens_input=0, tokens_output=0,
+                         duration_ms=int((_t.time() - t0) * 1000),
+                         status="error", error_message=str(e)[:300])
+        except Exception:
+            pass
         return f"**Commentary unavailable:** {e}"
 
 
