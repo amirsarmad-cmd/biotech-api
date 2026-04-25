@@ -20,19 +20,52 @@ def run_news_impact(payload: dict) -> dict:
     return analyze_news_npv_impact(**payload)
 
 
+def _build_context_string(payload: dict) -> str:
+    """ai_pipeline.run_parallel_only expects a single formatted text 'context' string,
+    not separate kwargs. Build it from our consensus payload."""
+    ticker = payload.get("ticker", "")
+    company = payload.get("company_name", ticker)
+    cat = payload.get("catalyst_info", {}) or {}
+    drug = payload.get("drug_info", {}) or {}
+    sources = payload.get("sources", []) or []
+    base_prob = cat.get("probability") or drug.get("commercial_prob") or 0.5
+    base_pct = int(round(base_prob * 100))
+
+    lines = [
+        f"TICKER: {ticker}",
+        f"COMPANY: {company}",
+        f"PROBABILITY: {base_pct}%   (current base estimate)",
+        "",
+        "CATALYST",
+        f"  Type: {cat.get('type','')}",
+        f"  Date: {cat.get('date','')}",
+        f"  Description: {cat.get('description','')}",
+        "",
+        "DRUG ECONOMICS",
+        f"  Peak sales: ${drug.get('peak_sales_b','?')}B",
+        f"  Multiple: {drug.get('multiple','?')}x",
+        f"  Commercial prob (if approved): {drug.get('commercial_prob','?')}",
+        f"  Peak sales rationale: {drug.get('peak_sales_rationale','')}",
+        f"  Multiple rationale: {drug.get('multiple_rationale','')}",
+        f"  Commercial rationale: {drug.get('commercial_rationale','')}",
+    ]
+    if sources:
+        lines.append("")
+        lines.append("RECENT NEWS / SOURCES (top 8)")
+        for s in sources[:8]:
+            title = (s.get("title") or "")[:140]
+            src = s.get("source") or "?"
+            date = s.get("date") or "?"
+            lines.append(f"  [{src} {date}] {title}")
+    return "\n".join(lines)
+
+
 def run_consensus(payload: dict) -> dict:
     from services.ai_pipeline import run_parallel_only, compute_consensus
-    # Run all 3 models in parallel
-    parallel = run_parallel_only(
-        ticker=payload.get("ticker", ""),
-        company_name=payload.get("company_name", ""),
-        catalyst_info=payload.get("catalyst_info", {}),
-        drug_info=payload.get("drug_info", {}),
-        sources=payload.get("sources", []),
-    )
-    # Synthesize consensus
+    context = _build_context_string(payload)
+    parallel = run_parallel_only(context=context, question=payload.get("question", ""))
     cons = compute_consensus(parallel)
-    return {"parallel": parallel, "consensus": cons}
+    return {"parallel": parallel, "consensus": cons, "context_used": context[:1500]}
 
 
 HANDLERS = {
@@ -52,10 +85,10 @@ def process_one(r: redis.Redis, job_id: str):
     if not handler:
         r.hset(key, mapping={"status": "failed", "error": f"unknown job type: {job_type}"})
         return
-    
+
     r.hset(key, mapping={"status": "running", "started": time.time()})
     logger.info(f"[{job_id}] running {job_type}")
-    
+
     try:
         payload = json.loads(data.get("payload", "{}"))
         result = handler(payload)
@@ -86,7 +119,6 @@ def main():
     logger.info("worker started, consuming from %s", QUEUE_KEY)
     while True:
         try:
-            # Block up to 5s waiting for a job
             item = r.brpop(QUEUE_KEY, timeout=5)
             if not item:
                 continue
