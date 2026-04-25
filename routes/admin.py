@@ -54,7 +54,7 @@ async def inspect_db():
     try:
         with _pg_conn() as conn:
             with conn.cursor() as cur:
-                # alembic version
+                # alembic versions — both shared table and our isolated table
                 cur.execute("""
                     SELECT EXISTS (
                         SELECT FROM information_schema.tables
@@ -66,6 +66,19 @@ async def inspect_db():
                 if has_alembic:
                     cur.execute("SELECT version_num FROM alembic_version")
                     versions = [r[0] for r in cur.fetchall()]
+                
+                # Our isolated alembic table
+                cur.execute("""
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.tables
+                        WHERE table_schema = 'public' AND table_name = 'alembic_version_biotech'
+                    )
+                """)
+                has_biotech_alembic = cur.fetchone()[0]
+                biotech_versions = []
+                if has_biotech_alembic:
+                    cur.execute("SELECT version_num FROM alembic_version_biotech")
+                    biotech_versions = [r[0] for r in cur.fetchall()]
 
                 # all public tables
                 cur.execute("""
@@ -83,12 +96,31 @@ async def inspect_db():
                 v2_present = [t for t in v2_tables if t in tables]
                 v2_missing = [t for t in v2_tables if t not in tables]
 
+                # NPV defaults singleton check
+                npv_defaults_row = None
+                if "npv_defaults" in tables:
+                    cur.execute("SELECT scope, discount_rate, tax_rate, cogs_pct, default_penetration_pct, default_time_to_peak_years, rating_weights FROM npv_defaults WHERE scope='global'")
+                    row = cur.fetchone()
+                    if row:
+                        npv_defaults_row = {
+                            "scope": row[0],
+                            "discount_rate": float(row[1]) if row[1] else None,
+                            "tax_rate": float(row[2]) if row[2] else None,
+                            "cogs_pct": float(row[3]) if row[3] else None,
+                            "default_penetration_pct": float(row[4]) if row[4] else None,
+                            "default_time_to_peak_years": row[5],
+                            "rating_weights": row[6],
+                        }
+
                 return {
-                    "alembic_table_exists": has_alembic,
-                    "alembic_versions": versions,
+                    "alembic_version_table_exists": has_alembic,
+                    "alembic_versions_shared": versions,
+                    "alembic_version_biotech_exists": has_biotech_alembic,
+                    "alembic_versions_biotech": biotech_versions,
                     "all_public_tables": tables,
                     "v2_tables_present": v2_present,
                     "v2_tables_missing": v2_missing,
+                    "npv_defaults_singleton": npv_defaults_row,
                 }
     except Exception as e:
         logger.exception("inspect_db")
