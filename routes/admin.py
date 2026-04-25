@@ -1,8 +1,9 @@
 """
-/admin — universe refresh, DB stats.
+/admin — universe refresh, DB stats, migration tools.
 """
-import logging
+import logging, os
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -35,3 +36,102 @@ async def db_stats():
         return stats
     except Exception as e:
         raise HTTPException(500, f"stats error: {e}")
+
+
+# ─── Migration inspection & repair ─────────────────────────────────────────
+
+def _pg_conn():
+    import psycopg2
+    url = os.getenv("DATABASE_URL", "")
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql://", 1)
+    return psycopg2.connect(url)
+
+
+@router.get("/db/inspect")
+async def inspect_db():
+    """Show alembic_version state + list of public tables."""
+    try:
+        with _pg_conn() as conn:
+            with conn.cursor() as cur:
+                # alembic version
+                cur.execute("""
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.tables
+                        WHERE table_schema = 'public' AND table_name = 'alembic_version'
+                    )
+                """)
+                has_alembic = cur.fetchone()[0]
+                versions = []
+                if has_alembic:
+                    cur.execute("SELECT version_num FROM alembic_version")
+                    versions = [r[0] for r in cur.fetchall()]
+
+                # all public tables
+                cur.execute("""
+                    SELECT table_name FROM information_schema.tables
+                    WHERE table_schema='public' ORDER BY table_name
+                """)
+                tables = [r[0] for r in cur.fetchall()]
+
+                # check which v2 tables exist
+                v2_tables = [
+                    "catalyst_universe", "earnings_dates", "catalyst_npv_cache",
+                    "ai_analysis_cache", "stock_risk_factors", "drug_economics_cache",
+                    "historical_catalyst_moves", "stock_scores", "npv_defaults", "cron_runs"
+                ]
+                v2_present = [t for t in v2_tables if t in tables]
+                v2_missing = [t for t in v2_tables if t not in tables]
+
+                return {
+                    "alembic_table_exists": has_alembic,
+                    "alembic_versions": versions,
+                    "all_public_tables": tables,
+                    "v2_tables_present": v2_present,
+                    "v2_tables_missing": v2_missing,
+                }
+    except Exception as e:
+        logger.exception("inspect_db")
+        raise HTTPException(500, f"inspect error: {e}")
+
+
+class StampRequest(BaseModel):
+    revision: str
+    confirm: bool = False
+
+
+@router.post("/db/alembic-clear")
+async def alembic_clear(req: StampRequest):
+    """DESTRUCTIVE: clear the alembic_version table. Requires confirm=True."""
+    if not req.confirm:
+        raise HTTPException(400, "Must pass confirm=True")
+    try:
+        with _pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM alembic_version")
+                conn.commit()
+                cur.execute("SELECT count(*) FROM alembic_version")
+                remaining = cur.fetchone()[0]
+                return {"cleared": True, "rows_remaining": remaining}
+    except Exception as e:
+        logger.exception("alembic_clear")
+        raise HTTPException(500, f"clear error: {e}")
+
+
+@router.post("/db/migrate-now")
+async def migrate_now():
+    """Run alembic upgrade head right now from the API container."""
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["alembic", "upgrade", "head"],
+            capture_output=True, text=True, timeout=120, cwd="/app"
+        )
+        return {
+            "rc": r.returncode,
+            "stdout": r.stdout[-3000:],
+            "stderr": r.stderr[-3000:],
+        }
+    except Exception as e:
+        logger.exception("migrate_now")
+        raise HTTPException(500, f"migrate error: {e}")
