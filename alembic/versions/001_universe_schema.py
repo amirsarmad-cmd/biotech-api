@@ -209,6 +209,8 @@ def upgrade() -> None:
     op.execute("CREATE INDEX IF NOT EXISTS idx_scores_short ON stock_scores(short_score DESC)")
 
     # 9. npv_defaults (singleton row config)
+    # Note: rating_weights default is set via UPDATE after CREATE+INSERT to avoid
+    # SQLAlchemy's bindparam parser misinterpreting ':' in JSON literal.
     op.execute("""
         CREATE TABLE IF NOT EXISTS npv_defaults (
             id SERIAL PRIMARY KEY,
@@ -218,16 +220,22 @@ def upgrade() -> None:
             cogs_pct NUMERIC DEFAULT 0.15,
             default_penetration_pct NUMERIC DEFAULT 0.15,
             default_time_to_peak_years INTEGER DEFAULT 5,
-            rating_weights JSONB DEFAULT '{"catalyst_probability":0.35,"news_sentiment":0.15,"news_activity":0.10,"market_cap":0.10,"days_proximity":0.30}'::jsonb,
+            rating_weights JSONB,
             updated_at TIMESTAMPTZ DEFAULT NOW(),
             UNIQUE(scope)
         )
     """)
-    # Seed the singleton row
+    # Seed singleton row + populate JSONB default
     op.execute("""
         INSERT INTO npv_defaults (scope) VALUES ('global')
         ON CONFLICT (scope) DO NOTHING
     """)
+    # Use sa.text() with explicit bindparams=[] to disable colon parsing
+    from sqlalchemy import text
+    op.execute(
+        text("UPDATE npv_defaults SET rating_weights = CAST(:weights AS JSONB) WHERE scope = 'global' AND rating_weights IS NULL")
+        .bindparams(weights='{"catalyst_probability": 0.35, "news_sentiment": 0.15, "news_activity": 0.10, "market_cap": 0.10, "days_proximity": 0.30}')
+    )
 
     # 10. cron_runs
     op.execute("""
