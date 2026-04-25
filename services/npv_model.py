@@ -584,7 +584,15 @@ def estimate_drug_economics_v2(ticker: str, company_name: str, drug_name: str,
 
     prompt = f"""You are a senior biotech equity analyst building a structured rNPV model.
 
-Estimate drug economics in PRECISE STRUCTURED form (not narrative).
+CRITICAL: estimate the INCREMENTAL VALUE of THIS SPECIFIC CATALYST'S OUTCOME — not the entire drug franchise.
+
+If this is a NEW INDICATION / LABEL EXPANSION for an already-approved drug (e.g. Dupixent for COPD when Dupixent is already approved for atopic dermatitis), return ONLY the additional patient population, pricing, and revenue from the NEW INDICATION. Do NOT include existing approved indications.
+
+If this is a FIRST APPROVAL of a new drug, return the full drug economics.
+
+If this is a Phase 3 readout (drug not yet approved), return the full drug economics if approved.
+
+If this is an Earnings catalyst, return zeros for population/pricing — earnings doesn't have a per-drug NPV.
 
 STOCK: {ticker} — {company_name}
 DRUG: {drug}
@@ -598,33 +606,37 @@ Return ONLY a JSON object. No markdown, no preamble. Use realistic, evidence-bas
 If you genuinely don't know a field, set it to null. Don't fabricate. Schema:
 
 {{
-  "indication": "<concise indication, e.g. 'Type 2 diabetes' or 'COPD with eosinophilic phenotype'>",
+  "catalyst_scope": "<one of: 'first_approval' | 'new_indication' | 'label_expansion' | 'phase_readout' | 'earnings' | 'other'>",
+  "indication": "<the SPECIFIC indication tied to THIS catalyst (not all approved indications)>",
   "modality": "<one of: small_molecule | biologic | antibody | cell_gene | rna | other>",
-  "first_in_class": <true|false>,
-  "addressable_population_us": <integer — US patients eligible for this drug at peak. e.g. 250000>,
-  "addressable_population_global": <integer — global eligible patients>,
-  "annual_cost_min_usd": <number — annual list price US, low end>,
-  "annual_cost_max_usd": <number — annual list price US, high end>,
-  "standard_of_care_cost_usd": <number — current standard of care annual cost in US, or null if none>,
-  "penetration_min_pct": <number 0-100 — pessimistic peak market share %>,
-  "penetration_max_pct": <number 0-100 — optimistic peak market share %>,
-  "penetration_mid_pct": <number 0-100 — realistic mid-case peak market share %>,
-  "launch_year": <integer — first commercial year if approved>,
-  "peak_sales_year": <integer — year of peak sales>,
+  "first_in_class": <true|false — for THIS specific indication, is this drug the first MOA approved?>,
+  "addressable_population_us": <integer — US patients eligible for THIS indication only. Not the drug's total patients across all indications. e.g. for Dupixent COPD: ~500k eosinophilic COPD patients, NOT the 27M total Dupixent global patients across all approved uses>,
+  "addressable_population_global": <integer — global patients for THIS indication only>,
+  "annual_cost_min_usd": <number — annual list price for this indication, low end>,
+  "annual_cost_max_usd": <number — annual list price for this indication, high end>,
+  "standard_of_care_cost_usd": <number — current SOC annual cost for THIS indication, or null if no SOC>,
+  "penetration_min_pct": <number 0-100 — pessimistic peak market share within THIS indication's eligible patients>,
+  "penetration_max_pct": <number 0-100 — optimistic peak market share>,
+  "penetration_mid_pct": <number 0-100 — realistic mid-case peak market share>,
+  "launch_year": <integer — effective LAUNCH year for THIS catalyst's revenue. For new_indication / label_expansion, this is the year of the FDA decision (revenue starts then), NOT the drug's original launch year>,
+  "peak_sales_year": <integer — year of peak INCREMENTAL sales from this catalyst>,
   "time_to_peak_years": <number — years from launch to peak (typical 4-7)>,
   "patent_expiry_date": "<YYYY-MM-DD or YYYY of LOE / patent cliff>",
   "loe_dropoff_pct": <number 0-1 — first-year revenue drop after LOE. 0.75 typical small-mol, 0.40 biologic>,
   "cogs_pct_estimate": <number 0-1 — COGS / revenue. small-mol: 0.10-0.15, biologic: 0.18-0.25, cell-gene: 0.35-0.50>,
-  "commercial_success_prob": <number 0-1 — P(strong commercial success | approval). first-in-class unmet need: 0.75-0.90; me-too crowded: 0.30-0.55>,
-  "competitors": [<list of named competitor drugs/companies, max 5>],
+  "commercial_success_prob": <number 0-1 — P(strong commercial uptake in THIS indication | approval). first-in-class unmet need: 0.75-0.90; me-too crowded: 0.30-0.55>,
+  "competitors": [<list of named competitor drugs/companies in THIS indication, max 5>],
   "competitive_intensity": "<low | medium | high>",
-  "key_risks": [<2-4 short risk bullets specific to this drug — pricing, pre-existing therapy, manufacturing, etc.>],
-  "rationale": "<3-4 sentence summary justifying the numbers above. Cite specific epidemiology / pricing benchmarks where possible.>"
+  "key_risks": [<2-4 short risk bullets specific to this catalyst's outcome>],
+  "rationale": "<3-4 sentence summary justifying the numbers above. Make clear whether you're scoping to a single indication or whole franchise. Cite specific epidemiology / pricing benchmarks where possible.>"
 }}
 
 CALCULATION SANITY CHECK (do this mentally before returning):
 peak_sales_estimate = (addressable_population_global × penetration_mid_pct/100 × annual_cost_avg) / 1e9 → in $B
-This should match what you'd quote as peak sales for this drug. If your structured numbers imply $20B peak but the drug realistically tops out at $3B, REVISE penetration or pricing or population down to be consistent.
+- For Dupixent COPD label expansion: ~500k US + 1.5M global eosinophilic COPD × ~10% peak share × $40K = ~$6B peak (NOT $70B+)
+- For a first-approval blockbuster small-mol: ~$2-5B peak typical
+- For an orphan drug: $200M-$1B peak typical
+If your structured numbers imply unrealistic peak (e.g. >$10B for label expansion), REVISE down.
 
 Return ONLY the JSON object."""
 

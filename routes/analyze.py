@@ -64,6 +64,10 @@ class NPVRequest(BaseModel):
     discount_rate: Optional[float] = 0.12
     time_to_peak_years: Optional[float] = 5.0
     loe_years: Optional[float] = 10.0
+    # V2 controls
+    force_refresh: bool = False  # bypass drug_economics_cache + catalyst_npv_cache
+    drug_name_override: Optional[str] = None  # override heuristic drug-name extraction
+    description_override: Optional[str] = None  # override description (useful when caller has more context)
 
 
 class NewsImpactRequest(BaseModel):
@@ -127,11 +131,11 @@ async def analyze_npv(req: NPVRequest):
         primary = rows[0]
         company_name = primary.get("company_name", req.ticker)
         catalyst_date = primary.get("catalyst_date", "") or ""
-        description = primary.get("description", "") or ""
+        description = req.description_override or (primary.get("description", "") or "")
         market_cap_m = req.market_cap_m or float(primary.get("market_cap") or 0)
         
         # Try to extract drug name from description (best-effort)
-        drug_name = primary.get("drug_name") or ""
+        drug_name = req.drug_name_override or primary.get("drug_name") or ""
         if not drug_name and description:
             # Heuristic: first parenthetical generic name, else first capitalized word
             import re as _re
@@ -149,16 +153,18 @@ async def analyze_npv(req: NPVRequest):
         }
         params_hash_val = _params_hash(cache_payload)
         
-        cached = get_npv_cached(req.ticker, None, params_hash_val)
-        if cached:
-            cached["from_cache"] = True
-            return cached
+        if not req.force_refresh:
+            cached = get_npv_cached(req.ticker, None, params_hash_val)
+            if cached:
+                cached["from_cache"] = True
+                return cached
         
         # ---- Step 1: structured drug economics (V2) ----
         econ_v2 = fetch_or_compute_drug_economics_v2(
             ticker=req.ticker, company_name=company_name, drug_name=drug_name,
             catalyst_type=req.catalyst_type, catalyst_date=catalyst_date,
             description=description, market_cap_m=market_cap_m,
+            force_refresh=req.force_refresh,
         )
         
         # ---- Step 2: legacy NPV (kept for back-compat / sanity check) ----
