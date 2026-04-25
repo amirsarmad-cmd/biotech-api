@@ -54,13 +54,30 @@ def _process_job(r, job_id):
             result = analyze_news_npv_impact(**payload)
         elif job_type == "consensus":
             from services.ai_pipeline import run_parallel_only, compute_consensus
-            parallel = run_parallel_only(
-                ticker=payload.get("ticker",""),
-                company_name=payload.get("company_name",""),
-                catalyst_info=payload.get("catalyst_info",{}),
-                drug_info=payload.get("drug_info",{}),
-                sources=payload.get("sources",[]),
-            )
+            # Build text context for ai_pipeline
+            cat = payload.get("catalyst_info", {}) or {}
+            drug = payload.get("drug_info", {}) or {}
+            sources = payload.get("sources", []) or []
+            base_pct = int(round((cat.get("probability") or drug.get("commercial_prob") or 0.5) * 100))
+            ctx_lines = [
+                f"TICKER: {payload.get('ticker','')}",
+                f"COMPANY: {payload.get('company_name','')}",
+                f"PROBABILITY: {base_pct}%",
+                "",
+                f"CATALYST: {cat.get('type','')} on {cat.get('date','')}",
+                f"  Description: {cat.get('description','')}",
+                "",
+                f"DRUG ECONOMICS: peak ${drug.get('peak_sales_b','?')}B × {drug.get('multiple','?')}x | p_commercial {drug.get('commercial_prob','?')}",
+                f"  Peak sales rationale: {drug.get('peak_sales_rationale','')}",
+                f"  Multiple rationale: {drug.get('multiple_rationale','')}",
+                f"  Commercial rationale: {drug.get('commercial_rationale','')}",
+            ]
+            if sources:
+                ctx_lines.append("\nRECENT NEWS (top 8):")
+                for s in sources[:8]:
+                    ctx_lines.append(f"  [{s.get('source','?')} {s.get('date','?')}] {(s.get('title') or '')[:140]}")
+            context = "\n".join(ctx_lines)
+            parallel = run_parallel_only(context=context, question=payload.get("question",""))
             cons = compute_consensus(parallel)
             result = {"parallel": parallel, "consensus": cons}
         else:
