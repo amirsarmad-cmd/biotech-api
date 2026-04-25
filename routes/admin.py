@@ -197,17 +197,20 @@ async def universe_spend():
 
 
 @router.delete("/universe/v2-mock-clear")
-async def clear_mock_catalysts(confirm: bool = False):
-    """Delete all rows where source='mock'. Pass confirm=true to execute."""
+async def clear_mock_catalysts(confirm: bool = False, source: str = "mock"):
+    """Delete catalyst rows with given source. Pass confirm=true to execute. source='all' wipes everything."""
     if not confirm:
-        raise HTTPException(400, "Pass ?confirm=true to delete mock rows")
+        raise HTTPException(400, "Pass ?confirm=true to delete rows")
     try:
         with _pg_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("DELETE FROM catalyst_universe WHERE source='mock' RETURNING id")
+                if source == "all":
+                    cur.execute("DELETE FROM catalyst_universe RETURNING id")
+                else:
+                    cur.execute("DELETE FROM catalyst_universe WHERE source=%s RETURNING id", (source,))
                 deleted = len(cur.fetchall())
                 conn.commit()
-                return {"deleted": deleted}
+                return {"deleted": deleted, "source_filter": source}
     except Exception as e:
         raise HTTPException(500, f"clear error: {e}")
 
