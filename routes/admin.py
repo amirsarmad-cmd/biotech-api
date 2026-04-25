@@ -175,27 +175,6 @@ class SeedRequest(BaseModel):
     max_tickers: int | None = None  # cap for safety; None = use env default
 
 
-@router.post("/universe/v2-seed-async")
-async def seed_universe_v2_async(req: SeedRequest, background_tasks: BackgroundTasks):
-    """Run universe seeder in background. Returns immediately. Check status via /v2-cron-runs."""
-    import threading
-    from services.universe_seeder import run_universe_seed
-    
-    def _bg():
-        try:
-            run_universe_seed(max_tickers=req.max_tickers)
-        except Exception as e:
-            logger.exception(f"bg seed failed: {e}")
-    
-    t = threading.Thread(target=_bg, daemon=True)
-    t.start()
-    return {
-        "status": "started",
-        "max_tickers": req.max_tickers,
-        "check_status_via": "/admin/universe/v2-cron-runs",
-    }
-
-
 @router.post("/universe/v2-seed")
 async def seed_universe_v2(req: SeedRequest):
     """Run the Phase B universe seeder synchronously. Use only for small max_tickers (≤10)."""
