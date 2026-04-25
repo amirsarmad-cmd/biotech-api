@@ -195,25 +195,15 @@ _bg_seed_jobs: dict = {}
 
 
 def _run_seed_background(job_id: str, max_tickers: int | None, start_idx: int):
-    """Background thread runner for the seeder."""
-    from services.universe_seeder import run_universe_seed, get_seed_universe
+    """Background thread runner for the seeder.
+    
+    Passes start_idx natively (no monkeypatch) so concurrent runs don't race.
+    """
+    from services.universe_seeder import run_universe_seed
     
     _bg_seed_jobs[job_id] = {"job_id": job_id, "status": "running", "started_at": _dt.utcnow().isoformat()+"Z", "max_tickers": max_tickers, "start_idx": start_idx}
     try:
-        # Slice the universe based on start_idx
-        universe = get_seed_universe()
-        if start_idx > 0:
-            # Patch the seeder to start from a different offset by passing slice
-            # Easiest: temporarily monkeypatch get_seed_universe
-            import services.universe_seeder as us
-            original = us.get_seed_universe
-            us.get_seed_universe = lambda: universe[start_idx:]
-            try:
-                result = run_universe_seed(max_tickers=max_tickers)
-            finally:
-                us.get_seed_universe = original
-        else:
-            result = run_universe_seed(max_tickers=max_tickers)
+        result = run_universe_seed(max_tickers=max_tickers, start_idx=start_idx)
         _bg_seed_jobs[job_id]["status"] = "completed"
         _bg_seed_jobs[job_id]["result"] = result
         _bg_seed_jobs[job_id]["completed_at"] = _dt.utcnow().isoformat()+"Z"
