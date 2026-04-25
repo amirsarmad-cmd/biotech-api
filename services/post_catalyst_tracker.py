@@ -248,10 +248,21 @@ def _fetch_price_window(ticker: str, catalyst_date_str: str) -> Optional[Dict]:
 # Outcome inference
 # ============================================================
 
-def _infer_outcome(catalyst_type: str, move_1d: Optional[float],
-                   move_7d: Optional[float], move_30d: Optional[float]) -> Tuple[str, float, str]:
+def _infer_outcome(
+    catalyst_type: str,
+    move_1d: Optional[float],
+    move_7d: Optional[float],
+    move_30d: Optional[float],
+    intraday_max_pct: Optional[float] = None,
+    volume_ratio: Optional[float] = None,
+) -> Tuple[str, float, str]:
     """Heuristic outcome inference from price action.
     Returns (outcome, confidence_0_to_1, basis_text).
+    
+    Improvements over v1:
+    - Intraday max move: detects 'priced-in' approvals where close is small but
+      intraday shows the news landed (high range = real reaction)
+    - Volume ratio: high volume on small move = priced-in approval, not delay
     """
     if move_1d is None and move_30d is None:
         return ("unknown", 0.0, "no price data")
@@ -263,6 +274,11 @@ def _infer_outcome(catalyst_type: str, move_1d: Optional[float],
     if primary is None:
         return ("unknown", 0.0, "no 1d/30d move")
 
+    high_volume = volume_ratio is not None and volume_ratio > 2.0
+    very_high_volume = volume_ratio is not None and volume_ratio > 4.0
+    intraday_was_big = intraday_max_pct is not None and abs(intraday_max_pct) > 8
+    vol_str = f"{volume_ratio:.1f}" if volume_ratio is not None else "?"
+
     # Binary catalysts (FDA-type): clean splits
     if is_binary:
         if primary > 25:
@@ -273,16 +289,29 @@ def _infer_outcome(catalyst_type: str, move_1d: Optional[float],
             return ("rejected", 0.85, f"{primary:.1f}% on day1, typical FDA rejection reaction")
         if primary < -12:
             return ("rejected", 0.65, f"{primary:.1f}% on day1, likely negative outcome")
+
+        # Small moves — disambiguate priced-in vs delayed
         if abs(primary) < 5:
-            return ("delayed", 0.45, f"{primary:.1f}% — small reaction may indicate delay/inconclusive")
-        return ("mixed", 0.40, f"{primary:.1f}% — moderate reaction, ambiguous")
+            # High volume + intraday range → priced-in approval (positive direction)
+            if (high_volume or intraday_was_big) and primary >= -1:
+                if intraday_max_pct is not None and intraday_max_pct > 3:
+                    return ("approved", 0.55, f"{primary:+.1f}% close, intraday +{intraday_max_pct:.1f}%, vol×{vol_str} — likely priced-in approval")
+                if very_high_volume and primary > 0:
+                    return ("approved", 0.50, f"{primary:+.1f}% close on vol×{vol_str} — high-volume small move suggests priced-in")
+            # High volume + intraday range → priced-in rejection (negative direction)
+            if (high_volume or intraday_was_big) and primary <= 1:
+                if intraday_max_pct is not None and intraday_max_pct < -3:
+                    return ("rejected", 0.50, f"{primary:+.1f}% close, intraday {intraday_max_pct:.1f}%, vol×{vol_str} — likely priced-in rejection")
+            # Low volume + small move → genuinely delayed/inconclusive
+            return ("delayed", 0.45, f"{primary:+.1f}% close, vol×{vol_str} — small reaction, likely delay/inconclusive")
+        return ("mixed", 0.40, f"{primary:+.1f}% — moderate reaction, ambiguous")
 
     # Phase-readout / earnings / other: looser
     if primary > 15:
-        return ("approved", 0.55, f"+{primary:.1f}% on day1, positive reaction")  # 'approved' overloaded as 'good outcome'
+        return ("approved", 0.55, f"+{primary:.1f}% on day1, positive reaction")
     if primary < -15:
         return ("rejected", 0.55, f"{primary:.1f}% on day1, negative reaction")
-    return ("mixed", 0.40, f"{primary:.1f}% — modest reaction")
+    return ("mixed", 0.40, f"{primary:+.1f}% — modest reaction")
 
 
 # ============================================================
@@ -320,7 +349,16 @@ def backfill_one(catalyst: Dict) -> Dict:
     move_7d = ((pw["day7_price"] - pre) / pre * 100.0) if (pw.get("day7_price") and pre) else None
     move_30d = ((pw["day30_price"] - pre) / pre * 100.0) if (pw.get("day30_price") and pre) else None
 
-    outcome, confidence, basis = _infer_outcome(cat_type, move_1d, move_7d, move_30d)
+    # Volume ratio: day0 volume / 30d avg pre-event volume
+    avg_vol = pw.get("preevent_avg_volume_30d")
+    post_vol = pw.get("postevent_volume_1d")
+    volume_ratio = (post_vol / avg_vol) if (avg_vol and avg_vol > 0 and post_vol) else None
+
+    outcome, confidence, basis = _infer_outcome(
+        cat_type, move_1d, move_7d, move_30d,
+        intraday_max_pct=pw.get("postevent_max_intraday_move_pct"),
+        volume_ratio=volume_ratio,
+    )
 
     # Predicted: confidence_score from catalyst_universe (probability), plus reference move
     predicted_prob = catalyst.get("confidence_score")

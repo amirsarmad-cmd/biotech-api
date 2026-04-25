@@ -2,6 +2,7 @@
 /admin — universe refresh, DB stats, migration tools.
 """
 import logging, os
+from datetime import datetime
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
@@ -470,6 +471,9 @@ async def backfill_market_cap(
         with db.get_conn() as conn:
             cur = conn.cursor()
             if only_missing:
+                # Skip tickers we tried in the last 24h that came back $0 — likely
+                # delisted / acquired / inaccessible. We mark these by writing a
+                # marker row with description='yfinance: no data ...' and last_updated.
                 cur.execute("""
                     SELECT DISTINCT cu.ticker
                     FROM catalyst_universe cu
@@ -477,6 +481,12 @@ async def backfill_market_cap(
                     WHERE (ss.market_cap IS NULL OR ss.market_cap = 0)
                       AND cu.ticker IS NOT NULL
                       AND cu.ticker != ''
+                      AND (
+                        ss.last_updated IS NULL
+                        OR ss.description IS NULL
+                        OR ss.description NOT LIKE 'yfinance: no data%'
+                        OR ss.last_updated < (NOW() - INTERVAL '24 hours')::text
+                      )
                     ORDER BY cu.ticker
                     LIMIT %s
                 """, (limit,))
@@ -527,11 +537,35 @@ async def backfill_market_cap(
 
         # 3. UPSERT into screener_stocks
         written = 0
+        marked_dead = 0
         if not dry_run:
             with db.get_conn() as conn:
                 cur = conn.cursor()
                 for r in results:
-                    if "error" in r or not r.get("market_cap_m"):
+                    if "error" in r:
+                        continue
+                    mc = r.get("market_cap_m") or 0
+                    if not mc:
+                        # Write a marker row so we skip this ticker for 24h
+                        try:
+                            cur.execute("""
+                                INSERT INTO screener_stocks
+                                    (ticker, company_name, industry, market_cap,
+                                     catalyst_type, catalyst_date, probability,
+                                     description, last_updated)
+                                VALUES (%s, %s, %s, 0, %s, %s, %s, %s, NOW()::text)
+                                ON CONFLICT (ticker, catalyst_type, catalyst_date) DO UPDATE SET
+                                    description = EXCLUDED.description,
+                                    last_updated = NOW()::text
+                            """, (
+                                r["ticker"], r["ticker"], "Biotechnology",
+                                "", "", 0.5,
+                                f"yfinance: no data {datetime.now().strftime('%Y-%m-%d')}",
+                            ))
+                            marked_dead += 1
+                        except Exception as e:
+                            errors += 1
+                            r["mark_dead_error"] = str(e)[:100]
                         continue
                     try:
                         # screener_stocks UNIQUE on (ticker, catalyst_type, catalyst_date)
@@ -546,6 +580,7 @@ async def backfill_market_cap(
                                 company_name = EXCLUDED.company_name,
                                 industry = EXCLUDED.industry,
                                 market_cap = EXCLUDED.market_cap,
+                                description = EXCLUDED.description,
                                 last_updated = NOW()::text
                         """, (
                             r["ticker"], r.get("company_name", r["ticker"]),
@@ -563,6 +598,7 @@ async def backfill_market_cap(
         return {
             "fetched": len(tickers),
             "written": written if not dry_run else 0,
+            "marked_dead": marked_dead if not dry_run else 0,
             "errors": errors,
             "dry_run": dry_run,
             "results": results,
