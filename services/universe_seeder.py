@@ -724,94 +724,6 @@ def get_seed_universe() -> List[Dict]:
         {"ticker": "ZBIO", "company_name": "Zenas BioPharma", "source": "seed"},
         {"ticker": "ZIMV", "company_name": "ZimVie Inc", "source": "seed"},
         {"ticker": "ZYXI", "company_name": "Zynex Medical", "source": "seed"},
-        # ── IBB + XBI ETF members added Apr 2026 — completing index coverage ──
-        {"ticker": "ARGX", "company_name": "ARGENX SE ADR", "source": "etf_ibb_xbi"},
-        {"ticker": "ONC", "company_name": "BEONE MEDICINES AG", "source": "etf_ibb_xbi"},
-        {"ticker": "MEDP", "company_name": "MEDPACE HOLDINGS INC", "source": "etf_ibb_xbi"},
-        {"ticker": "PCVX", "company_name": "VAXCYTE INC", "source": "etf_ibb_xbi"},
-        {"ticker": "CRL", "company_name": "CHARLES RIVER LABORATORIES INTERNA", "source": "etf_ibb_xbi"},
-        {"ticker": "ABVX", "company_name": "ABIVAX AMERICAN DEPOSITARY SHARES", "source": "etf_ibb_xbi"},
-        {"ticker": "TEM", "company_name": "TEMPUS AI INC CLASS A", "source": "etf_ibb_xbi"},
-        {"ticker": "SYRE", "company_name": "SPYRE THERAPEUTICS INC", "source": "etf_ibb_xbi"},
-        {"ticker": "BRKR", "company_name": "BRUKER CORP", "source": "etf_ibb_xbi"},
-        {"ticker": "IBRX", "company_name": "IMMUNITYBIO INC", "source": "etf_ibb_xbi"},
-        {"ticker": "ORKA", "company_name": "ORUKA THERAPEUTICS INC", "source": "etf_ibb_xbi"},
-        {"ticker": "VCYT", "company_name": "VERACYTE INC", "source": "etf_ibb_xbi"},
-        {"ticker": "TXG", "company_name": "10X GENOMICS INC CLASS A", "source": "etf_ibb_xbi"},
-        {"ticker": "GPCR", "company_name": "STRUCTURE THERAPEUTICS ADR INC", "source": "etf_ibb_xbi"},
-        {"ticker": "EWTX", "company_name": "EDGEWISE THERAPEUTICS INC", "source": "etf_ibb_xbi"},
-        {"ticker": "CAI", "company_name": "CARIS LIFE SCIENCES INC", "source": "etf_ibb_xbi"},
-        {"ticker": "NAMS", "company_name": "NEWAMSTERDAM PHARMA NV", "source": "etf_ibb_xbi"},
-        {"ticker": "DFTX", "company_name": "DEFINIUM THERAPEUTICS INC", "source": "etf_ibb_xbi"},
-        {"ticker": "ADPT", "company_name": "ADAPTIVE BIOTECHNOLOGIES CORP", "source": "etf_ibb_xbi"},
-        {"ticker": "IRON", "company_name": "DISC MEDICINE INC", "source": "etf_ibb_xbi"},
-        {"ticker": "ZLAB", "company_name": "ZAI LABORATORY ADR REPRESENTING LT", "source": "etf_ibb_xbi"},
-        {"ticker": "GRAL", "company_name": "GRAIL INC", "source": "etf_ibb_xbi"},
-        {"ticker": "MLYS", "company_name": "MINERALYS THERAPEUTICS INC", "source": "etf_ibb_xbi"},
-        {"ticker": "INBX", "company_name": "INHIBRX BIOSCIENCES INC", "source": "etf_ibb_xbi"},
-        {"ticker": "NUVB", "company_name": "NUVATION BIO INC CLASS A", "source": "etf_ibb_xbi"},
-        {"ticker": "GRFS", "company_name": "GRIFOLS ADR REPRESENTING ONE NON-V", "source": "etf_ibb_xbi"},
-        {"ticker": "MESO", "company_name": "MESOBLAST ADR REPRESENTING LTD", "source": "etf_ibb_xbi"},
-        {"ticker": "SION", "company_name": "SIONNA THERAPEUTICS INC", "source": "etf_ibb_xbi"},
-        {"ticker": "GLUE", "company_name": "MONTE ROSA THERAPEUTICS INC", "source": "etf_ibb_xbi"},
-        {"ticker": "FTRE", "company_name": "FORTREA HOLDINGS INC", "source": "etf_ibb_xbi"},
-        {"ticker": "MBX", "company_name": "MBX BIOSCIENCES INC", "source": "etf_ibb_xbi"},
-        {"ticker": "XNCR", "company_name": "XENCOR INC", "source": "etf_ibb_xbi"},
-        {"ticker": "GHRS", "company_name": "GH RESEARCH PLC", "source": "etf_ibb_xbi"},
-        {"ticker": "BCAX", "company_name": "BICARA THERAPEUTICS INC", "source": "etf_ibb_xbi"},
-        {"ticker": "AVBP", "company_name": "ARRIVENT BIOPHARMA INC", "source": "etf_ibb_xbi"},
-        {"ticker": "STVN", "company_name": "STEVANATO GROUP", "source": "etf_ibb_xbi"},
-        {"ticker": "ANRO", "company_name": "ALTO NEUROSCIENCE INC", "source": "etf_ibb_xbi"},
-        {"ticker": "PHVS", "company_name": "PHARVARIS N V NV", "source": "etf_ibb_xbi"},
-        {"ticker": "MAZE", "company_name": "MAZE THERAPEUTICS INC", "source": "etf_ibb_xbi"},
-        {"ticker": "SEPN", "company_name": "SEPTERNA INC", "source": "etf_ibb_xbi"},
-        {"ticker": "ABUS", "company_name": "ARBUTUS BIOPHARMA CORP", "source": "etf_ibb_xbi"},
-        {"ticker": "ZVRA", "company_name": "ZEVRA THERAPEUTICS INC", "source": "etf_ibb_xbi"},
-        {"ticker": "ABSI", "company_name": "ABSCI CORP", "source": "etf_ibb_xbi"},
-        {"ticker": "SPRY", "company_name": "ARS PHARMACEUTICALS INC", "source": "etf_ibb_xbi"},
-        {"ticker": "BIOA", "company_name": "BIOAGE LABS INC", "source": "etf_ibb_xbi"},
-        {"ticker": "FULC", "company_name": "FULCRUM THERAPEUTICS INC", "source": "etf_ibb_xbi"},
-        {"ticker": "FDMT", "company_name": "4D MOLECULAR THERAPEUTICS INC", "source": "etf_ibb_xbi"},
-        {"ticker": "CATX", "company_name": "PERSPECTIVE THERAPEUTICS INC", "source": "etf_ibb_xbi"},
-        {"ticker": "BBOT", "company_name": "BRIDGEBIO ONCOLOGY THERAPEUTICS IN", "source": "etf_ibb_xbi"},
-        {"ticker": "CADL", "company_name": "CANDEL THERAPEUTICS INC", "source": "etf_ibb_xbi"},
-        {"ticker": "ALVO", "company_name": "ALVOTECH SA", "source": "etf_ibb_xbi"},
-        {"ticker": "LXEO", "company_name": "LEXEO THERAPEUTICS INC", "source": "etf_ibb_xbi"},
-        {"ticker": "MRVI", "company_name": "MARAVAI LIFESCIENCES HOLDINGS INC", "source": "etf_ibb_xbi"},
-        {"ticker": "CTNM", "company_name": "CONTINEUM THERAPEUTICS INC CLASS A", "source": "etf_ibb_xbi"},
-        {"ticker": "AURA", "company_name": "AURA BIOSCIENCES INC", "source": "etf_ibb_xbi"},
-        {"ticker": "NGNE", "company_name": "NEUROGENE INC", "source": "etf_ibb_xbi"},
-        {"ticker": "DNA", "company_name": "GINKGO BIOWORKS HOLDINGS INC CLASS", "source": "etf_ibb_xbi"},
-        {"ticker": "FLGT", "company_name": "FULGENT GENETICS INC", "source": "etf_ibb_xbi"},
-        {"ticker": "KYTX", "company_name": "KYVERNA THERAPEUTICS INC", "source": "etf_ibb_xbi"},
-        {"ticker": "TECX", "company_name": "TECTONIC THERAPEUTIC INC", "source": "etf_ibb_xbi"},
-        {"ticker": "AUTL", "company_name": "AUTOLUS THERAPEUTICS ADR PLC", "source": "etf_ibb_xbi"},
-        {"ticker": "LENZ", "company_name": "LENZ THERAPEUTICS INC", "source": "etf_ibb_xbi"},
-        {"ticker": "CCCC", "company_name": "C4 THERAPEUTICS INC", "source": "etf_ibb_xbi"},
-        {"ticker": "OABI", "company_name": "OMNIAB INC", "source": "etf_ibb_xbi"},
-        {"ticker": "CRBU", "company_name": "CARIBOU BIOSCIENCES INC", "source": "etf_ibb_xbi"},
-        {"ticker": "NBP", "company_name": "NOVABRIDGE BIOSCIENCES ADR", "source": "etf_ibb_xbi"},
-        {"ticker": "VYGR", "company_name": "VOYAGER THERAPEUTICS INC", "source": "etf_ibb_xbi"},
-        {"ticker": "LYEL", "company_name": "LYELL IMMUNOPHARMA INC", "source": "etf_ibb_xbi"},
-        {"ticker": "FHTX", "company_name": "FOGHORN THERAPEUTICS INC", "source": "etf_ibb_xbi"},
-        {"ticker": "SGMT", "company_name": "SAGIMET BIOSCIENCES INC SERIES A", "source": "etf_ibb_xbi"},
-        {"ticker": "NMRA", "company_name": "NEUMORA THERAPEUTICS INC", "source": "etf_ibb_xbi"},
-        {"ticker": "QTRX", "company_name": "QUANTERIX CORP", "source": "etf_ibb_xbi"},
-        {"ticker": "TRAX", "company_name": "FIRST TRACKS BIOTHERAPEUTICS INC", "source": "etf_ibb_xbi"},
-        {"ticker": "AARD", "company_name": "AARDVARK THERAPEUTICS INC", "source": "etf_ibb_xbi"},
-        {"ticker": "MENS", "company_name": "JYONG BIOTECH LTD", "source": "etf_ibb_xbi"},
-        {"ticker": "AKE", "company_name": "AKERO THERAPEUTICS CVR", "source": "etf_ibb_xbi"},
-        {"ticker": "TKNO", "company_name": "ALPHA TEKNOVA INC", "source": "etf_ibb_xbi"},
-        {"ticker": "ADRO", "company_name": "CHINOOK THERAPEUTICS INC", "source": "etf_ibb_xbi"},
-        {"ticker": "THRD", "company_name": "THIRD HARMONIC BIO INC", "source": "etf_ibb_xbi"},
-        {"ticker": "CRGX", "company_name": "CARGO THERAPEUTICS INC", "source": "etf_ibb_xbi"},
-        {"ticker": "DNTH", "company_name": "DIANTHUS THERAPEUTICS INC", "source": "etf_ibb_xbi"},
-        {"ticker": "PVLA", "company_name": "PALVELLA THERAPEUTICS INC", "source": "etf_ibb_xbi"},
-        {"ticker": "SLS", "company_name": "SELLAS LIFE SCIENCES GROUP I", "source": "etf_ibb_xbi"},
-        {"ticker": "CMPX", "company_name": "COMPASS THERAPEUTICS INC", "source": "etf_ibb_xbi"},
-        {"ticker": "PURR", "company_name": "HYPERLIQUID STRATEGIES", "source": "etf_ibb_xbi"},
-        {"ticker": "IVVD", "company_name": "INVIVYD INC", "source": "etf_ibb_xbi"},
-        {"ticker": "DMRA", "company_name": "DAMORA THERAPEUTICS INC", "source": "etf_ibb_xbi"},
     
     ]
     return SEED_TICKERS
@@ -1038,39 +950,91 @@ def _call_openai_extract(ticker: str, company_name: str) -> List[Dict]:
 def _extract_first_json_object(text: str) -> str:
     """
     Pull the first complete JSON object out of a possibly-noisy LLM response.
-    Handles markdown fences, duplicated outputs, and trailing prose.
+    
+    Robust against:
+    - Markdown fences (```json ... ```)
+    - Gemini's duplicated outputs (response contains the same JSON twice, sometimes
+      with the first one truncated mid-stream — depth counter on raw text gets confused)
+    - Mixed prose + JSON
+    - Mid-stream truncation
+    
+    Strategy: strip ALL ``` markers first, then try every `{` position as a start
+    candidate and return the first one that produces a valid balanced object.
     """
+    import json as _json
     if not text:
         return ""
     
-    # Strip markdown fences (```json ... ``` or ``` ... ```)
-    if "```" in text:
-        # Try to find content between first ``` and matching close
-        start = text.find("```")
-        # Skip the language specifier line
-        nl = text.find("\n", start)
-        if nl > 0:
-            inner_start = nl + 1
-            close = text.find("```", inner_start)
-            if close > 0:
-                text = text[inner_start:close]
-            else:
-                text = text[inner_start:]
+    # Strip ALL markdown fence markers entirely (not just the outer ones).
+    # This handles the case where Gemini returns: ```json\n{...truncated...}\n```json\n{...full...}\n```
+    cleaned = text.replace("```json", "").replace("```JSON", "").replace("```", "")
+    cleaned = cleaned.strip()
     
-    # Find first { and matching close brace via depth counter
-    text = text.strip()
-    if not text.startswith("{") and not text.startswith("["):
-        # find first { or [
-        b = text.find("{")
-        s = text.find("[")
-        first = min(p for p in [b, s] if p >= 0) if (b >= 0 or s >= 0) else -1
-        if first < 0:
-            return ""
-        text = text[first:]
+    if not cleaned:
+        return ""
     
-    # Walk depth — first complete object/array wins
-    open_ch = text[0]
-    close_ch = "}" if open_ch == "{" else "]"
+    # Try every '{' position as a start candidate. Return the first one that produces
+    # valid JSON via balanced-brace extraction.
+    candidates = []
+    pos = 0
+    while True:
+        idx = cleaned.find("{", pos)
+        if idx < 0:
+            break
+        candidates.append(idx)
+        pos = idx + 1
+        if len(candidates) > 20:  # safety cap
+            break
+    
+    # Collect ALL valid JSON candidates, then prefer one with 'catalysts' key
+    valid_candidates = []
+    for start in candidates:
+        candidate = _try_extract_balanced(cleaned[start:], "{", "}")
+        if candidate:
+            try:
+                parsed = _json.loads(candidate)
+                # Score: prefer dicts with 'catalysts' (or other expected) key
+                score = 0
+                if isinstance(parsed, dict):
+                    for k in ("catalysts", "results", "data", "items"):
+                        if k in parsed and isinstance(parsed[k], list):
+                            score = 1000 + len(parsed[k]) * 10
+                            break
+                    if score == 0:
+                        score = len(candidate)  # fallback: longest valid
+                valid_candidates.append((score, candidate))
+            except _json.JSONDecodeError:
+                continue
+    
+    # Pick highest-scoring
+    if valid_candidates:
+        valid_candidates.sort(key=lambda t: -t[0])
+        return valid_candidates[0][1]
+    
+    # Try array-form too
+    pos = 0
+    while True:
+        idx = cleaned.find("[", pos)
+        if idx < 0:
+            break
+        candidate = _try_extract_balanced(cleaned[idx:], "[", "]")
+        if candidate:
+            try:
+                _json.loads(candidate)
+                return candidate
+            except _json.JSONDecodeError:
+                pass
+        pos = idx + 1
+        if pos > len(cleaned):
+            break
+    
+    return ""
+
+
+def _try_extract_balanced(text: str, open_ch: str, close_ch: str) -> str:
+    """Extract a balanced object/array starting at text[0]. Returns "" if not balanced."""
+    if not text or text[0] != open_ch:
+        return ""
     depth = 0
     in_string = False
     escape = False
@@ -1081,8 +1045,11 @@ def _extract_first_json_object(text: str) -> str:
         if ch == "\\":
             escape = True
             continue
-        if ch == '"' and not escape:
-            in_string = not in_string
+        if ch == '"' and not in_string:
+            in_string = True
+            continue
+        if ch == '"' and in_string:
+            in_string = False
             continue
         if in_string:
             continue
@@ -1092,7 +1059,7 @@ def _extract_first_json_object(text: str) -> str:
             depth -= 1
             if depth == 0:
                 return text[: i + 1]
-    return text  # incomplete, return what we have
+    return ""  # unbalanced
 
 
 def _call_gemini_extract(ticker: str, company_name: str) -> List[Dict]:
