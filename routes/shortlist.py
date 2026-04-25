@@ -62,12 +62,31 @@ class AddRequest(BaseModel):
 
 @router.get("")
 async def list_shortlist():
-    """List all shortlisted tickers with current snapshots."""
+    """List all shortlisted tickers, enriched with current catalyst data from the stocks universe."""
     try:
         rows = db().get_shortlist() or []
+        enriched = []
+        for r in rows:
+            tkr = (r.get("ticker") or "").upper()
+            try:
+                stocks = db().get_stock(tkr) or []
+                if stocks:
+                    primary = sorted(stocks, key=lambda s: s.get("probability") or 0, reverse=True)[0]
+                    r["catalyst_type"] = primary.get("catalyst_type")
+                    r["catalyst_date"] = primary.get("catalyst_date")
+                    r["current_probability"] = primary.get("probability")
+                    r["current_score"] = primary.get("overall_score")
+                    r["market_cap"] = primary.get("market_cap")
+                    r["industry"] = primary.get("industry")
+                    # Update company_name if it's still placeholder
+                    if not r.get("company_name") or r.get("company_name") == tkr:
+                        r["company_name"] = primary.get("company_name") or tkr
+            except Exception as e:
+                logger.warning(f"enrich {tkr}: {e}")
+            enriched.append(r)
         return _to_jsonable({
-            "count": len(rows),
-            "items": rows,
+            "count": len(enriched),
+            "items": enriched,
         })
     except Exception as e:
         logger.exception("list_shortlist")
