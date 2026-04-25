@@ -30,12 +30,19 @@ logger = logging.getLogger(__name__)
 # Configuration
 # ────────────────────────────────────────────────────────────
 LLM_ENABLED = os.getenv("LLM_ENABLED", "false").lower() in ("true", "1", "yes")
-LLM_MODEL = os.getenv("UNIVERSE_LLM_MODEL", "gpt-4o-mini")
+# Primary: gemini-2.5-flash with Google Search grounding (real-time facts, ~$0.0003/call)
+# Fallback: openai gpt-4o (no grounding but better factual recall than mini, ~$0.003/call)
+LLM_PROVIDER = os.getenv("UNIVERSE_LLM_PROVIDER", "gemini")  # 'gemini' | 'openai'
+LLM_MODEL_GEMINI = os.getenv("UNIVERSE_LLM_MODEL_GEMINI", "gemini-2.5-flash")
+LLM_MODEL_OPENAI = os.getenv("UNIVERSE_LLM_MODEL_OPENAI", "gpt-4o")
+GEMINI_GROUNDING = os.getenv("UNIVERSE_GROUNDING", "true").lower() in ("true", "1", "yes")
 DAILY_LLM_BUDGET_USD = float(os.getenv("DAILY_LLM_BUDGET_USD", "5.00"))
-COST_PER_LLM_CALL_USD = 0.0002  # gpt-4o-mini avg per call we make
+COST_PER_GEMINI_CALL_USD = 0.0003   # gemini-2.5-flash with grounding
+COST_PER_OPENAI_CALL_USD = 0.003    # gpt-4o
 MAX_TICKERS_PER_RUN = int(os.getenv("MAX_TICKERS_PER_RUN", "50"))  # safety throttle
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 
 # In-memory daily spend tracker (resets on container restart)
 _daily_spend = 0.0
@@ -148,46 +155,56 @@ def get_daily_spend() -> Dict:
         "budget_usd": DAILY_LLM_BUDGET_USD,
         "remaining_usd": round(DAILY_LLM_BUDGET_USD - _daily_spend, 4),
         "llm_enabled": LLM_ENABLED,
-        "model": LLM_MODEL,
+        "model": LLM_MODEL_OPENAI,
     }
 
 
 def extract_catalysts_for_ticker(ticker: str, company_name: str) -> Tuple[List[Dict], Dict]:
     """
     Extract upcoming catalysts for a single ticker.
+    Returns (catalysts_list, meta) with source ('llm_gemini'|'llm_openai'|'mock'), cost, error.
     
-    Returns (catalysts_list, meta) where meta includes source ('llm'|'mock'|'cached'),
-    cost incurred, and any error string.
-    
-    Cost discipline:
-      - If LLM_ENABLED=false → returns mock catalyst (zero cost)
-      - If budget exceeded → returns empty list + meta error
-      - If OPENAI_API_KEY missing → returns empty list + meta error
+    Provider order:
+      1. LLM_ENABLED=false → mock data, $0
+      2. Try gemini-2.5-flash with Google Search grounding (cheap, real facts)
+      3. Fallback to gpt-4o (no search but stronger reasoning)
     """
     meta = {"source": None, "cost_usd": 0.0, "error": None}
 
-    # Fast path: LLM disabled = mock data (for plumbing tests)
     if not LLM_ENABLED:
         meta["source"] = "mock"
         return _mock_catalysts(ticker, company_name), meta
 
-    # Real LLM path - guarded by budget + key
-    if not OPENAI_API_KEY:
-        meta["error"] = "OPENAI_API_KEY not set"
-        return [], meta
     if not _check_budget():
         meta["error"] = f"Daily LLM budget exceeded (${DAILY_LLM_BUDGET_USD})"
         return [], meta
 
+    # Try primary: Gemini with grounding
+    if LLM_PROVIDER == "gemini" and GOOGLE_API_KEY:
+        try:
+            catalysts = _call_gemini_extract(ticker, company_name)
+            _record_spend(COST_PER_GEMINI_CALL_USD)
+            meta["source"] = "llm_gemini"
+            meta["cost_usd"] = COST_PER_GEMINI_CALL_USD
+            return catalysts, meta
+        except Exception as e:
+            logger.warning(f"Gemini extract failed for {ticker}, trying OpenAI: {e}")
+            meta["error"] = f"gemini_failed: {type(e).__name__}"
+            # fall through to OpenAI
+
+    # Fallback: OpenAI gpt-4o
+    if not OPENAI_API_KEY:
+        meta["error"] = (meta.get("error") or "") + "; OPENAI_API_KEY not set"
+        return [], meta
     try:
         catalysts = _call_openai_extract(ticker, company_name)
-        _record_spend(COST_PER_LLM_CALL_USD)
-        meta["source"] = "llm"
-        meta["cost_usd"] = COST_PER_LLM_CALL_USD
+        _record_spend(COST_PER_OPENAI_CALL_USD)
+        meta["source"] = "llm_openai"
+        meta["cost_usd"] = COST_PER_OPENAI_CALL_USD
         return catalysts, meta
     except Exception as e:
-        meta["error"] = f"LLM call failed: {type(e).__name__}: {e}"
-        logger.exception(f"LLM extract failed for {ticker}")
+        meta["error"] = (meta.get("error") or "") + f"; openai_failed: {type(e).__name__}: {e}"
+        logger.exception(f"OpenAI extract failed for {ticker}")
         return [], meta
 
 
@@ -228,32 +245,45 @@ def _mock_catalysts(ticker: str, company_name: str) -> List[Dict]:
     ]
 
 
-def _call_openai_extract(ticker: str, company_name: str) -> List[Dict]:
-    """Call OpenAI to extract upcoming catalysts. Returns parsed list of dicts."""
+def _build_extraction_prompt(ticker: str, company_name: str) -> str:
+    """Shared prompt for both Gemini and OpenAI."""
     today = date.today()
     six_months = today + timedelta(days=183)
-    
-    prompt = f"""You are a biotech catalyst analyst. Extract upcoming non-earnings catalysts for {ticker} ({company_name}) expected between {today.isoformat()} and {six_months.isoformat()}.
+    return f"""You are a biotech catalyst analyst. Extract REAL upcoming non-earnings catalysts for {ticker} ({company_name}) expected between {today.isoformat()} and {six_months.isoformat()}.
+
+CRITICAL RULES:
+- ONLY include catalysts you have factual evidence for (recent press releases, SEC 8-K filings, FDA calendar, ClinicalTrials.gov)
+- DO NOT make up drug names, dates, or indications. If you don't know specifics, do not include the catalyst.
+- Use EXACT drug brand/code names (e.g. "ABBV-001", "Humira", "Skyrizi") — never placeholders like "Drug X" or "Drug ABC"
+- Indications must be specific medical conditions (e.g. "metastatic melanoma", "rheumatoid arthritis"), not "various"
+- If you have NO high-confidence catalyst data for this ticker, return an empty array — do not invent
 
 Catalyst types to find: FDA Decision, AdComm, Phase 1/2/3 Readout, Clinical Trial, Partnership, BLA submission, NDA submission.
 EXCLUDE: earnings reports, conferences, investor days.
 
-For each catalyst found, provide JSON object with these fields:
+For each catalyst found:
 - catalyst_type: one of the types above
-- catalyst_date: ISO date YYYY-MM-DD (estimate if uncertain)
+- catalyst_date: ISO date YYYY-MM-DD (estimate quarter if uncertain)
 - date_precision: "exact" | "quarter" | "half" | "year"
-- description: 1-sentence factual description
-- drug_name: drug or program name
-- indication: disease/condition
+- description: 1-sentence FACTUAL description with specifics
+- drug_name: real drug or program name (no placeholders)
+- indication: specific disease/condition
 - phase: "Phase 1" | "Phase 2" | "Phase 3" | "BLA" | "NDA" | null
-- confidence_score: 0.0-1.0 (your confidence in this prediction)
+- confidence_score: 0.0-1.0 — be honest about your certainty
 
-Return ONLY a JSON array. If no catalysts known, return empty array [].
-Do not invent facts. Only include catalysts you're at least 60% confident exist.
+Return ONLY a JSON object: {{"catalysts": [...]}}. If no high-confidence catalysts known, return {{"catalysts": []}}.
+"""
+
+
+def _call_openai_extract(ticker: str, company_name: str) -> List[Dict]:
+    """Call OpenAI to extract upcoming catalysts. Returns parsed list of dicts."""
+    prompt = _build_extraction_prompt(ticker, company_name)
+    _ = """OLD_INLINE_PROMPT_REPLACED
+
 """
 
     body = {
-        "model": LLM_MODEL,
+        "model": LLM_MODEL_OPENAI,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": 1500,
         "response_format": {"type": "json_object"},
@@ -294,9 +324,91 @@ Do not invent facts. Only include catalysts you're at least 60% confident exist.
             "canonical_drug_name": _canonicalize_drug(item.get("drug_name")),
             "indication": item.get("indication"),
             "phase": item.get("phase"),
-            "source": "llm",
+            "source": "llm_openai",
             "source_url": None,
             "confidence_score": item.get("confidence_score", 0.6),
+        })
+    return out
+
+
+def _call_gemini_extract(ticker: str, company_name: str) -> List[Dict]:
+    """Call Gemini 2.5 Flash with Google Search grounding for real-time biotech facts."""
+    from google import genai
+    from google.genai import types
+    
+    client = genai.Client(api_key=GOOGLE_API_KEY)
+    prompt = _build_extraction_prompt(ticker, company_name)
+    
+    config = types.GenerateContentConfig(
+        max_output_tokens=2000,
+        temperature=0.1,  # low for factual extraction
+    )
+    if GEMINI_GROUNDING:
+        # Enable Google Search as a tool — model decides when to use it
+        config.tools = [types.Tool(google_search=types.GoogleSearch())]
+    
+    response = client.models.generate_content(
+        model=LLM_MODEL_GEMINI,
+        contents=prompt,
+        config=config,
+    )
+    
+    text = response.text or ""
+    # Strip markdown fences if present
+    text = text.strip()
+    if text.startswith("```"):
+        # Remove first line ```json or ``` and last line ```
+        lines = text.split("\n")
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines)
+    
+    parsed = json.loads(text) if text else {}
+    if isinstance(parsed, dict):
+        for k in ("catalysts", "results", "data", "items"):
+            if k in parsed and isinstance(parsed[k], list):
+                parsed = parsed[k]
+                break
+        else:
+            parsed = []
+    if not isinstance(parsed, list):
+        parsed = []
+    
+    out = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        # Filter out junk drug names from the model
+        drug_name = item.get("drug_name", "")
+        if drug_name and any(token in drug_name.lower() for token in [
+            "drug x", "drug y", "drug z", "drug abc", "drug xyz",
+            "drug 1", "drug 2", "compound x", "compound y", "compound z",
+            "candidate x", "candidate y", "candidate z", "tbd", "n/a"
+        ]):
+            logger.warning(f"[gemini] {ticker} returned placeholder drug_name '{drug_name}', skipping")
+            continue
+        # Filter out generic indications
+        indication = item.get("indication", "")
+        if indication and indication.lower() in ("various", "various conditions", "tbd", "n/a", "unknown"):
+            logger.warning(f"[gemini] {ticker} returned generic indication '{indication}', skipping")
+            continue
+        
+        out.append({
+            "ticker": ticker,
+            "company_name": company_name,
+            "catalyst_type": item.get("catalyst_type", "Unknown"),
+            "catalyst_date": item.get("catalyst_date"),
+            "date_precision": item.get("date_precision", "exact"),
+            "description": item.get("description", ""),
+            "drug_name": drug_name or None,
+            "canonical_drug_name": _canonicalize_drug(drug_name),
+            "indication": indication or None,
+            "phase": item.get("phase"),
+            "source": "llm_gemini",
+            "source_url": None,
+            "confidence_score": item.get("confidence_score", 0.7),
         })
     return out
 
@@ -401,7 +513,7 @@ def run_universe_seed(max_tickers: Optional[int] = None) -> Dict:
     total_updated = 0
     total_errors = []
     total_cost = 0.0
-    catalysts_per_source = {"mock": 0, "llm": 0, "error": 0}
+    catalysts_per_source = {"mock": 0, "llm_gemini": 0, "llm_openai": 0, "error": 0}
     
     for entry in universe:
         ticker = entry["ticker"]
