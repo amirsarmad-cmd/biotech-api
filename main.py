@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from routes import stocks, analyze, jobs as jobs_router, strategies, admin, shortlist, universe
+from routes import stocks, analyze, jobs as jobs_router, strategies, admin, shortlist, universe, catalyst_risks
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
 logger = logging.getLogger("biotech-api")
@@ -176,6 +176,7 @@ app.include_router(strategies.router, prefix="/strategies", tags=["strategies"])
 app.include_router(admin.router, prefix="/admin", tags=["admin"])
 app.include_router(shortlist.router, prefix="/shortlist", tags=["shortlist"])
 app.include_router(universe.router, prefix="/universe", tags=["universe"])
+app.include_router(catalyst_risks.router, tags=["catalyst_risks"])
 
 
 @app.exception_handler(Exception)
