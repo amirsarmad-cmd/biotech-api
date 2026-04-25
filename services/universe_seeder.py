@@ -736,9 +736,21 @@ def write_catalysts_to_db(catalysts: List[Dict], conn) -> Dict:
     with conn.cursor() as cur:
         for c in catalysts:
             try:
-                if not c.get("catalyst_date"):
+                raw_date = c.get("catalyst_date")
+                if not raw_date:
                     stats["skipped"] += 1
                     continue
+                
+                # Normalize date format (handle '2026', '2026-Q3', '2026-08', etc.)
+                normalized_date, normalized_precision = _normalize_catalyst_date(raw_date)
+                if not normalized_date:
+                    stats["errors"].append(f"{c.get('ticker','?')}/{c.get('catalyst_type','?')}: unparseable date '{raw_date}'")
+                    stats["skipped"] += 1
+                    continue
+                c["catalyst_date"] = normalized_date
+                # Override precision only if parsing detected a coarser one
+                if normalized_precision != "exact":
+                    c["date_precision"] = normalized_precision
                 
                 # Try INSERT, fall back to UPDATE on conflict
                 cur.execute("""
