@@ -177,13 +177,77 @@ class SeedRequest(BaseModel):
 
 @router.post("/universe/v2-seed")
 async def seed_universe_v2(req: SeedRequest):
-    """Run the Phase B universe seeder. LLM cost gated by LLM_ENABLED env var."""
+    """Run the Phase B universe seeder synchronously. Use only for small max_tickers (≤10)."""
     try:
         from services.universe_seeder import run_universe_seed
         return run_universe_seed(max_tickers=req.max_tickers)
     except Exception as e:
         logger.exception("v2-seed")
         raise HTTPException(500, f"seed error: {e}")
+
+
+import threading
+import uuid as _uuid
+from datetime import datetime as _dt
+
+# In-memory tracker for background seed jobs
+_bg_seed_jobs: dict = {}
+
+
+def _run_seed_background(job_id: str, max_tickers: int | None, start_idx: int):
+    """Background thread runner for the seeder."""
+    from services.universe_seeder import run_universe_seed, get_seed_universe
+    
+    _bg_seed_jobs[job_id] = {"job_id": job_id, "status": "running", "started_at": _dt.utcnow().isoformat()+"Z", "max_tickers": max_tickers, "start_idx": start_idx}
+    try:
+        # Slice the universe based on start_idx
+        universe = get_seed_universe()
+        if start_idx > 0:
+            # Patch the seeder to start from a different offset by passing slice
+            # Easiest: temporarily monkeypatch get_seed_universe
+            import services.universe_seeder as us
+            original = us.get_seed_universe
+            us.get_seed_universe = lambda: universe[start_idx:]
+            try:
+                result = run_universe_seed(max_tickers=max_tickers)
+            finally:
+                us.get_seed_universe = original
+        else:
+            result = run_universe_seed(max_tickers=max_tickers)
+        _bg_seed_jobs[job_id]["status"] = "completed"
+        _bg_seed_jobs[job_id]["result"] = result
+        _bg_seed_jobs[job_id]["completed_at"] = _dt.utcnow().isoformat()+"Z"
+    except Exception as e:
+        _bg_seed_jobs[job_id]["status"] = "failed"
+        _bg_seed_jobs[job_id]["error"] = f"{type(e).__name__}: {e}"
+        _bg_seed_jobs[job_id]["completed_at"] = _dt.utcnow().isoformat()+"Z"
+
+
+class AsyncSeedRequest(BaseModel):
+    max_tickers: int | None = None
+    start_idx: int = 0
+
+
+@router.post("/universe/v2-seed-async")
+async def seed_universe_v2_async(req: AsyncSeedRequest):
+    """Kick off background seed run. Returns job_id immediately."""
+    job_id = _uuid.uuid4().hex[:12]
+    t = threading.Thread(target=_run_seed_background, args=(job_id, req.max_tickers, req.start_idx), daemon=True)
+    t.start()
+    return {"job_id": job_id, "status": "queued", "start_idx": req.start_idx, "max_tickers": req.max_tickers}
+
+
+@router.get("/universe/v2-seed-async/{job_id}")
+async def seed_status(job_id: str):
+    if job_id not in _bg_seed_jobs:
+        raise HTTPException(404, f"job {job_id} not found")
+    return _bg_seed_jobs[job_id]
+
+
+@router.get("/universe/v2-seed-async")
+async def list_seed_jobs():
+    """List all in-memory background seed jobs."""
+    return {"jobs": list(_bg_seed_jobs.values())}
 
 
 @router.get("/universe/v2-spend")
