@@ -183,13 +183,20 @@ def extract_catalysts_for_ticker(ticker: str, company_name: str) -> Tuple[List[D
         return [], meta
 
     # Try primary: Gemini with grounding
+    gemini_returned_empty = False
     if LLM_PROVIDER == "gemini" and GOOGLE_API_KEY:
         try:
             catalysts = _call_gemini_extract(ticker, company_name)
             _record_spend(COST_PER_GEMINI_CALL_USD)
             meta["source"] = "llm_gemini"
             meta["cost_usd"] = COST_PER_GEMINI_CALL_USD
-            return catalysts, meta
+            if catalysts:
+                return catalysts, meta
+            # Gemini returned empty list (silent JSON parse failure or content filter).
+            # Fall through to OpenAI fallback rather than accept zero results.
+            gemini_returned_empty = True
+            meta["error"] = "gemini_returned_empty"
+            logger.info(f"Gemini returned 0 catalysts for {ticker}, trying OpenAI fallback")
         except Exception as e:
             logger.warning(f"Gemini extract failed for {ticker}, trying OpenAI: {e}")
             meta["error"] = f"gemini_failed: {type(e).__name__}"
@@ -202,8 +209,9 @@ def extract_catalysts_for_ticker(ticker: str, company_name: str) -> Tuple[List[D
     try:
         catalysts = _call_openai_extract(ticker, company_name)
         _record_spend(COST_PER_OPENAI_CALL_USD)
-        meta["source"] = "llm_openai"
-        meta["cost_usd"] = COST_PER_OPENAI_CALL_USD
+        # If we already recorded gemini cost, append rather than replace cost
+        meta["cost_usd"] = round(meta.get("cost_usd", 0.0) + COST_PER_OPENAI_CALL_USD, 4)
+        meta["source"] = "llm_openai_after_gemini_empty" if gemini_returned_empty else "llm_openai"
         return catalysts, meta
     except Exception as e:
         meta["error"] = (meta.get("error") or "") + f"; openai_failed: {type(e).__name__}: {e}"

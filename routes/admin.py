@@ -247,15 +247,73 @@ def _run_seed_background(job_id: str, max_tickers: int | None, start_idx: int):
 class AsyncSeedRequest(BaseModel):
     max_tickers: int | None = None
     start_idx: int = 0
+    force: bool = False  # bypass mutex (use only for stuck-state recovery)
 
 
 @router.post("/universe/v2-seed-async")
 async def seed_universe_v2_async(req: AsyncSeedRequest):
-    """Kick off background seed run. Returns job_id immediately."""
+    """Kick off background seed run. Returns job_id immediately.
+
+    Mutex: refuses to start if any job already in 'running' state, unless
+    force=True is passed. This prevents concurrent runs from racing on the
+    same tickers + budget.
+    """
+    if not req.force:
+        running = [j for j in _bg_seed_jobs.values() if j.get("status") == "running"]
+        if running:
+            return {
+                "rejected": True,
+                "reason": "Another seed job is already running. Pass force=true to override.",
+                "running_job_ids": [j.get("job_id") for j in running],
+                "running_count": len(running),
+            }
     job_id = _uuid.uuid4().hex[:12]
     t = threading.Thread(target=_run_seed_background, args=(job_id, req.max_tickers, req.start_idx), daemon=True)
     t.start()
     return {"job_id": job_id, "status": "queued", "start_idx": req.start_idx, "max_tickers": req.max_tickers}
+
+
+@router.post("/universe/v2-seed-mark-stale")
+async def mark_stale_jobs(stale_minutes: int = 10):
+    """Mark in-memory bg jobs that have been 'running' for >stale_minutes as 'stale'.
+    Also marks corresponding cron_runs rows as 'killed'.
+    Returns how many were marked.
+    """
+    from datetime import datetime as _ndt, timedelta
+    cutoff = _ndt.utcnow() - timedelta(minutes=stale_minutes)
+    marked = []
+    for job in list(_bg_seed_jobs.values()):
+        if job.get("status") != "running":
+            continue
+        try:
+            started = _ndt.fromisoformat(job["started_at"].rstrip("Z"))
+        except Exception:
+            continue
+        if started < cutoff:
+            job["status"] = "stale"
+            job["completed_at"] = _ndt.utcnow().isoformat() + "Z"
+            job["error"] = f"marked stale (running > {stale_minutes} min)"
+            marked.append(job["job_id"])
+
+    # Also clean up cron_runs entries
+    cron_killed = 0
+    try:
+        with _pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE cron_runs
+                    SET status='killed', completed_at=NOW(),
+                        errors=COALESCE(errors, '[]'::jsonb) || jsonb_build_array(%s)
+                    WHERE status='running'
+                      AND started_at < NOW() - INTERVAL '%s minutes'
+                    RETURNING id
+                """, (f"marked killed by /v2-seed-mark-stale (>{stale_minutes}min)", stale_minutes))
+                cron_killed = len(cur.fetchall())
+                conn.commit()
+    except Exception as e:
+        logger.warning(f"cron_runs killed update failed: {e}")
+
+    return {"bg_jobs_marked_stale": marked, "cron_runs_killed": cron_killed}
 
 
 @router.get("/universe/v2-seed-async/{job_id}")
