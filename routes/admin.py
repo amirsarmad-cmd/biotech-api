@@ -495,6 +495,9 @@ async def fix_market_cap_units(dry_run: bool = True):
     except Exception as e:
         logger.exception("fix_market_cap_units failed")
         raise HTTPException(500, f"fix error: {e}")
+
+
+@router.post("/marketcap/backfill")
 async def backfill_market_cap(
     limit: int = 100,
     only_missing: bool = True,
@@ -657,3 +660,207 @@ async def backfill_market_cap(
     except Exception as e:
         logger.exception("market cap backfill failed")
         raise HTTPException(500, f"backfill error: {e}")
+
+
+# ============================================================
+# Dead-marker cleanup — for tickers that yfinance returns no data on
+# (delisted, acquired, ticker-changed). These rows pollute screener
+# listings with $0 market_cap entries.
+# ============================================================
+
+@router.post("/marketcap/cleanup-dead")
+async def cleanup_dead_markers(dry_run: bool = True, only_with_universe: bool = False):
+    """Identify and remove screener_stocks rows that are pure dead-marker
+    entries: empty catalyst_type AND empty catalyst_date AND market_cap = 0
+    AND description starts with 'yfinance: no data'.
+
+    Args:
+      dry_run: report candidates without deleting (default True)
+      only_with_universe: only delete if the ticker still has rows in
+        catalyst_universe (in case we want to keep dead-marker for orphan
+        tickers as a 'tried this ticker, no data' record). Default False —
+        delete all dead markers regardless.
+
+    Returns: {dry_run, candidates_count, deleted, candidates: [...]}
+    """
+    try:
+        from services.database import BiotechDatabase
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            # Find candidates
+            sql = """
+                SELECT ss.ticker, ss.last_updated, ss.description
+                FROM screener_stocks ss
+                WHERE (ss.catalyst_type IS NULL OR ss.catalyst_type = '')
+                  AND (ss.catalyst_date IS NULL OR ss.catalyst_date = '')
+                  AND (ss.market_cap IS NULL OR ss.market_cap = 0)
+                  AND ss.description LIKE 'yfinance: no data%'
+            """
+            if only_with_universe:
+                sql += """
+                  AND ss.ticker IN (SELECT DISTINCT ticker FROM catalyst_universe)
+                """
+            sql += " ORDER BY ss.ticker LIMIT 500"
+            cur.execute(sql)
+            candidates = [{"ticker": r[0], "last_updated": str(r[1])[:19] if r[1] else None,
+                           "description": r[2]} for r in cur.fetchall()]
+
+            deleted = 0
+            if not dry_run:
+                del_sql = """
+                    DELETE FROM screener_stocks
+                    WHERE (catalyst_type IS NULL OR catalyst_type = '')
+                      AND (catalyst_date IS NULL OR catalyst_date = '')
+                      AND (market_cap IS NULL OR market_cap = 0)
+                      AND description LIKE 'yfinance: no data%'
+                """
+                if only_with_universe:
+                    del_sql += " AND ticker IN (SELECT DISTINCT ticker FROM catalyst_universe)"
+                cur.execute(del_sql)
+                deleted = cur.rowcount
+                conn.commit()
+
+            return {
+                "dry_run": dry_run,
+                "only_with_universe": only_with_universe,
+                "candidates_count": len(candidates),
+                "deleted": deleted,
+                "candidates": candidates[:50],
+            }
+    except Exception as e:
+        logger.exception("cleanup_dead_markers failed")
+        raise HTTPException(500, f"cleanup error: {e}")
+
+
+@router.post("/marketcap/mark-superseded-by-universe")
+async def mark_screener_rows_superseded():
+    """For tickers where catalyst_universe has at least one active catalyst,
+    flag the legacy screener_stocks rows so /stocks endpoint can prefer V2
+    data without showing duplicates.
+
+    This is informational — current /stocks endpoint already merges + filters,
+    but having a status field helps with bulk queries and screener listings.
+
+    Currently a no-op marker for visibility; will become a real status update
+    once a screener_stocks.status column exists. Returns count of tickers
+    with V2 catalysts.
+    """
+    try:
+        from services.database import BiotechDatabase
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT COUNT(DISTINCT ticker) FROM catalyst_universe WHERE status='active'
+            """)
+            v2_tickers = cur.fetchone()[0]
+            cur.execute("""
+                SELECT COUNT(DISTINCT ticker) FROM screener_stocks
+            """)
+            legacy_tickers = cur.fetchone()[0]
+            cur.execute("""
+                SELECT COUNT(DISTINCT ss.ticker)
+                FROM screener_stocks ss
+                INNER JOIN catalyst_universe cu ON cu.ticker = ss.ticker
+                WHERE cu.status = 'active'
+            """)
+            overlap = cur.fetchone()[0]
+            return {
+                "v2_active_tickers": v2_tickers,
+                "legacy_screener_tickers": legacy_tickers,
+                "overlap_tickers": overlap,
+                "v2_only_tickers": v2_tickers - overlap,
+                "legacy_only_tickers": legacy_tickers - overlap,
+                "note": "/stocks endpoint already merges V2 + legacy and filters dead markers",
+            }
+    except Exception as e:
+        logger.exception("mark_screener_rows_superseded failed")
+        raise HTTPException(500, f"error: {e}")
+
+
+# ============================================================
+# Phase 3A backfill scheduler — runs in-process if SCHEDULER_ENABLED=1
+# ============================================================
+
+_post_catalyst_scheduler_state: dict = {
+    "started": False,
+    "last_run_at": None,
+    "last_result": None,
+    "runs_total": 0,
+}
+
+
+def _start_post_catalyst_scheduler_once() -> None:
+    """Start a background asyncio task that runs the Phase 3A backfill on
+    a schedule. Idempotent — multiple calls are no-ops. Only runs if env
+    var POST_CATALYST_SCHEDULER_ENABLED=1."""
+    if _post_catalyst_scheduler_state.get("started"):
+        return
+    if os.getenv("POST_CATALYST_SCHEDULER_ENABLED", "0") != "1":
+        return
+    _post_catalyst_scheduler_state["started"] = True
+
+    import asyncio
+    interval_hours = float(os.getenv("POST_CATALYST_SCHEDULER_HOURS", "6"))
+    batch_limit = int(os.getenv("POST_CATALYST_SCHEDULER_LIMIT", "25"))
+    min_age_days = int(os.getenv("POST_CATALYST_SCHEDULER_MIN_AGE_DAYS", "7"))
+
+    async def _loop():
+        # Wait 60s on startup so the app finishes initialization
+        await asyncio.sleep(60)
+        from datetime import datetime as _dt
+        from services.post_catalyst_tracker import backfill_batch
+        while True:
+            try:
+                logger.info(f"[post-catalyst-scheduler] running batch limit={batch_limit} min_age={min_age_days}")
+                result = backfill_batch(limit=batch_limit, min_age_days=min_age_days)
+                _post_catalyst_scheduler_state["last_run_at"] = _dt.utcnow().isoformat()
+                _post_catalyst_scheduler_state["last_result"] = {
+                    "processed": result.get("processed"),
+                    "created": result.get("created"),
+                    "failed": result.get("failed"),
+                    "skipped": result.get("skipped"),
+                }
+                _post_catalyst_scheduler_state["runs_total"] += 1
+                logger.info(f"[post-catalyst-scheduler] done: {result.get('created')} created, {result.get('failed')} failed, {result.get('skipped')} skipped")
+            except Exception as e:
+                logger.warning(f"[post-catalyst-scheduler] error: {e}")
+                _post_catalyst_scheduler_state["last_result"] = {"error": str(e)[:200]}
+            await asyncio.sleep(interval_hours * 3600)
+
+    try:
+        loop = asyncio.get_event_loop()
+        loop.create_task(_loop())
+        logger.info(f"[post-catalyst-scheduler] STARTED interval={interval_hours}h limit={batch_limit} min_age={min_age_days}d")
+    except Exception as e:
+        logger.warning(f"[post-catalyst-scheduler] failed to start: {e}")
+        _post_catalyst_scheduler_state["started"] = False
+
+
+@router.get("/post-catalyst/scheduler-status")
+async def post_catalyst_scheduler_status():
+    """Status of the Phase 3A backfill scheduler. Set env var
+    POST_CATALYST_SCHEDULER_ENABLED=1 to enable.
+    Tunable via:
+      POST_CATALYST_SCHEDULER_HOURS (default 6)
+      POST_CATALYST_SCHEDULER_LIMIT (default 25)
+      POST_CATALYST_SCHEDULER_MIN_AGE_DAYS (default 7)"""
+    return {
+        "enabled": os.getenv("POST_CATALYST_SCHEDULER_ENABLED", "0") == "1",
+        "interval_hours": float(os.getenv("POST_CATALYST_SCHEDULER_HOURS", "6")),
+        "batch_limit": int(os.getenv("POST_CATALYST_SCHEDULER_LIMIT", "25")),
+        "min_age_days": int(os.getenv("POST_CATALYST_SCHEDULER_MIN_AGE_DAYS", "7")),
+        **_post_catalyst_scheduler_state,
+    }
+
+
+@router.post("/post-catalyst/scheduler-trigger-now")
+async def post_catalyst_scheduler_trigger():
+    """Manually trigger one round of the Phase 3A backfill, bypassing the
+    scheduler. Equivalent to POST /admin/post-catalyst/backfill but uses
+    the env-var defaults so it matches what the scheduler would do."""
+    from services.post_catalyst_tracker import backfill_batch
+    batch_limit = int(os.getenv("POST_CATALYST_SCHEDULER_LIMIT", "25"))
+    min_age_days = int(os.getenv("POST_CATALYST_SCHEDULER_MIN_AGE_DAYS", "7"))
+    return backfill_batch(limit=batch_limit, min_age_days=min_age_days)

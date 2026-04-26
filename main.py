@@ -108,6 +108,12 @@ async def lifespan(app: FastAPI):
         logger.error(f"DB init failed: {e}")
     # Spawn background worker
     worker_task = asyncio.create_task(_background_worker())
+    # Start Phase 3A backfill scheduler (no-op if env var not set)
+    try:
+        from routes.admin import _start_post_catalyst_scheduler_once
+        _start_post_catalyst_scheduler_once()
+    except Exception as e:
+        logger.warning(f"post-catalyst scheduler start failed: {e}")
     try:
         yield
     finally:
