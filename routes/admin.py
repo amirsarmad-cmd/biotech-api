@@ -1601,3 +1601,71 @@ async def fda_sources_lookup(drug_name: str, indication: Optional[str] = None):
     except Exception as e:
         logger.exception("fda_sources_lookup failed")
         raise HTTPException(500, f"fda_sources error: {e}")
+
+
+# ────────────────────────────────────────────────────────────
+# Research corpus — URL ingestion + retrieval
+# ────────────────────────────────────────────────────────────
+
+class ResearchIngestRequest(BaseModel):
+    url: str
+    ticker_hint: Optional[str] = None
+    cookies: Optional[str] = None  # "k1=v1; k2=v2" — passed per-request, never stored
+
+
+@router.post("/research/ingest")
+async def research_ingest(req: ResearchIngestRequest):
+    """Ingest a URL: fetch → extract → LLM summarize → embed → store.
+
+    Solves the SA-scraper question by inverting it. User pastes any URL
+    (Seeking Alpha, Substack, IR page, transcript) and we extract structured
+    insights into research_corpus for retrieval at NPV time.
+
+    Cookies are passed per-request and never stored — caller can supply
+    SA Premium auth cookies for paywalled articles.
+    """
+    try:
+        from services.research_ingestor import ingest_url
+        result = ingest_url(
+            url=req.url,
+            ticker_hint=(req.ticker_hint or "").upper().strip() or None,
+            cookies=req.cookies,
+        )
+        return result
+    except Exception as e:
+        logger.exception("research_ingest failed")
+        raise HTTPException(500, f"ingest error: {e}")
+
+
+@router.get("/research/list")
+async def research_list(ticker: Optional[str] = None, limit: int = 50):
+    """List ingested articles. Filter by ticker if given."""
+    try:
+        from services.research_ingestor import list_corpus
+        items = list_corpus(ticker=(ticker or "").upper().strip() or None, limit=min(limit, 200))
+        return {"count": len(items), "items": items}
+    except Exception as e:
+        logger.exception("research_list failed")
+        raise HTTPException(500, f"list error: {e}")
+
+
+@router.get("/research/relevant")
+async def research_relevant(ticker: str, indication: Optional[str] = None,
+                             query: Optional[str] = None, limit: int = 5):
+    """Return relevant research_corpus entries for a ticker / indication.
+
+    Uses pgvector cosine similarity on embeddings. Direct ticker_hint matches
+    are ranked first. Used by V2 NPV at analysis time as Layer 5 user research.
+    """
+    try:
+        from services.research_ingestor import find_relevant_research
+        items = find_relevant_research(
+            ticker=ticker.upper(),
+            indication=indication,
+            query_text=query,
+            limit=min(limit, 20),
+        )
+        return {"ticker": ticker.upper(), "count": len(items), "items": items}
+    except Exception as e:
+        logger.exception("research_relevant failed")
+        raise HTTPException(500, f"relevant error: {e}")

@@ -461,56 +461,355 @@ def fetch_clinical_trials(drug_name: str = None, indication: str = None,
 # Orange Book — patent + exclusivity (LOE dates)
 # ────────────────────────────────────────────────────────────
 
-# Orange Book is published as a CSV bundle. We fetch + parse it weekly.
-# Endpoint: https://www.fda.gov/media/76860/download (the file structure
-# changes occasionally; the canonical reference is
-# https://www.fda.gov/drugs/drug-approvals-and-databases/orange-book-data-files)
+# Orange Book is published as a ZIP bundle on the FDA website. It contains
+# pipe-separated text files (products, patents, exclusivity) updated monthly.
+# Reference: https://www.fda.gov/drugs/drug-approvals-and-databases/orange-book-data-files
 ORANGE_BOOK_URL = "https://www.fda.gov/media/76860/download?attachment"
+
+# Cache structure: orange_book is parsed once per ~7 days into a single
+# in-Redis dict keyed by appl_no, plus secondary indices on brand_name and
+# ingredient. Subsequent lookups are O(1).
+_OB_CACHE_KEY = "orangebook:parsed:v1"
+_OB_TTL_SEC = 7 * 86400  # 7 days
+
+
+def _download_and_parse_orange_book() -> Optional[Dict]:
+    """Download the Orange Book ZIP, parse the three pipe-delimited files,
+    and return a lookup dict.
+
+    Output structure:
+        {
+          "by_appl_no": {
+            "021107": {
+              "products": [{"trade_name", "ingredient", "strength", "appl_type",
+                            "approval_date", "rld", "te_code"}, ...],
+              "patents": [{"patent_no", "expire_date", "drug_substance_flag",
+                            "drug_product_flag", "patent_use_code"}, ...],
+              "exclusivities": [{"code", "date"}, ...],
+              "earliest_loe": "2030-12-15",
+              "latest_loe": "2035-08-21",
+            }, ...
+          },
+          "by_brand": {"REPATHA": ["125522", ...]},
+          "by_ingredient": {"EVOLOCUMAB": ["125522"]},
+          "_meta": {"fetched_at": iso8601, "files_parsed": [...]},
+        }
+    """
+    import io, zipfile, urllib.request, urllib.error
+
+    try:
+        logger.info("Orange Book: downloading ~50MB ZIP from FDA...")
+        req = urllib.request.Request(ORANGE_BOOK_URL,
+                                     headers={"User-Agent": "biotech-screener/1.0"})
+        # The download is large — give it 60s
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            buf = resp.read()
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
+        logger.warning(f"Orange Book download failed: {e}")
+        return None
+
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(buf))
+        names = zf.namelist()
+        logger.info(f"Orange Book: ZIP extracted, files: {names}")
+    except zipfile.BadZipFile as e:
+        logger.warning(f"Orange Book ZIP malformed: {e}")
+        return None
+
+    # Find the three data files (case-insensitive — FDA renames occasionally)
+    def _find(name_part: str) -> Optional[str]:
+        for n in names:
+            if name_part.lower() in n.lower() and (n.endswith(".txt") or n.endswith(".TXT")):
+                return n
+        return None
+    products_file = _find("products")
+    patent_file = _find("patent")
+    exclusivity_file = _find("exclusivity")
+
+    by_appl_no: Dict[str, Dict] = {}
+    by_brand: Dict[str, set] = {}
+    by_ingredient: Dict[str, set] = {}
+    files_parsed = []
+
+    # ─── Parse products.txt ─────
+    if products_file:
+        try:
+            text = zf.read(products_file).decode("utf-8", errors="replace")
+            lines = text.split("\n")
+            header = [h.strip() for h in (lines[0] if lines else "").split("~")]
+            # Some recent Orange Book files use ~ as separator instead of |
+            if "Trade_Name" not in header and len(header) < 3:
+                header = [h.strip() for h in lines[0].split("|")]
+                sep = "|"
+            else:
+                sep = "~"
+            # Map column indices
+            idx = {h: i for i, h in enumerate(header)}
+            for line in lines[1:]:
+                if not line.strip():
+                    continue
+                cols = line.split(sep)
+                if len(cols) < len(header):
+                    continue
+                appl_no = (cols[idx.get("Appl_No", 0)] or "").strip()
+                if not appl_no:
+                    continue
+                trade = (cols[idx.get("Trade_Name", 1)] or "").strip().upper()
+                ingredient = (cols[idx.get("Ingredient", 0)] or "").strip().upper()
+                product = {
+                    "trade_name": trade,
+                    "ingredient": ingredient,
+                    "strength": (cols[idx.get("Strength", 0)] or "").strip(),
+                    "appl_type": (cols[idx.get("Appl_Type", 0)] or "").strip(),
+                    "approval_date": (cols[idx.get("Approval_Date", 0)] or "").strip(),
+                    "rld": (cols[idx.get("RLD", 0)] or "").strip(),
+                    "te_code": (cols[idx.get("TE_Code", 0)] or "").strip(),
+                }
+                d = by_appl_no.setdefault(appl_no,
+                                          {"products": [], "patents": [], "exclusivities": []})
+                d["products"].append(product)
+                if trade:
+                    by_brand.setdefault(trade, set()).add(appl_no)
+                if ingredient:
+                    by_ingredient.setdefault(ingredient, set()).add(appl_no)
+            files_parsed.append(products_file)
+        except Exception as e:
+            logger.warning(f"products.txt parse failed: {e}")
+
+    # ─── Parse patent.txt ─────
+    if patent_file:
+        try:
+            text = zf.read(patent_file).decode("utf-8", errors="replace")
+            lines = text.split("\n")
+            header = [h.strip() for h in (lines[0] if lines else "").split("~")]
+            if "Patent_No" not in header and len(header) < 3:
+                header = [h.strip() for h in lines[0].split("|")]
+                sep = "|"
+            else:
+                sep = "~"
+            idx = {h: i for i, h in enumerate(header)}
+            for line in lines[1:]:
+                if not line.strip():
+                    continue
+                cols = line.split(sep)
+                if len(cols) < len(header):
+                    continue
+                appl_no = (cols[idx.get("Appl_No", 0)] or "").strip()
+                if not appl_no or appl_no not in by_appl_no:
+                    # Patent for an Appl_No we didn't see in products — still record
+                    by_appl_no.setdefault(appl_no,
+                                          {"products": [], "patents": [], "exclusivities": []})
+                pat = {
+                    "patent_no": (cols[idx.get("Patent_No", 0)] or "").strip(),
+                    "expire_date": (cols[idx.get("Patent_Expire_Date_Text", 0)] or "").strip(),
+                    "drug_substance_flag": (cols[idx.get("Drug_Substance_Flag", 0)] or "").strip() == "Y",
+                    "drug_product_flag": (cols[idx.get("Drug_Product_Flag", 0)] or "").strip() == "Y",
+                    "patent_use_code": (cols[idx.get("Patent_Use_Code", 0)] or "").strip(),
+                    "delist_flag": (cols[idx.get("Delist_Flag", 0)] or "").strip() == "Y",
+                }
+                if pat["patent_no"] and not pat["delist_flag"]:
+                    by_appl_no[appl_no]["patents"].append(pat)
+            files_parsed.append(patent_file)
+        except Exception as e:
+            logger.warning(f"patent.txt parse failed: {e}")
+
+    # ─── Parse exclusivity.txt ─────
+    if exclusivity_file:
+        try:
+            text = zf.read(exclusivity_file).decode("utf-8", errors="replace")
+            lines = text.split("\n")
+            header = [h.strip() for h in (lines[0] if lines else "").split("~")]
+            if "Exclusivity_Code" not in header and len(header) < 3:
+                header = [h.strip() for h in lines[0].split("|")]
+                sep = "|"
+            else:
+                sep = "~"
+            idx = {h: i for i, h in enumerate(header)}
+            for line in lines[1:]:
+                if not line.strip():
+                    continue
+                cols = line.split(sep)
+                if len(cols) < len(header):
+                    continue
+                appl_no = (cols[idx.get("Appl_No", 0)] or "").strip()
+                if not appl_no:
+                    continue
+                if appl_no not in by_appl_no:
+                    by_appl_no[appl_no] = {"products": [], "patents": [], "exclusivities": []}
+                excl = {
+                    "code": (cols[idx.get("Exclusivity_Code", 0)] or "").strip(),
+                    "date": (cols[idx.get("Exclusivity_Date", 0)] or "").strip(),
+                }
+                if excl["code"]:
+                    by_appl_no[appl_no]["exclusivities"].append(excl)
+            files_parsed.append(exclusivity_file)
+        except Exception as e:
+            logger.warning(f"exclusivity.txt parse failed: {e}")
+
+    # ─── Compute LOE per appl_no ─────
+    for appl_no, d in by_appl_no.items():
+        all_dates = []
+        for p in d["patents"]:
+            if p.get("expire_date"):
+                all_dates.append(p["expire_date"])
+        for e in d["exclusivities"]:
+            if e.get("date"):
+                all_dates.append(e["date"])
+        # Convert MMM DD, YYYY format to ISO if needed
+        norm_dates = []
+        for ds in all_dates:
+            iso = _parse_ob_date(ds)
+            if iso:
+                norm_dates.append(iso)
+        norm_dates.sort()
+        d["earliest_loe"] = norm_dates[0] if norm_dates else None
+        d["latest_loe"] = norm_dates[-1] if norm_dates else None
+
+    out = {
+        "by_appl_no": by_appl_no,
+        "by_brand": {k: list(v) for k, v in by_brand.items()},
+        "by_ingredient": {k: list(v) for k, v in by_ingredient.items()},
+        "_meta": {
+            "fetched_at": __import__("datetime").datetime.utcnow().isoformat(),
+            "files_parsed": files_parsed,
+            "n_appl_no": len(by_appl_no),
+            "n_brands": len(by_brand),
+            "n_ingredients": len(by_ingredient),
+        },
+    }
+    logger.info(f"Orange Book parsed: {out['_meta']}")
+    return out
+
+
+def _parse_ob_date(date_str: str) -> Optional[str]:
+    """Parse Orange Book date (e.g. 'Mar 21, 2030', 'Jan 2, 2030') → ISO YYYY-MM-DD."""
+    if not date_str:
+        return None
+    date_str = date_str.strip()
+    # Already ISO?
+    if len(date_str) == 10 and date_str[4] == "-" and date_str[7] == "-":
+        return date_str
+    from datetime import datetime
+    for fmt in ("%b %d, %Y", "%B %d, %Y", "%m/%d/%Y", "%Y-%m-%d", "%Y%m%d"):
+        try:
+            return datetime.strptime(date_str, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return None
+
+
+def _get_orange_book_lookup(force_refresh: bool = False) -> Optional[Dict]:
+    """Get the parsed Orange Book lookup dict — from Redis cache or by
+    downloading + parsing. Cached for 7 days.
+    """
+    r = _redis_client()
+    if r and not force_refresh:
+        try:
+            raw = r.get(_OB_CACHE_KEY)
+            if raw:
+                return json.loads(raw)
+        except Exception:
+            pass
+    # Cache miss — download + parse
+    parsed = _download_and_parse_orange_book()
+    if parsed and r:
+        try:
+            r.setex(_OB_CACHE_KEY, _OB_TTL_SEC, json.dumps(parsed, default=str))
+            logger.info(f"Orange Book cached in Redis (TTL {_OB_TTL_SEC}s)")
+        except Exception as e:
+            logger.warning(f"Orange Book Redis set failed: {e}")
+    return parsed
 
 
 def fetch_orange_book_loe(drug_name: str = None, ingredient: str = None) -> Optional[Dict]:
     """Look up patent + exclusivity expirations for a drug from Orange Book.
-    
-    Note: this is a heavy operation — the OB CSV is ~50MB. We cache the
-    parsed lookup table for 7 days. First call after deploy will be slow.
-    
+
+    First call after deploy will be slow (~30-60s) as it downloads + parses
+    the ZIP. Subsequent calls are O(1) Redis lookups.
+
     Returns:
         {
           "drug_name": str,
           "ingredient": str,
-          "patents": [
-            {"patent_no": str, "expire_date": str, "drug_substance_flag": bool, "drug_product_flag": bool},
-            ...
-          ],
-          "exclusivities": [
-            {"code": str, "date": str, "description": str},  # e.g. ODE = orphan
-            ...
-          ],
-          "earliest_loe": str | None,
+          "matched_appl_no": str,
+          "products": [...],
+          "patents": [{"patent_no", "expire_date", "drug_substance_flag", ...}],
+          "exclusivities": [{"code", "date"}],
+          "earliest_loe": str | None,  # ISO date
           "latest_loe": str | None,
+          "_source": "orange_book",
         }
+        Or {"_not_found": True} if the drug isn't in Orange Book (typical for
+        biologics — Orange Book is for small-molecule drugs only; biologics
+        are in the Purple Book which is a separate database).
     """
     if not (drug_name or ingredient):
         return None
-    
+
     cache_key = f"orangebook:lookup:{(drug_name or ingredient or '').lower()}"
     cached = _cached_get(cache_key)
     if cached is not None:
         cached["_from_cache"] = True
         return cached
 
-    # For now, a stub that returns the cache key + indicates not implemented.
-    # Full implementation requires download + parse of products.txt, patent.txt,
-    # and exclusivity.txt. Will add in a follow-up commit once we verify
-    # OpenFDA + ClinicalTrials.gov work end-to-end.
+    lookup = _get_orange_book_lookup()
+    if not lookup:
+        return {
+            "drug_name": drug_name,
+            "ingredient": ingredient,
+            "_source": "orange_book",
+            "_status": "download_failed",
+            "_note": "Could not download Orange Book — try again later or check network",
+        }
+
+    # Find matching appl_no(s) — by brand or ingredient name (case-insensitive)
+    candidates = []
+    if drug_name:
+        candidates.extend(lookup.get("by_brand", {}).get(drug_name.upper(), []))
+        # Also try just the first word (e.g. 'Lonvoguran ziclumeran' → 'LONVOGURAN')
+        if " " in drug_name:
+            candidates.extend(lookup.get("by_brand", {}).get(drug_name.split()[0].upper(), []))
+    if ingredient:
+        candidates.extend(lookup.get("by_ingredient", {}).get(ingredient.upper(), []))
+    elif drug_name:
+        # Fallback: try drug_name as ingredient
+        candidates.extend(lookup.get("by_ingredient", {}).get(drug_name.upper(), []))
+        if " " in drug_name:
+            candidates.extend(lookup.get("by_ingredient", {}).get(drug_name.split()[0].upper(), []))
+
+    # Deduplicate while preserving order
+    seen = set()
+    candidates = [c for c in candidates if not (c in seen or seen.add(c))]
+
+    if not candidates:
+        out = {
+            "drug_name": drug_name,
+            "ingredient": ingredient,
+            "_source": "orange_book",
+            "_not_found": True,
+            "_note": "Drug not in Orange Book — likely biologic (Purple Book) or pre-approval",
+        }
+        _cached_set(cache_key, out, ttl_sec=86400)
+        return out
+
+    # Use the first match — for now, simple. Could merge across multiple Appl_Nos
+    # for drugs with multiple formulations.
+    appl_no = candidates[0]
+    d = lookup["by_appl_no"].get(appl_no, {})
     out = {
         "drug_name": drug_name,
         "ingredient": ingredient,
+        "matched_appl_no": appl_no,
+        "products": d.get("products", [])[:5],
+        "patents": d.get("patents", []),
+        "exclusivities": d.get("exclusivities", []),
+        "earliest_loe": d.get("earliest_loe"),
+        "latest_loe": d.get("latest_loe"),
+        "n_other_matching_appl_nos": max(0, len(candidates) - 1),
         "_source": "orange_book",
-        "_status": "not_yet_implemented",
-        "_note": "Orange Book CSV ingest deferred; use OpenFDA Drugs@FDA approval_date as proxy",
+        "_from_cache": False,
     }
-    _cached_set(cache_key, out, ttl_sec=300)
+    _cached_set(cache_key, out, ttl_sec=86400)
     return out
 
 
@@ -557,12 +856,19 @@ def gather_verified_facts(ticker: str, drug_name: str,
         facts["clinical_trials"] = trials
         succeeded.append("clinicaltrials_gov")
 
-    # Orange Book — patents (stub for now)
-    # attempted.append("orange_book")
-    # orange = fetch_orange_book_loe(drug_name=drug_name)
-    # if orange:
-    #     facts["orange_book"] = orange
-    #     succeeded.append("orange_book")
+    # Orange Book — real LOE dates (small molecules only; biologics in Purple Book)
+    # Skipped if explicitly disabled — first call after deploy is slow (~30-60s)
+    # so allow opting out for performance-sensitive paths.
+    if os.getenv("ORANGE_BOOK_ENABLED", "1") != "0":
+        attempted.append("orange_book")
+        try:
+            orange = fetch_orange_book_loe(drug_name=drug_name)
+            if orange and not orange.get("_not_found") and not orange.get("_status") == "download_failed":
+                if orange.get("earliest_loe") or orange.get("patents"):
+                    facts["orange_book"] = orange
+                    succeeded.append("orange_book")
+        except Exception as e:
+            logger.info(f"orange_book lookup failed: {e}")
 
     facts["_sources_attempted"] = attempted
     facts["_sources_succeeded"] = succeeded
@@ -629,6 +935,32 @@ def format_verified_facts_for_prompt(facts: Dict) -> str:
                 lines.append(f"      Primary endpoint: {pom}")
             if s.get("primary_completion_date"):
                 lines.append(f"      Primary completion: {s['primary_completion_date']}")
+
+    # Orange Book section — real patents + exclusivities
+    if facts.get("orange_book"):
+        ob = facts["orange_book"]
+        lines.append(f"\n[Orange Book — patent / exclusivity (small molecules only)]")
+        lines.append(f"  Matched Appl_No: {ob.get('matched_appl_no')}")
+        if ob.get("earliest_loe"):
+            lines.append(f"  Earliest LOE date: {ob['earliest_loe']} (USE THIS as patent_expiry_date)")
+        if ob.get("latest_loe"):
+            lines.append(f"  Latest LOE date:   {ob['latest_loe']}")
+        n_pat = len(ob.get("patents", []))
+        n_excl = len(ob.get("exclusivities", []))
+        lines.append(f"  Patents on record: {n_pat} | Exclusivities: {n_excl}")
+        # Show 3 nearest-expiring patents
+        all_loe = []
+        for p in (ob.get("patents") or []):
+            iso = _parse_ob_date(p.get("expire_date", ""))
+            if iso:
+                all_loe.append((iso, "patent", p.get("patent_no")))
+        for e in (ob.get("exclusivities") or []):
+            iso = _parse_ob_date(e.get("date", ""))
+            if iso:
+                all_loe.append((iso, "exclusivity", e.get("code")))
+        all_loe.sort()
+        for iso, kind, code in all_loe[:3]:
+            lines.append(f"    {iso}  {kind}  {code}")
 
     lines.append(f"\n  (Sources fetched: {', '.join(facts['_sources_succeeded'])} in "
                  f"{facts.get('_fetch_duration_ms', '?')}ms)")

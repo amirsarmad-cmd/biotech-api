@@ -716,7 +716,7 @@ If you genuinely don't know a field, set it to null. Don't fabricate. Schema:
   "rationale": "<3-4 sentence summary justifying the numbers above. Make clear whether you're scoping to a single indication or whole franchise. Cite specific epidemiology / pricing benchmarks where possible.>",
   "provenance": {{
     "<field_name>": {{
-      "source": "<one of: 'openfda' | 'clinicaltrials_gov' | 'sec_edgar' | 'orange_book' | 'polygon_options' | 'finnhub' | 'llm_grounded_web' | 'llm_inference'>",
+      "source": "<one of: 'openfda' | 'clinicaltrials_gov' | 'sec_edgar' | 'orange_book' | 'polygon_options' | 'finnhub' | 'llm_grounded_web' | 'llm_inference' | 'user_research'>",
       "confidence": "<one of: 'high' | 'medium' | 'low'>",
       "citation": "<short string — e.g. 'HAEA 2024 prevalence estimate' or 'Takhzyro WAC list price 2024' or 'analyst inference'>"
     }},
@@ -726,7 +726,8 @@ If you genuinely don't know a field, set it to null. Don't fabricate. Schema:
 
 PROVENANCE RULES:
 - Every numeric field above (population, pricing, penetration, dates, probabilities, COGS, LOE) MUST have a provenance entry.
-- Use 'llm_grounded_web' for facts you found in the CONTEXT FROM RESEARCH section above.
+- Use 'llm_grounded_web' for facts you found in the GROUNDED WEB RESEARCH section.
+- Use 'user_research' for facts derived from the USER-SUPPLIED RESEARCH section (Layer 5 — articles the user explicitly fed the system).
 - Use 'llm_inference' for values you reasoned from analogues, modality typicals, or standard biotech rules of thumb.
 - Use 'openfda' / 'clinicaltrials_gov' / 'sec_edgar' / 'orange_book' ONLY when those sources are explicitly cited in the research context.
 - 'high' confidence: you have a specific cited number from a reliable source.
@@ -923,6 +924,40 @@ def fetch_or_compute_drug_economics_v2(ticker: str, company_name: str,
         except Exception as e:
             logger.info(f"FDA verified_facts gather failed: {e}")
 
+    # ─── Layer 5: User-supplied research (research_corpus) ─────────────
+    # Retrieve previously-ingested articles (SA, Substack, IR pages, etc.)
+    # that are relevant to this ticker / indication. Surfaces analyst
+    # frameworks the user explicitly chose to feed the system.
+    user_research_block = ""
+    if os.getenv("RESEARCH_CORPUS_ENABLED", "1") != "0":
+        try:
+            from services.research_ingestor import find_relevant_research
+            relevant = find_relevant_research(
+                ticker=ticker, indication=None,
+                query_text=f"{drug_name or ''} {catalyst_type}",
+                limit=3,
+            )
+            if relevant:
+                lines = ["USER-SUPPLIED RESEARCH (Layer 5 — analyst content user has fed the system):"]
+                for r in relevant:
+                    lines.append(f"\n[{r.get('url_domain', '?')} | match={r.get('similarity', 0):.2f}{' [TICKER]' if r.get('ticker_match') else ''}]")
+                    if r.get("title"):
+                        lines.append(f"  Title: {r['title'][:150]}")
+                    if r.get("summary"):
+                        lines.append(f"  Summary: {r['summary'][:400]}")
+                    if r.get("valuation_framework"):
+                        lines.append(f"  Valuation framework: {r['valuation_framework'][:150]}")
+                    claims = r.get("key_claims") or []
+                    if claims:
+                        lines.append(f"  Key claims:")
+                        for c in claims[:3]:
+                            if isinstance(c, dict):
+                                lines.append(f"    - [{c.get('confidence', '?')}] {(c.get('claim') or '')[:200]}")
+                user_research_block = "\n".join(lines)
+                logger.info(f"User research found for {ticker}: {len(relevant)} articles")
+        except Exception as e:
+            logger.info(f"research_corpus retrieval failed: {e}")
+
     # ─── Layer 3: LLM-grounded web research ────────────────────────────
     # Gemini + Google Search pulls epidemiology, pricing, competitive context
     # that's not in FDA structured data. This is run AFTER FDA so the LLM
@@ -934,10 +969,12 @@ def fetch_or_compute_drug_economics_v2(ticker: str, company_name: str,
             catalyst_type=catalyst_type, description=description,
         )
 
-    # Compose the full context: verified_facts FIRST (anchor), then web research
+    # Compose the full context: Layer 1 (FDA) > Layer 5 (user) > Layer 3 (web)
     full_context = ""
     if verified_facts_block:
         full_context = verified_facts_block + "\n\n"
+    if user_research_block:
+        full_context += user_research_block + "\n\n"
     if research_context:
         full_context += "GROUNDED WEB RESEARCH:\n" + research_context
 
