@@ -1087,6 +1087,11 @@ def _params_hash(payload: Dict) -> str:
         "annual_cost_min_usd", "annual_cost_max_usd",
         "addressable_population_global", "penetration_mid_pct",
         "patent_expiry_date", "loe_dropoff_pct", "time_to_peak_years",
+        # Methodology audit additions — different inputs MUST yield
+        # different cache keys, otherwise dilution/per-share variants
+        # collide with the no-dilution base case.
+        "dilution_assumed_pct", "shares_outstanding_m_override",
+        "drug_name_override", "description_override",
     ])
     canonical = json.dumps({k: payload.get(k) for k in keys_of_interest}, default=str, sort_keys=True)
     return hashlib.md5(canonical.encode()).hexdigest()[:24]

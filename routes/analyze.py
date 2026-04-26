@@ -153,6 +153,11 @@ async def analyze_npv(req: NPVRequest):
             "cogs_pct": req.cogs_pct, "p_approval": req.p_commercial,
             "time_to_peak_years": req.time_to_peak_years,
             "loe_dropoff_pct": None,  # filled after econ_v2
+            # Methodology audit fields — different values MUST produce different cache keys
+            "dilution_assumed_pct": req.dilution_assumed_pct,
+            "shares_outstanding_m_override": req.shares_outstanding_m_override,
+            "drug_name_override": req.drug_name_override,
+            "description_override": req.description_override,
         }
         params_hash_val = _params_hash(cache_payload)
         
