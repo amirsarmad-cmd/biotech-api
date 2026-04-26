@@ -1169,22 +1169,32 @@ async def seed_historical_catalysts(
             # delisted/acquired tickers (ADAP, AKRO etc.) have no price
             # history and would all fail. Order by market_cap DESC so we
             # cover the biggest names first (better historical data quality).
+            #
+            # CRITICAL: also exclude tickers we ALREADY tried but where
+            # LLM returned no historical catalysts. Without this the same
+            # tickers get re-queried each batch (seen with ONC, ILMN).
+            # We track this via a marker row: post_catalyst_outcomes with
+            # outcome='no_history_known' written below.
             cur.execute("""
-                SELECT cu.ticker, cu.company_name, ss.market_cap
-                FROM catalyst_universe cu
-                INNER JOIN screener_stocks ss ON ss.ticker = cu.ticker
-                WHERE cu.status = 'active'
-                  AND cu.ticker IS NOT NULL
-                  AND ss.market_cap IS NOT NULL
-                  AND ss.market_cap > 0
-                  AND COALESCE(ss.description, '') NOT LIKE 'yfinance backfill%%'
-                  AND COALESCE(ss.description, '') NOT LIKE 'yfinance: no data%%'
-                  AND cu.ticker NOT IN (
-                    SELECT DISTINCT ticker FROM post_catalyst_outcomes
-                    WHERE outcome IS NOT NULL AND outcome != 'unknown'
-                  )
-                GROUP BY cu.ticker, cu.company_name, ss.market_cap
-                ORDER BY ss.market_cap DESC
+                SELECT t.ticker, t.company_name FROM (
+                    SELECT DISTINCT ON (cu.ticker)
+                        cu.ticker, cu.company_name, ss.market_cap
+                    FROM catalyst_universe cu
+                    INNER JOIN screener_stocks ss ON ss.ticker = cu.ticker
+                    WHERE cu.status = 'active'
+                      AND cu.ticker IS NOT NULL
+                      AND ss.market_cap IS NOT NULL
+                      AND ss.market_cap > 0
+                      AND COALESCE(ss.description, '') NOT LIKE 'yfinance backfill%%'
+                      AND COALESCE(ss.description, '') NOT LIKE 'yfinance: no data%%'
+                      AND cu.ticker NOT IN (
+                        SELECT DISTINCT ticker FROM post_catalyst_outcomes
+                        WHERE outcome IS NOT NULL
+                          AND outcome NOT IN ('unknown')
+                      )
+                    ORDER BY cu.ticker, ss.market_cap DESC NULLS LAST
+                ) t
+                ORDER BY t.market_cap DESC
                 LIMIT %s
             """, (max_tickers,))
             tickers = [(r[0], r[1] or r[0]) for r in cur.fetchall()]
@@ -1238,6 +1248,30 @@ If you don't have high-confidence knowledge of {per_ticker} historical catalysts
                 
                 catalysts = result.get("catalysts", []) or []
                 if not catalysts:
+                    # Write a sentinel row so subsequent batches skip this ticker.
+                    # We use catalyst_type='_no_history_known' + a fixed dummy date
+                    # so it goes into post_catalyst_outcomes and the query above
+                    # excludes it via 'outcome IS NOT NULL AND outcome != unknown'.
+                    if not dry_run:
+                        try:
+                            with db.get_conn() as conn2:
+                                cur2 = conn2.cursor()
+                                cur2.execute("""
+                                    INSERT INTO post_catalyst_outcomes
+                                      (catalyst_id, ticker, catalyst_type, catalyst_date,
+                                       outcome, outcome_confidence, outcome_source, outcome_notes,
+                                       computed_at, last_updated, backfill_attempts)
+                                    VALUES (NULL, %s, '_no_history_known', '1900-01-01',
+                                            'no_history_known', 0.0, 'historical_seed_skip',
+                                            'LLM returned no historical catalysts',
+                                            NOW(), NOW(), 1)
+                                    ON CONFLICT (ticker, catalyst_type, catalyst_date) DO UPDATE SET
+                                        last_updated = NOW(),
+                                        backfill_attempts = post_catalyst_outcomes.backfill_attempts + 1
+                                """, (ticker,))
+                                conn2.commit()
+                        except Exception as e:
+                            logger.info(f"skip-marker write failed for {ticker}: {e}")
                     results.append({"ticker": ticker, "catalysts_returned": 0,
                                      "note": "LLM returned no historical catalysts"})
                     continue
