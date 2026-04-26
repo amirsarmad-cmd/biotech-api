@@ -318,6 +318,98 @@ def _infer_outcome(
 # Backfill orchestration
 # ============================================================
 
+def _classify_outcome_with_llm(
+    ticker: str,
+    catalyst_type: Optional[str],
+    catalyst_date: str,
+    drug_name: Optional[str],
+    indication: Optional[str],
+    move_1d: Optional[float],
+    move_30d: Optional[float],
+    volume_ratio: Optional[float],
+) -> Optional[Tuple[str, float, str]]:
+    """LLM fallback classifier for ambiguous price-action cases.
+    
+    Used when _infer_outcome returns low-confidence (< 0.5) — typically when
+    the catalyst was priced-in (small close, small intraday) and price action
+    alone can't tell us if the underlying news was good/bad/delayed.
+    
+    The LLM has training-data knowledge of historical FDA decisions and clinical
+    readouts, which can resolve cases where price action is ambiguous but the
+    actual outcome is well-documented (e.g. Mounjaro 2022 — clearly approved
+    but priced-in days before).
+    
+    Returns (outcome, confidence, basis) or None if LLM call fails.
+    """
+    if not catalyst_type or not catalyst_date:
+        return None
+    
+    drug_label = drug_name or "(unspecified drug)"
+    indication_label = indication or "(unspecified indication)"
+    move_1d_str = f"{move_1d:+.1f}%" if move_1d is not None else "unknown"
+    move_30d_str = f"{move_30d:+.1f}%" if move_30d is not None else "unknown"
+    vol_str = f"{volume_ratio:.1f}x avg" if volume_ratio else "unknown"
+    
+    prompt = f"""You are classifying the historical outcome of a biotech catalyst for a learning-loop dataset.
+
+TICKER: {ticker}
+CATALYST TYPE: {catalyst_type}
+CATALYST DATE: {catalyst_date}
+DRUG: {drug_label}
+INDICATION: {indication_label}
+
+OBSERVED PRICE ACTION:
+- 1-day post-catalyst move: {move_1d_str}
+- 30-day post-catalyst move: {move_30d_str}
+- Day-0 volume vs 30-day avg: {vol_str}
+
+Based on your knowledge of what actually happened with this catalyst (drug approval status, trial readout outcome, etc), classify the OUTCOME of this specific event.
+
+CLASSIFICATION RULES:
+- "approved": the catalyst delivered a positive outcome (FDA approval, positive trial readout, label expansion granted, etc.). This applies even if the stock didn't move much because the result was already priced-in (common for high-probability events like Mounjaro 2022 where approval was widely expected).
+- "rejected": negative outcome (FDA rejection / CRL, failed trial, missed primary endpoint, label denied).
+- "delayed": event genuinely did not happen on this date (delayed PDUFA, postponed AdComm, trial readout pushed). Different from "small price reaction" — this requires evidence the event itself was delayed.
+- "mixed": partial approval, met primary but failed secondary, narrow label, conditional approval, etc.
+- "unknown": you genuinely don't have information about what happened.
+
+Respond with ONLY a JSON object:
+{{
+  "outcome": "approved" | "rejected" | "delayed" | "mixed" | "unknown",
+  "confidence": 0.0 to 1.0,
+  "rationale": "1-sentence explanation citing the specific event outcome (not the price action)"
+}}
+
+Do NOT default to the price action. If you don't know what happened, return "unknown" with low confidence rather than guessing from the move %."""
+    
+    try:
+        from services.llm_helper import call_llm_json
+        result, err = call_llm_json(
+            prompt,
+            max_tokens=300,
+            temperature=0.1,
+            feature="outcome_classifier",
+            ticker=ticker,
+        )
+        if not result or err:
+            logger.info(f"[outcome-llm] {ticker}@{catalyst_date}: {err}")
+            return None
+        
+        outcome = (result.get("outcome") or "unknown").lower().strip()
+        if outcome not in ("approved", "rejected", "delayed", "mixed", "unknown"):
+            return None
+        
+        confidence = float(result.get("confidence") or 0.0)
+        confidence = max(0.0, min(1.0, confidence))
+        rationale = str(result.get("rationale") or "")[:300]
+        provider = result.get("_llm_provider", "?")
+        basis = f"LLM[{provider}]: {rationale}"
+        
+        return (outcome, confidence, basis)
+    except Exception as e:
+        logger.warning(f"_classify_outcome_with_llm failed: {e}")
+        return None
+
+
 def backfill_one(catalyst: Dict) -> Dict:
     """Backfill a single post_catalyst_outcomes row.
     Returns dict {status: 'created'|'skipped'|'failed', reason, ...}.
@@ -359,6 +451,34 @@ def backfill_one(catalyst: Dict) -> Dict:
         intraday_max_pct=pw.get("postevent_max_intraday_move_pct"),
         volume_ratio=volume_ratio,
     )
+    
+    # LLM fallback for ambiguous price-action cases.
+    # Triggers when:
+    # - heuristic confidence < 0.55 (mid-confidence and below)
+    # - AND outcome is 'delayed' or 'mixed' (the categories that price action
+    #   can't reliably distinguish from priced-in approvals/rejections)
+    # - AND env var allows it (default on; opt-out via LLM_OUTCOME_CLASSIFIER=0)
+    outcome_source = "price_action"
+    use_llm = os.getenv("LLM_OUTCOME_CLASSIFIER", "1") != "0"
+    if use_llm and confidence < 0.55 and outcome in ("delayed", "mixed", "unknown"):
+        llm_result = _classify_outcome_with_llm(
+            ticker=ticker,
+            catalyst_type=cat_type,
+            catalyst_date=cat_date,
+            drug_name=catalyst.get("drug_name"),
+            indication=catalyst.get("indication"),
+            move_1d=move_1d,
+            move_30d=move_30d,
+            volume_ratio=volume_ratio,
+        )
+        if llm_result is not None:
+            llm_outcome, llm_confidence, llm_basis = llm_result
+            # Only override if LLM is more confident AND has a real answer
+            if llm_outcome != "unknown" and llm_confidence >= confidence:
+                outcome, confidence, basis = llm_outcome, llm_confidence, llm_basis
+                outcome_source = "llm"
+                logger.info(f"[post-catalyst] LLM override for {ticker}@{cat_date}: "
+                            f"price-action='{outcome}' → LLM='{llm_outcome}' conf={llm_confidence:.2f}")
 
     # Predicted: confidence_score from catalyst_universe (probability), plus reference move
     predicted_prob = catalyst.get("confidence_score")
@@ -444,7 +564,7 @@ def backfill_one(catalyst: Dict) -> Dict:
                 move_1d, move_7d, move_30d,
                 pw.get("preevent_avg_volume_30d"), pw.get("postevent_volume_1d"), pw.get("postevent_max_intraday_move_pct"),
                 predicted_prob, predicted_move, "reference_move",
-                outcome, confidence, "price_action", basis,
+                outcome, confidence, outcome_source, basis,
                 error_abs, error_signed, direction_correct,
             ))
             conn.commit()
