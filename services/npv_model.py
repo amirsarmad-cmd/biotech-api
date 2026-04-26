@@ -765,6 +765,11 @@ Return ONLY the JSON object."""
 
         result["llm_provider"] = provider
         result["llm_rationale"] = result.pop("rationale", result.get("llm_rationale", ""))
+        # Compute confidence rollup from provenance (so it's exposed in live
+        # response, not just on cache reads).
+        prov = result.get("provenance") or {}
+        if prov:
+            result["confidence_score"] = _compute_confidence_score(prov)
         result["error"] = None
         return result
 
@@ -899,10 +904,29 @@ def fetch_or_compute_drug_economics_v2(ticker: str, company_name: str,
             logger.info(f"drug_economics cache HIT: {ticker}/{drug_name}")
             return cached
 
-    # NEW: grounded research step — pulls real epidemiology + pricing
-    # benchmarks via Gemini Search before the V2 estimator runs. This
-    # closes the gap where V2 estimates were generic vs the rich detail-
-    # page narrative. Skipped if no drug_name or env-disabled.
+    # ─── Layer 1 (highest weight): Official FDA/CT.gov facts ───────────
+    # Pull verified facts BEFORE any LLM call. These are passed to the V2
+    # LLM as 'verified facts' that it MUST anchor on (and tag with the
+    # appropriate source layer in the provenance block).
+    verified_facts_block = ""
+    verified_facts_data = None
+    if drug_name and os.getenv("FDA_SOURCES_ENABLED", "1") != "0":
+        try:
+            from services.fda_sources import gather_verified_facts, format_verified_facts_for_prompt
+            verified_facts_data = gather_verified_facts(
+                ticker=ticker, drug_name=drug_name, indication=None,
+            )
+            verified_facts_block = format_verified_facts_for_prompt(verified_facts_data)
+            if verified_facts_data.get("_sources_succeeded"):
+                logger.info(f"FDA facts gathered for {ticker}/{drug_name}: "
+                            f"{verified_facts_data['_sources_succeeded']}")
+        except Exception as e:
+            logger.info(f"FDA verified_facts gather failed: {e}")
+
+    # ─── Layer 3: LLM-grounded web research ────────────────────────────
+    # Gemini + Google Search pulls epidemiology, pricing, competitive context
+    # that's not in FDA structured data. This is run AFTER FDA so the LLM
+    # treats both as inputs.
     research_context = ai_context_sources
     if not research_context:
         research_context = _fetch_grounded_research(
@@ -910,15 +934,24 @@ def fetch_or_compute_drug_economics_v2(ticker: str, company_name: str,
             catalyst_type=catalyst_type, description=description,
         )
 
+    # Compose the full context: verified_facts FIRST (anchor), then web research
+    full_context = ""
+    if verified_facts_block:
+        full_context = verified_facts_block + "\n\n"
+    if research_context:
+        full_context += "GROUNDED WEB RESEARCH:\n" + research_context
+
     econ = estimate_drug_economics_v2(
         ticker=ticker, company_name=company_name, drug_name=drug_name,
         catalyst_type=catalyst_type, catalyst_date=catalyst_date,
         description=description, market_cap_m=market_cap_m,
-        ai_context_sources=research_context,
+        ai_context_sources=full_context if full_context else None,
     )
     # Persist research context alongside economics for transparency
-    if research_context:
-        econ["research_context"] = research_context[:2000]
+    if full_context:
+        econ["research_context"] = full_context[:3000]
+    if verified_facts_data:
+        econ["verified_facts"] = verified_facts_data
     # Persist if useful
     if not econ.get("error") and drug_name:
         write_drug_economics_v2_to_cache(ticker, drug_name, econ, ttl_days=7)

@@ -1571,3 +1571,31 @@ async def recompute_predictions(limit: int = 1000):
         "avg_prediction_change_pts": round(error_changed_total / max(updated, 1), 2),
         "note": "Predictions recomputed using calibrated REF_MOVES. /v2/post-catalyst/accuracy will reflect changes immediately.",
     }
+
+
+@router.get("/fda-sources/lookup")
+async def fda_sources_lookup(drug_name: str, indication: Optional[str] = None):
+    """Spot-check the FDA + ClinicalTrials.gov facts our system has for a drug.
+    
+    Used to:
+    - Validate the fda_sources integration is working before NPV calls
+    - Inspect what's available before manually pinning provenance
+    - Compare LLM-claimed numbers vs. official records
+    
+    Example: GET /admin/fda-sources/lookup?drug_name=Repatha&indication=hyperlipidemia
+    """
+    try:
+        from services.fda_sources import gather_verified_facts, format_verified_facts_for_prompt
+        facts = gather_verified_facts(ticker="?", drug_name=drug_name, indication=indication)
+        # Also include the prompt-block render so user can see what the LLM
+        # would receive
+        prompt_block = format_verified_facts_for_prompt(facts)
+        return {
+            "drug_name": drug_name,
+            "indication": indication,
+            "facts": facts,
+            "prompt_block_preview": prompt_block[:2000],
+        }
+    except Exception as e:
+        logger.exception("fda_sources_lookup failed")
+        raise HTTPException(500, f"fda_sources error: {e}")
