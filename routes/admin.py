@@ -1185,7 +1185,9 @@ async def seed_historical_catalysts(
                         ss.ticker IS NULL  -- V2-only tickers, never in screener_stocks
                         OR (
                           ss.market_cap IS NOT NULL AND ss.market_cap > 0
-                          AND COALESCE(ss.description, '') NOT LIKE 'yfinance backfill%%'
+                          -- Note: 'yfinance backfill%' rows DO have real market_cap data
+                          -- written by /admin/marketcap/backfill — only exclude the
+                          -- 'no data' marker rows for truly delisted tickers.
                           AND COALESCE(ss.description, '') NOT LIKE 'yfinance: no data%%'
                         )
                       )
@@ -1355,7 +1357,7 @@ async def seed_historical_diag():
             INNER JOIN screener_stocks ss ON ss.ticker = cu.ticker
             WHERE cu.status = 'active'
               AND ss.market_cap IS NOT NULL AND ss.market_cap > 0
-              AND COALESCE(ss.description, '') NOT LIKE 'yfinance backfill%%'
+              -- 'yfinance backfill' rows have real market_cap, keep them
               AND COALESCE(ss.description, '') NOT LIKE 'yfinance: no data%%'
         """)
         live = cur.fetchone()[0]
@@ -1381,7 +1383,7 @@ async def seed_historical_diag():
                     ss.ticker IS NULL
                     OR (
                       ss.market_cap IS NOT NULL AND ss.market_cap > 0
-                      AND COALESCE(ss.description, '') NOT LIKE 'yfinance backfill%%'
+                      -- 'yfinance backfill' rows have real market_cap, keep them
                       AND COALESCE(ss.description, '') NOT LIKE 'yfinance: no data%%'
                     )
                   )
@@ -1405,7 +1407,7 @@ async def seed_historical_diag():
                     ss.ticker IS NULL
                     OR (
                       ss.market_cap IS NOT NULL AND ss.market_cap > 0
-                      AND COALESCE(ss.description, '') NOT LIKE 'yfinance backfill%%'
+                      -- 'yfinance backfill' rows have real market_cap, keep them
                       AND COALESCE(ss.description, '') NOT LIKE 'yfinance: no data%%'
                     )
                   )
