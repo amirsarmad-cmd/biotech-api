@@ -1044,20 +1044,27 @@ def _refresh_news_counts(limit: int = 50) -> dict:
     )
     
     # Pick tickers with stale or 0 news_count, prioritizing those with
-    # near-term catalysts (next 90 days)
+    # near-term catalysts (next 90 days). Use a subquery so SELECT DISTINCT
+    # doesn't conflict with the ORDER BY clause (Postgres requires ORDER BY
+    # columns to appear in SELECT list when DISTINCT is present).
     with db.get_conn() as conn:
         cur = conn.cursor()
         cur.execute("""
-            SELECT DISTINCT cu.ticker
-            FROM catalyst_universe cu
-            LEFT JOIN screener_stocks ss ON ss.ticker = cu.ticker
-            WHERE cu.status = 'active'
-              AND cu.catalyst_date IS NOT NULL
-              AND cu.catalyst_date::date <= (CURRENT_DATE + INTERVAL '120 days')
-              AND (ss.news_count IS NULL OR ss.news_count = 0
-                   OR ss.last_updated IS NULL
-                   OR ss.last_updated < (NOW() - INTERVAL '24 hours')::text)
-            ORDER BY cu.catalyst_date ASC
+            SELECT ticker FROM (
+                SELECT DISTINCT ON (cu.ticker)
+                    cu.ticker,
+                    cu.catalyst_date
+                FROM catalyst_universe cu
+                LEFT JOIN screener_stocks ss ON ss.ticker = cu.ticker
+                WHERE cu.status = 'active'
+                  AND cu.catalyst_date IS NOT NULL
+                  AND cu.catalyst_date::date <= (CURRENT_DATE + INTERVAL '120 days')
+                  AND (ss.news_count IS NULL OR ss.news_count = 0
+                       OR ss.last_updated IS NULL
+                       OR ss.last_updated < (NOW() - INTERVAL '24 hours')::text)
+                ORDER BY cu.ticker, cu.catalyst_date ASC
+            ) t
+            ORDER BY catalyst_date ASC
             LIMIT %s
         """, (limit,))
         tickers = [r[0] for r in cur.fetchall()]
