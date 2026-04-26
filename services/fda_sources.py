@@ -479,42 +479,52 @@ def _download_and_parse_orange_book() -> Optional[Dict]:
 
     Output structure:
         {
-          "by_appl_no": {
-            "021107": {
-              "products": [{"trade_name", "ingredient", "strength", "appl_type",
-                            "approval_date", "rld", "te_code"}, ...],
-              "patents": [{"patent_no", "expire_date", "drug_substance_flag",
-                            "drug_product_flag", "patent_use_code"}, ...],
-              "exclusivities": [{"code", "date"}, ...],
-              "earliest_loe": "2030-12-15",
-              "latest_loe": "2035-08-21",
-            }, ...
-          },
-          "by_brand": {"REPATHA": ["125522", ...]},
-          "by_ingredient": {"EVOLOCUMAB": ["125522"]},
-          "_meta": {"fetched_at": iso8601, "files_parsed": [...]},
+          "by_appl_no": {...},
+          "by_brand": {...},
+          "by_ingredient": {...},
+          "_meta": {...},
         }
+    Returns None on failure with detailed reason logged.
     """
     import io, zipfile, urllib.request, urllib.error
 
-    try:
-        logger.info("Orange Book: downloading ~50MB ZIP from FDA...")
-        req = urllib.request.Request(ORANGE_BOOK_URL,
-                                     headers={"User-Agent": "biotech-screener/1.0"})
-        # The download is large — give it 60s
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            buf = resp.read()
-    except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
-        logger.warning(f"Orange Book download failed: {e}")
-        return None
+    download_attempts = []
+    # Try multiple candidate URLs — FDA changes them occasionally
+    urls_to_try = [
+        "https://www.fda.gov/media/76860/download?attachment",
+        "https://www.fda.gov/media/76860/download",
+    ]
+
+    buf = None
+    for url in urls_to_try:
+        try:
+            logger.info(f"Orange Book: trying {url} (~50MB)...")
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "Mozilla/5.0 (compatible; biotech-screener/1.0; Railway)",
+                "Accept": "application/zip,application/octet-stream,*/*",
+            })
+            # The download is large — give it 120s
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                buf = resp.read()
+                download_attempts.append({"url": url, "status": "ok", "size": len(buf)})
+                break
+        except (urllib.error.HTTPError, urllib.error.URLError, OSError) as e:
+            download_attempts.append({"url": url, "status": "fail", "error": str(e)[:200]})
+            logger.warning(f"Orange Book download failed for {url}: {e}")
+            continue
+
+    if buf is None:
+        logger.warning(f"Orange Book ALL downloads failed: {download_attempts}")
+        # Return marker so caller can surface the reason
+        return {"_download_failed": True, "_attempts": download_attempts}
 
     try:
         zf = zipfile.ZipFile(io.BytesIO(buf))
         names = zf.namelist()
-        logger.info(f"Orange Book: ZIP extracted, files: {names}")
+        logger.info(f"Orange Book: ZIP extracted ({len(buf)} bytes), files: {names}")
     except zipfile.BadZipFile as e:
         logger.warning(f"Orange Book ZIP malformed: {e}")
-        return None
+        return {"_download_failed": True, "_zip_error": str(e), "_buf_size": len(buf)}
 
     # Find the three data files (case-insensitive — FDA renames occasionally)
     def _find(name_part: str) -> Optional[str]:
@@ -700,7 +710,8 @@ def _parse_ob_date(date_str: str) -> Optional[str]:
 
 def _get_orange_book_lookup(force_refresh: bool = False) -> Optional[Dict]:
     """Get the parsed Orange Book lookup dict — from Redis cache or by
-    downloading + parsing. Cached for 7 days.
+    downloading + parsing. Cached for 7 days. Negative results cached
+    for 5 minutes to avoid hammering FDA.
     """
     r = _redis_client()
     if r and not force_refresh:
@@ -708,10 +719,22 @@ def _get_orange_book_lookup(force_refresh: bool = False) -> Optional[Dict]:
             raw = r.get(_OB_CACHE_KEY)
             if raw:
                 return json.loads(raw)
+            # Check negative cache
+            neg = r.get(_OB_CACHE_KEY + ":neg")
+            if neg:
+                return json.loads(neg)
         except Exception:
             pass
     # Cache miss — download + parse
     parsed = _download_and_parse_orange_book()
+    if parsed and parsed.get("_download_failed"):
+        # Store the error info as a negative cache entry briefly
+        if r:
+            try:
+                r.setex(_OB_CACHE_KEY + ":neg", 300, json.dumps(parsed, default=str))
+            except Exception:
+                pass
+        return parsed  # caller checks _download_failed
     if parsed and r:
         try:
             r.setex(_OB_CACHE_KEY, _OB_TTL_SEC, json.dumps(parsed, default=str))
@@ -753,13 +776,14 @@ def fetch_orange_book_loe(drug_name: str = None, ingredient: str = None) -> Opti
         return cached
 
     lookup = _get_orange_book_lookup()
-    if not lookup:
+    if not lookup or lookup.get("_download_failed"):
         return {
             "drug_name": drug_name,
             "ingredient": ingredient,
             "_source": "orange_book",
             "_status": "download_failed",
-            "_note": "Could not download Orange Book — try again later or check network",
+            "_attempts": (lookup or {}).get("_attempts", []),
+            "_note": "Could not download Orange Book ZIP from FDA — try again later",
         }
 
     # Find matching appl_no(s) — by brand or ingredient name (case-insensitive)

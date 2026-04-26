@@ -1669,3 +1669,55 @@ async def research_relevant(ticker: str, indication: Optional[str] = None,
     except Exception as e:
         logger.exception("research_relevant failed")
         raise HTTPException(500, f"relevant error: {e}")
+
+
+@router.get("/orange-book/status")
+async def orange_book_status(force_refresh: bool = False):
+    """Diagnose Orange Book download/parse pipeline.
+    Use force_refresh=true to bypass Redis cache."""
+    try:
+        from services.fda_sources import _get_orange_book_lookup, _OB_CACHE_KEY, _redis_client
+        r = _redis_client()
+        cache_present = False
+        cache_meta = None
+        neg_cache = None
+        if r:
+            try:
+                raw = r.get(_OB_CACHE_KEY)
+                cache_present = raw is not None
+                if cache_present:
+                    import json
+                    parsed = json.loads(raw)
+                    cache_meta = parsed.get("_meta")
+                neg = r.get(_OB_CACHE_KEY + ":neg")
+                if neg:
+                    import json
+                    neg_cache = json.loads(neg)
+            except Exception as e:
+                pass
+
+        # If forced or no cache, attempt download
+        if force_refresh or (not cache_present and not neg_cache):
+            lookup = _get_orange_book_lookup(force_refresh=True)
+            if lookup and lookup.get("_download_failed"):
+                return {
+                    "status": "download_failed",
+                    "attempts": lookup.get("_attempts"),
+                    "zip_error": lookup.get("_zip_error"),
+                    "buf_size": lookup.get("_buf_size"),
+                }
+            elif lookup:
+                return {
+                    "status": "ok",
+                    "fresh_download": True,
+                    "meta": lookup.get("_meta"),
+                }
+        return {
+            "status": "ok" if cache_present else ("download_failed_recently" if neg_cache else "no_cache"),
+            "cache_present": cache_present,
+            "cache_meta": cache_meta,
+            "neg_cache": neg_cache,
+        }
+    except Exception as e:
+        logger.exception("orange_book_status failed")
+        raise HTTPException(500, f"orange_book_status error: {e}")
