@@ -446,7 +446,55 @@ async def clean_junk_catalysts(confirm: bool = False):
 # Market cap backfill — yfinance batch fetch for V2 universe tickers
 # ============================================================
 
-@router.post("/marketcap/backfill")
+@router.post("/marketcap/fix-units")
+async def fix_market_cap_units(dry_run: bool = True):
+    """One-time fix: earlier versions of /admin/marketcap/backfill divided
+    market_cap_m by 1000, storing values 1000× too small. This identifies and
+    fixes those rows by multiplying market_cap by 1000 where the row was
+    written by yfinance backfill (description LIKE 'yfinance backfill%').
+    
+    Skips rows where market_cap is already > 100 (likely already fixed or
+    legitimate $M value)."""
+    try:
+        from services.database import BiotechDatabase
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            # Find candidates: backfill marker rows with suspiciously small market_cap
+            cur.execute("""
+                SELECT ticker, market_cap, description
+                FROM screener_stocks
+                WHERE description LIKE 'yfinance backfill%'
+                  AND market_cap IS NOT NULL
+                  AND market_cap > 0
+                  AND market_cap < 1000  -- if real, would be a $1B company written as $1; could be legit but rare for biotech
+                ORDER BY ticker
+            """)
+            candidates = [{"ticker": r[0], "current_market_cap": float(r[1]),
+                            "would_become": float(r[1]) * 1000} for r in cur.fetchall()]
+
+            updated = 0
+            if not dry_run:
+                cur.execute("""
+                    UPDATE screener_stocks
+                    SET market_cap = market_cap * 1000
+                    WHERE description LIKE 'yfinance backfill%'
+                      AND market_cap IS NOT NULL
+                      AND market_cap > 0
+                      AND market_cap < 1000
+                """)
+                updated = cur.rowcount
+                conn.commit()
+
+            return {
+                "dry_run": dry_run,
+                "candidates_count": len(candidates),
+                "updated": updated,
+                "candidates": candidates[:20],
+            }
+    except Exception as e:
+        logger.exception("fix_market_cap_units failed")
+        raise HTTPException(500, f"fix error: {e}")
 async def backfill_market_cap(
     limit: int = 100,
     only_missing: bool = True,
@@ -568,8 +616,11 @@ async def backfill_market_cap(
                             r["mark_dead_error"] = str(e)[:100]
                         continue
                     try:
-                        # screener_stocks UNIQUE on (ticker, catalyst_type, catalyst_date)
-                        # Use empty string defaults for the catalyst_type/date if needed
+                        # screener_stocks.market_cap is in $M (NOT $B — the
+                        # /stocks endpoint maps it directly to market_cap_m).
+                        # Earlier versions of this code divided by 1000, which
+                        # produced row values 1000× too small. Write market_cap_m
+                        # directly.
                         cur.execute("""
                             INSERT INTO screener_stocks
                                 (ticker, company_name, industry, market_cap,
@@ -585,7 +636,7 @@ async def backfill_market_cap(
                         """, (
                             r["ticker"], r.get("company_name", r["ticker"]),
                             r.get("industry", "Biotechnology"),
-                            r["market_cap_m"] / 1000,  # screener_stocks.market_cap is in $B
+                            r["market_cap_m"],  # store as $M, no division
                             "", "", 0.5,
                             f"yfinance backfill — current_price ${r.get('current_price', 0)}",
                         ))

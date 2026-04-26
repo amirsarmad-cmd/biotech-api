@@ -210,18 +210,99 @@ async def get_stock_detail(ticker: str, with_npv: bool = Query(True)):
     - primary_catalyst = highest-probability catalyst (usually Earnings)
     - npv_catalyst = best DRUG catalyst for NPV math (FDA > Phase 3 > Clinical)
     - NPV is computed against npv_catalyst, not primary.
+    
+    Catalyst sources merged (in priority order):
+      1. catalyst_universe (V2, LLM-seeded with structured drug/indication/phase) — preferred
+      2. screener_stocks (legacy table, also stores market_cap metadata)
+    Marker rows from yfinance backfill (empty type+date, description LIKE
+    'yfinance backfill%') are filtered out — they exist only to carry market_cap.
     """
     ticker = ticker.upper().strip()
     try:
-        rows = db().get_stock(ticker)
+        legacy_rows = db().get_stock(ticker)
     except Exception as e:
         logger.exception(f"get_stock({ticker}) failed")
         raise HTTPException(500, f"DB error: {e}")
 
-    if not rows:
-        raise HTTPException(404, f"Ticker {ticker} not found in universe")
+    # Pull V2 catalysts from catalyst_universe (active only)
+    v2_rows: List[Dict] = []
+    try:
+        from routes.universe import _pg_conn, _row_to_dict
+        with _pg_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT id, ticker, company_name, catalyst_type, catalyst_date,
+                       date_precision, description, drug_name, canonical_drug_name,
+                       indication, phase, source, source_url, confidence_score,
+                       verified, status, last_updated
+                FROM catalyst_universe
+                WHERE ticker = %s AND status = 'active'
+                ORDER BY catalyst_date ASC NULLS LAST
+            """, (ticker,))
+            cols = [d[0] for d in cur.description]
+            for raw in cur.fetchall():
+                v2_row = _row_to_dict(raw, cols)
+                # Normalize to look like a screener_stocks row for downstream merge
+                v2_rows.append({
+                    "ticker": v2_row.get("ticker"),
+                    "company_name": v2_row.get("company_name"),
+                    "industry": "Biotechnology",
+                    "catalyst_type": v2_row.get("catalyst_type"),
+                    "catalyst_date": v2_row.get("catalyst_date"),
+                    "probability": v2_row.get("confidence_score") or 0.5,
+                    "description": v2_row.get("description"),
+                    "drug_name": v2_row.get("drug_name"),
+                    "indication": v2_row.get("indication"),
+                    "phase": v2_row.get("phase"),
+                    "source": v2_row.get("source") or "v2",
+                    # market_cap is filled below from legacy if available
+                })
+    except Exception as e:
+        logger.warning(f"catalyst_universe fetch for {ticker}: {e}")
 
-    rows_sorted = sorted(rows, key=lambda r: r.get("probability") or 0, reverse=True)
+    # Filter legacy rows: drop marker rows (empty type+date or backfill description)
+    legacy_real = [
+        r for r in legacy_rows
+        if (r.get("catalyst_type") or "").strip()
+           or (r.get("catalyst_date") or "").strip()
+    ]
+    legacy_marker = next(
+        (r for r in legacy_rows
+         if not (r.get("catalyst_type") or "").strip()
+            and not (r.get("catalyst_date") or "").strip()),
+        None
+    )
+
+    # Merge: V2 wins for catalyst data; legacy provides market_cap fallback
+    merged_rows: List[Dict] = list(v2_rows) + list(legacy_real)
+    if not merged_rows:
+        # If only marker exists, ticker is in screener_stocks but has no real catalysts
+        if not legacy_marker:
+            raise HTTPException(404, f"Ticker {ticker} not found in universe")
+        # Build a single placeholder row from the marker so we don't 404
+        merged_rows = [legacy_marker]
+
+    # Pull market_cap + company_name from any source (V2 row, real legacy, or marker)
+    market_cap_m: Optional[float] = None
+    company_name: Optional[str] = None
+    industry: Optional[str] = None
+    last_updated: Optional[str] = None
+    for r in (legacy_real + ([legacy_marker] if legacy_marker else []) + v2_rows):
+        if market_cap_m is None and r.get("market_cap") is not None:
+            try:
+                mc = float(r.get("market_cap") or 0)
+                if mc > 0:
+                    market_cap_m = mc
+            except (TypeError, ValueError):
+                pass
+        if not company_name and r.get("company_name"):
+            company_name = r.get("company_name")
+        if not industry and r.get("industry"):
+            industry = r.get("industry")
+        if not last_updated and r.get("last_updated"):
+            last_updated = r.get("last_updated")
+
+    rows_sorted = sorted(merged_rows, key=lambda r: r.get("probability") or 0, reverse=True)
     primary = rows_sorted[0]
 
     # Pick the right catalyst for NPV (drug-related, not earnings)
@@ -263,11 +344,11 @@ async def get_stock_detail(ticker: str, with_npv: bool = Query(True)):
 
                 economics = estimate_drug_economics(
                     ticker=ticker,
-                    company_name=primary.get("company_name", ticker),
+                    company_name=company_name or ticker,
                     catalyst_type=npv_catalyst.get("catalyst_type") or "FDA Decision",
                     catalyst_date=npv_catalyst.get("catalyst_date", ""),
                     description=npv_catalyst.get("description", ""),
-                    market_cap_m=float(primary.get("market_cap") or 0),
+                    market_cap_m=float(market_cap_m or 0),
                 )
                 baseline_price = get_baseline_price(ticker) or current_price or 50.0
                 price_for_calc = current_price or baseline_price
@@ -277,7 +358,7 @@ async def get_stock_detail(ticker: str, with_npv: bool = Query(True)):
                 try:
                     risk_factors = estimate_risk_factors(
                         ticker=ticker,
-                        company_name=primary.get("company_name", ticker),
+                        company_name=company_name or ticker,
                         info=yf_info,
                     )
                 except Exception as e:
@@ -287,7 +368,7 @@ async def get_stock_detail(ticker: str, with_npv: bool = Query(True)):
                 npv_result = compute_npv_estimate(
                     ticker=ticker,
                     current_price=price_for_calc,
-                    market_cap_m=float(primary.get("market_cap") or 0),
+                    market_cap_m=float(market_cap_m or 0),
                     p_approval=float(npv_catalyst.get("probability") or 0.5),
                     economics=economics,
                     baseline_price=baseline_price,
@@ -308,15 +389,18 @@ async def get_stock_detail(ticker: str, with_npv: bool = Query(True)):
 
     return _to_jsonable({
         "ticker": ticker,
-        "company_name": primary.get("company_name"),
-        "industry": primary.get("industry"),
+        "company_name": company_name,
+        "industry": industry,
         "current_price": current_price,
-        "market_cap_m": primary.get("market_cap"),
+        "market_cap_m": market_cap_m,
         "primary_catalyst": {
             "type": primary.get("catalyst_type"),
             "date": primary.get("catalyst_date"),
             "probability": primary.get("probability"),
             "description": primary.get("description"),
+            "drug_name": primary.get("drug_name"),
+            "indication": primary.get("indication"),
+            "phase": primary.get("phase"),
         },
         "npv_catalyst": npv_catalyst_summary,
         "all_catalysts": [{
@@ -324,6 +408,10 @@ async def get_stock_detail(ticker: str, with_npv: bool = Query(True)):
             "date": r.get("catalyst_date"),
             "probability": r.get("probability"),
             "description": r.get("description"),
+            "drug_name": r.get("drug_name"),
+            "indication": r.get("indication"),
+            "phase": r.get("phase"),
+            "source": r.get("source"),
         } for r in rows_sorted],
         "npv": npv_result,
         "scores": {
@@ -331,7 +419,7 @@ async def get_stock_detail(ticker: str, with_npv: bool = Query(True)):
             "sentiment": primary.get("sentiment_score"),
             "news_count": primary.get("news_count"),
         },
-        "last_updated": primary.get("last_updated"),
+        "last_updated": last_updated,
     })
 
 
