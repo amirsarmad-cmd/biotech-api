@@ -866,3 +866,251 @@ async def post_catalyst_scheduler_trigger():
     batch_limit = int(os.getenv("POST_CATALYST_SCHEDULER_LIMIT", "25"))
     min_age_days = int(os.getenv("POST_CATALYST_SCHEDULER_MIN_AGE_DAYS", "7"))
     return backfill_batch(limit=batch_limit, min_age_days=min_age_days)
+
+
+# ============================================================
+# Universe seeder scheduler — keeps catalyst_universe fresh
+# ============================================================
+
+_seeder_scheduler_state: dict = {
+    "started": False,
+    "last_run_at": None,
+    "last_result": None,
+    "runs_total": 0,
+}
+
+
+def _start_seeder_scheduler_once() -> None:
+    """Start a background asyncio task that runs the V2 universe seeder
+    on a schedule. Idempotent — multiple calls are no-ops. Only runs if
+    env var SEEDER_SCHEDULER_ENABLED=1."""
+    if _seeder_scheduler_state.get("started"):
+        return
+    if os.getenv("SEEDER_SCHEDULER_ENABLED", "0") != "1":
+        return
+    _seeder_scheduler_state["started"] = True
+
+    import asyncio
+    interval_hours = float(os.getenv("SEEDER_SCHEDULER_HOURS", "24"))
+    max_tickers = os.getenv("SEEDER_SCHEDULER_MAX_TICKERS")  # None = full universe
+    max_tickers_int = int(max_tickers) if max_tickers else None
+
+    async def _loop():
+        # Wait 5min on startup so the app finishes initialization and other
+        # one-time work (alembic, cache warm) doesn't compete for resources.
+        await asyncio.sleep(300)
+        from datetime import datetime as _dt
+        from services.universe_seeder import run_universe_seed
+        while True:
+            try:
+                # Check that no other seed is running already (mutex from
+                # the ad-hoc /v2-seed-async path)
+                running = [j for j in _bg_seed_jobs.values() if j.get("status") == "running"]
+                if running:
+                    logger.info(f"[seeder-scheduler] skipping run — {len(running)} other job(s) running")
+                    _seeder_scheduler_state["last_result"] = {"skipped": "other_job_running"}
+                else:
+                    # Use a thread so the asyncio loop isn't blocked by the
+                    # synchronous seeder (which calls Gemini, yfinance, etc.)
+                    job_id = "scheduler-" + _dt.utcnow().strftime("%Y%m%d-%H%M%S")
+                    _bg_seed_jobs[job_id] = {
+                        "job_id": job_id, "status": "running",
+                        "started_at": _dt.utcnow().isoformat()+"Z",
+                        "max_tickers": max_tickers_int, "start_idx": 0,
+                        "source": "scheduler",
+                    }
+                    logger.info(f"[seeder-scheduler] starting run job_id={job_id} max_tickers={max_tickers_int}")
+                    try:
+                        # Run the seed in the executor so we don't block the loop
+                        loop = asyncio.get_event_loop()
+                        result = await loop.run_in_executor(
+                            None, lambda: run_universe_seed(max_tickers=max_tickers_int, start_idx=0)
+                        )
+                        _bg_seed_jobs[job_id]["status"] = "completed"
+                        _bg_seed_jobs[job_id]["result"] = result
+                        _bg_seed_jobs[job_id]["completed_at"] = _dt.utcnow().isoformat()+"Z"
+                        _seeder_scheduler_state["last_result"] = {
+                            "tickers_processed": result.get("tickers_processed") if isinstance(result, dict) else None,
+                            "catalysts_added": result.get("catalysts_added") if isinstance(result, dict) else None,
+                            "job_id": job_id,
+                        }
+                        logger.info(f"[seeder-scheduler] done job_id={job_id}")
+                    except Exception as e:
+                        _bg_seed_jobs[job_id]["status"] = "failed"
+                        _bg_seed_jobs[job_id]["error"] = f"{type(e).__name__}: {e}"
+                        _bg_seed_jobs[job_id]["completed_at"] = _dt.utcnow().isoformat()+"Z"
+                        _seeder_scheduler_state["last_result"] = {"error": str(e)[:200], "job_id": job_id}
+                        logger.warning(f"[seeder-scheduler] error: {e}")
+
+                _seeder_scheduler_state["last_run_at"] = _dt.utcnow().isoformat()
+                _seeder_scheduler_state["runs_total"] += 1
+            except Exception as e:
+                logger.warning(f"[seeder-scheduler] loop error: {e}")
+                _seeder_scheduler_state["last_result"] = {"error": str(e)[:200]}
+            await asyncio.sleep(interval_hours * 3600)
+
+    try:
+        loop = asyncio.get_event_loop()
+        loop.create_task(_loop())
+        logger.info(f"[seeder-scheduler] STARTED interval={interval_hours}h max_tickers={max_tickers_int}")
+    except Exception as e:
+        logger.warning(f"[seeder-scheduler] failed to start: {e}")
+        _seeder_scheduler_state["started"] = False
+
+
+@router.get("/universe/seeder-scheduler-status")
+async def seeder_scheduler_status():
+    """Status of the universe seeder scheduler. Set env var
+    SEEDER_SCHEDULER_ENABLED=1 to enable.
+    Tunable via:
+      SEEDER_SCHEDULER_HOURS (default 24)
+      SEEDER_SCHEDULER_MAX_TICKERS (default unset = full universe)"""
+    return {
+        "enabled": os.getenv("SEEDER_SCHEDULER_ENABLED", "0") == "1",
+        "interval_hours": float(os.getenv("SEEDER_SCHEDULER_HOURS", "24")),
+        "max_tickers": int(os.getenv("SEEDER_SCHEDULER_MAX_TICKERS", "0")) or None,
+        **_seeder_scheduler_state,
+    }
+
+
+# ============================================================
+# news_count refresher — periodic background job
+# Updates screener_stocks.news_count + sentiment_score for V2 tickers
+# whose row was created by the marketcap backfill (news_count = 0).
+# This makes the screener listing's "news_count" column meaningful.
+# ============================================================
+
+_news_refresher_state: dict = {
+    "started": False,
+    "last_run_at": None,
+    "last_result": None,
+    "runs_total": 0,
+}
+
+
+def _start_news_refresher_once() -> None:
+    """Background task that updates news_count + sentiment_score in
+    screener_stocks for tickers with stale or missing values. Idempotent.
+    Only runs if NEWS_REFRESHER_ENABLED=1."""
+    if _news_refresher_state.get("started"):
+        return
+    if os.getenv("NEWS_REFRESHER_ENABLED", "0") != "1":
+        return
+    _news_refresher_state["started"] = True
+
+    import asyncio
+    interval_hours = float(os.getenv("NEWS_REFRESHER_HOURS", "12"))
+    batch_limit = int(os.getenv("NEWS_REFRESHER_BATCH", "50"))
+
+    async def _loop():
+        await asyncio.sleep(180)  # 3min startup delay
+        from datetime import datetime as _dt
+        while True:
+            try:
+                logger.info(f"[news-refresher] starting batch limit={batch_limit}")
+                # Run sync work in executor
+                loop = asyncio.get_event_loop()
+                result = await loop.run_in_executor(None, lambda: _refresh_news_counts(batch_limit))
+                _news_refresher_state["last_run_at"] = _dt.utcnow().isoformat()
+                _news_refresher_state["last_result"] = result
+                _news_refresher_state["runs_total"] += 1
+                logger.info(f"[news-refresher] done: {result.get('updated',0)} updated, {result.get('errors',0)} errors")
+            except Exception as e:
+                logger.warning(f"[news-refresher] error: {e}")
+                _news_refresher_state["last_result"] = {"error": str(e)[:200]}
+            await asyncio.sleep(interval_hours * 3600)
+
+    try:
+        loop = asyncio.get_event_loop()
+        loop.create_task(_loop())
+        logger.info(f"[news-refresher] STARTED interval={interval_hours}h batch={batch_limit}")
+    except Exception as e:
+        logger.warning(f"[news-refresher] failed to start: {e}")
+        _news_refresher_state["started"] = False
+
+
+def _refresh_news_counts(limit: int = 50) -> dict:
+    """Refresh news_count + sentiment_score in screener_stocks for V2 tickers.
+    Picks tickers that are in catalyst_universe (active) but have stale or zero
+    news_count in screener_stocks. Updates by calling fetcher.fetch_news_sentiment.
+    Returns: {processed, updated, errors, sample_results}.
+    """
+    from services.database import BiotechDatabase
+    from services.fetcher import StockDataFetcher
+    db = BiotechDatabase()
+    fetcher = StockDataFetcher()
+    
+    # Pick tickers with stale or 0 news_count, prioritizing those with
+    # near-term catalysts (next 90 days)
+    with db.get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT DISTINCT cu.ticker
+            FROM catalyst_universe cu
+            LEFT JOIN screener_stocks ss ON ss.ticker = cu.ticker
+            WHERE cu.status = 'active'
+              AND cu.catalyst_date IS NOT NULL
+              AND cu.catalyst_date::date <= (CURRENT_DATE + INTERVAL '120 days')
+              AND (ss.news_count IS NULL OR ss.news_count = 0
+                   OR ss.last_updated IS NULL
+                   OR ss.last_updated < (NOW() - INTERVAL '24 hours')::text)
+            ORDER BY cu.catalyst_date ASC
+            LIMIT %s
+        """, (limit,))
+        tickers = [r[0] for r in cur.fetchall()]
+    
+    if not tickers:
+        return {"processed": 0, "updated": 0, "errors": 0, "note": "no tickers needing refresh"}
+    
+    updated = 0
+    errors = 0
+    results = []
+    with db.get_conn() as conn:
+        cur = conn.cursor()
+        for ticker in tickers:
+            try:
+                ns = fetcher.fetch_news_sentiment(ticker, days_back=30)
+                news_count = int(ns.get("news_count", 0))
+                sentiment = float(ns.get("sentiment_score", 0))
+                # UPDATE the most recent row for this ticker (or all rows)
+                cur.execute("""
+                    UPDATE screener_stocks
+                    SET news_count = %s,
+                        sentiment_score = %s,
+                        last_updated = NOW()::text
+                    WHERE ticker = %s
+                """, (news_count, sentiment, ticker))
+                updated += cur.rowcount
+                results.append({"ticker": ticker, "news_count": news_count,
+                                "sentiment_score": round(sentiment, 3),
+                                "rows_updated": cur.rowcount})
+            except Exception as e:
+                errors += 1
+                results.append({"ticker": ticker, "error": str(e)[:100]})
+        conn.commit()
+    
+    return {
+        "processed": len(tickers),
+        "updated": updated,
+        "errors": errors,
+        "sample_results": results[:20],
+    }
+
+
+@router.get("/news-refresher/status")
+async def news_refresher_status():
+    """Status of the news_count refresher. Set NEWS_REFRESHER_ENABLED=1 to enable.
+    Tunable via NEWS_REFRESHER_HOURS (default 12), NEWS_REFRESHER_BATCH (default 50)."""
+    return {
+        "enabled": os.getenv("NEWS_REFRESHER_ENABLED", "0") == "1",
+        "interval_hours": float(os.getenv("NEWS_REFRESHER_HOURS", "12")),
+        "batch_limit": int(os.getenv("NEWS_REFRESHER_BATCH", "50")),
+        **_news_refresher_state,
+    }
+
+
+@router.post("/news-refresher/trigger-now")
+async def news_refresher_trigger():
+    """Manually trigger one round of news_count refresh."""
+    batch = int(os.getenv("NEWS_REFRESHER_BATCH", "50"))
+    return _refresh_news_counts(limit=batch)

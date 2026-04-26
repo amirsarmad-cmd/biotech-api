@@ -114,6 +114,18 @@ async def lifespan(app: FastAPI):
         _start_post_catalyst_scheduler_once()
     except Exception as e:
         logger.warning(f"post-catalyst scheduler start failed: {e}")
+    # Start V2 universe seeder scheduler (no-op if env var not set)
+    try:
+        from routes.admin import _start_seeder_scheduler_once
+        _start_seeder_scheduler_once()
+    except Exception as e:
+        logger.warning(f"seeder scheduler start failed: {e}")
+    # Start news_count refresher (no-op if env var not set)
+    try:
+        from routes.admin import _start_news_refresher_once
+        _start_news_refresher_once()
+    except Exception as e:
+        logger.warning(f"news refresher start failed: {e}")
     try:
         yield
     finally:
