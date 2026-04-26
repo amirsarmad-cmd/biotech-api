@@ -1185,9 +1185,9 @@ async def seed_historical_catalysts(
                         ss.ticker IS NULL  -- V2-only tickers, never in screener_stocks
                         OR (
                           ss.market_cap IS NOT NULL AND ss.market_cap > 0
-                          -- Note: 'yfinance backfill%' rows DO have real market_cap data
-                          -- written by /admin/marketcap/backfill — only exclude the
-                          -- 'no data' marker rows for truly delisted tickers.
+                          -- Note: yfinance backfill rows DO have real market_cap data
+                          -- written by /admin/marketcap/backfill -- only exclude the
+                          -- "no data" marker rows for truly delisted tickers.
                           AND COALESCE(ss.description, '') NOT LIKE 'yfinance: no data%%'
                         )
                       )
