@@ -29,15 +29,19 @@ logger = logging.getLogger(__name__)
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 SQLITE_PATH = os.getenv("SQLITE_PATH", "/tmp/biotech_screener.db")
+DB_POOL_MIN = int(os.getenv("DB_POOL_MIN", "1"))
+DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "10"))
 
 # Detect if we can use Postgres
 USE_POSTGRES = False
 _pg_module = None
+_pg_pool = None  # psycopg2.pool.ThreadedConnectionPool — initialized lazily
 
 if DATABASE_URL:
     try:
         import psycopg2
         import psycopg2.extras
+        from psycopg2.pool import ThreadedConnectionPool
         _pg_module = psycopg2
         USE_POSTGRES = True
         logger.info(f"Using PostgreSQL via psycopg2 ({DATABASE_URL[:30]}...)")
@@ -49,6 +53,30 @@ if DATABASE_URL:
             logger.info("Using PostgreSQL via pg8000")
         except ImportError:
             logger.warning("DATABASE_URL is set but no Postgres driver available — falling back to SQLite")
+
+
+def _get_pg_pool():
+    """Lazy-init the threaded connection pool. Survives across BiotechDatabase
+    instances; one pool per process. Bounded at DB_POOL_MAX connections so we
+    don't blow past Postgres max_connections (default 100 on Railway) when
+    multiple schedulers run concurrently."""
+    global _pg_pool
+    if _pg_pool is not None:
+        return _pg_pool
+    if not (USE_POSTGRES and _pg_module is not None):
+        return None
+    try:
+        from psycopg2.pool import ThreadedConnectionPool
+        _pg_pool = ThreadedConnectionPool(
+            minconn=DB_POOL_MIN,
+            maxconn=DB_POOL_MAX,
+            dsn=DATABASE_URL,
+        )
+        logger.info(f"Postgres connection pool initialized: min={DB_POOL_MIN} max={DB_POOL_MAX}")
+        return _pg_pool
+    except Exception as e:
+        logger.warning(f"Failed to init pg pool: {e} — falling back to per-call connect()")
+        return None
 
 
 def _ph(use_pg):
@@ -104,12 +132,38 @@ class BiotechDatabase:
 
     # Aliases for biotech-api (main.py expects these names)
     def get_conn(self):
-        """Context-manager-friendly connection wrapper."""
+        """Context-manager-friendly connection wrapper.
+        Uses ThreadedConnectionPool for Postgres when available — bounded
+        at DB_POOL_MAX (default 10) to avoid exhausting Postgres connections
+        when multiple schedulers run concurrently. Falls back to per-call
+        connect() for sqlite or if pool init fails."""
+        outer = self
+        pool = _get_pg_pool() if self.use_pg else None
+
         class _CM:
-            def __init__(self, outer): self._c = outer._conn()
-            def __enter__(self): return self._c
-            def __exit__(self, *a): self._c.close()
-        return _CM(self)
+            def __init__(self):
+                if pool is not None:
+                    self._conn_obj = pool.getconn()
+                    self._from_pool = True
+                else:
+                    self._conn_obj = outer._conn()
+                    self._from_pool = False
+
+            def __enter__(self):
+                return self._conn_obj
+
+            def __exit__(self, exc_type, *_):
+                if self._from_pool:
+                    # Rollback any pending tx so the next user gets clean state
+                    if exc_type is not None:
+                        try: self._conn_obj.rollback()
+                        except Exception: pass
+                    pool.putconn(self._conn_obj)
+                else:
+                    try: self._conn_obj.close()
+                    except Exception: pass
+
+        return _CM()
 
     def ensure_schema(self):
         """Alias for init_database — idempotent DDL."""
