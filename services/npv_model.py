@@ -690,6 +690,98 @@ Return ONLY the JSON object."""
         }
 
 
+def _fetch_grounded_research(ticker: str, drug_name: str, catalyst_type: str,
+                              description: str) -> Optional[str]:
+    """Optional Gemini-grounded research step that pulls real epidemiology +
+    pricing data BEFORE the V2 economics LLM call, so the structured
+    estimator has facts to anchor on rather than estimating from training.
+    
+    Returns a short research summary string suitable for ai_context_sources,
+    or None if disabled/failed. Records to llm_usage with feature='npv_research'.
+    
+    Disabled if GROUNDED_NPV_RESEARCH=0. Default ON.
+    """
+    import os, time as _t
+    if os.getenv("GROUNDED_NPV_RESEARCH", "1") == "0":
+        return None
+    if not drug_name or drug_name == "(unspecified)":
+        return None
+    
+    prompt = f"""You are a biotech equity research analyst. For the upcoming catalyst below, do focused research and return a concise factual summary.
+
+TICKER: {ticker}
+DRUG: {drug_name}
+CATALYST TYPE: {catalyst_type}
+CATALYST CONTEXT: {description[:500]}
+
+Use Google Search to find:
+1. INDICATION-SPECIFIC EPIDEMIOLOGY — real prevalence/incidence numbers from medical literature, not estimates
+2. PRICING BENCHMARKS — actual list prices of comparable approved drugs in the same indication (with sources)
+3. CURRENT STANDARD OF CARE — what patients are getting today + cost
+4. KEY COMPETITORS — drugs in development or approved targeting same indication
+5. ADDRESSABLE MARKET SIZE — analyst estimates if available, with citation
+
+Return a 200-400 word summary in plain text (no JSON, no markdown headers). Cite specific numbers with sources where possible. Format example:
+
+"Hereditary angioedema affects 10,000-15,000 US patients (HAEA estimate, 2024) and ~40,000 globally. Standard-of-care prophylaxis: Takhzyro (lanadelumab, $700K/year wholesale), Orladeyo (berotralstat, $480K/year). Total US prophylactic market ~$3B annually. Lonvoguran ziclumeran is a one-time CRISPR therapy with potential for functional cure, expected pricing $2-3M lifetime (one-time). Competitors: Donidalorsen (Ionis, Phase 3) and BCX9930 (BioCryst, Phase 2). Analyst estimates 30-35% prophylactic-population capture at $400-500K equivalent annualized."
+
+Be factual. If you can't find a number, omit it rather than guess."""
+    
+    try:
+        from google import genai as google_genai
+        from google.genai import types
+        from services.llm_usage import record_usage
+    except Exception as e:
+        logger.warning(f"grounded_research import failed: {e}")
+        return None
+    
+    google_key = os.getenv("GOOGLE_API_KEY", "")
+    if not google_key:
+        return None
+    
+    t0 = _t.time()
+    try:
+        client = google_genai.Client(api_key=google_key)
+        config = types.GenerateContentConfig(
+            max_output_tokens=1500,
+            temperature=0.1,
+            tools=[types.Tool(google_search=types.GoogleSearch())],
+        )
+        resp = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=config,
+        )
+        text = (resp.text or "").strip()
+        usage = getattr(resp, "usage_metadata", None)
+        try:
+            record_usage(
+                provider="google", model="gemini-2.5-flash",
+                feature="npv_research", ticker=ticker,
+                tokens_input=getattr(usage, "prompt_token_count", 0) or 0 if usage else 0,
+                tokens_output=getattr(usage, "candidates_token_count", 0) or 0 if usage else 0,
+                duration_ms=int((_t.time() - t0) * 1000),
+                status="success" if text else "error",
+                error_message=None if text else "empty response",
+            )
+        except Exception:
+            pass
+        return text if text else None
+    except Exception as e:
+        try:
+            record_usage(
+                provider="google", model="gemini-2.5-flash",
+                feature="npv_research", ticker=ticker,
+                tokens_input=0, tokens_output=0,
+                duration_ms=int((_t.time() - t0) * 1000),
+                status="error", error_message=str(e)[:300],
+            )
+        except Exception:
+            pass
+        logger.warning(f"_fetch_grounded_research failed: {e}")
+        return None
+
+
 def fetch_or_compute_drug_economics_v2(ticker: str, company_name: str,
                                         drug_name: str, catalyst_type: str,
                                         catalyst_date: str, description: str,
@@ -704,12 +796,26 @@ def fetch_or_compute_drug_economics_v2(ticker: str, company_name: str,
             logger.info(f"drug_economics cache HIT: {ticker}/{drug_name}")
             return cached
 
+    # NEW: grounded research step — pulls real epidemiology + pricing
+    # benchmarks via Gemini Search before the V2 estimator runs. This
+    # closes the gap where V2 estimates were generic vs the rich detail-
+    # page narrative. Skipped if no drug_name or env-disabled.
+    research_context = ai_context_sources
+    if not research_context:
+        research_context = _fetch_grounded_research(
+            ticker=ticker, drug_name=drug_name,
+            catalyst_type=catalyst_type, description=description,
+        )
+
     econ = estimate_drug_economics_v2(
         ticker=ticker, company_name=company_name, drug_name=drug_name,
         catalyst_type=catalyst_type, catalyst_date=catalyst_date,
         description=description, market_cap_m=market_cap_m,
-        ai_context_sources=ai_context_sources,
+        ai_context_sources=research_context,
     )
+    # Persist research context alongside economics for transparency
+    if research_context:
+        econ["research_context"] = research_context[:2000]
     # Persist if useful
     if not econ.get("error") and drug_name:
         write_drug_economics_v2_to_cache(ticker, drug_name, econ, ttl_days=7)

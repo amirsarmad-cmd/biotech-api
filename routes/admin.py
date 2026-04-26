@@ -1124,3 +1124,169 @@ async def news_refresher_trigger():
     """Manually trigger one round of news_count refresh."""
     batch = int(os.getenv("NEWS_REFRESHER_BATCH", "50"))
     return _refresh_news_counts(limit=batch)
+
+
+# ============================================================
+# Historical post-catalyst seeder
+# Backfills 1-2 historical catalysts per V2 ticker so we have a real
+# accuracy dataset, not just one Mounjaro datapoint.
+# ============================================================
+
+@router.post("/post-catalyst/seed-historical")
+async def seed_historical_catalysts(
+    per_ticker: int = 2,
+    max_tickers: int = 50,
+    dry_run: bool = True,
+    use_llm: bool = True,
+):
+    """For each V2 ticker, ask the LLM for {per_ticker} notable historical
+    catalysts (FDA decisions, Phase 3 readouts) from the last 5 years and
+    backfill outcomes for them.
+    
+    This builds a real accuracy dataset for Phase 3A. Without it we have
+    only forward-dated V2 catalysts and the single Mounjaro test row.
+    
+    Args:
+      per_ticker: how many historical catalysts to ask LLM for per ticker (default 2)
+      max_tickers: cap total tickers processed per call (default 50; cost control)
+      dry_run: only fetch LLM suggestions, don't actually backfill
+      use_llm: must be True (placeholder for future heuristic version)
+    
+    Returns: {tickers_processed, catalysts_seeded, llm_failures, results}
+    """
+    if not use_llm:
+        raise HTTPException(400, "use_llm=false not yet implemented")
+    
+    try:
+        from services.database import BiotechDatabase
+        from services.llm_helper import call_llm_json
+        from services.post_catalyst_tracker import backfill_one
+        
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT DISTINCT cu.ticker, cu.company_name
+                FROM catalyst_universe cu
+                WHERE cu.status = 'active'
+                  AND cu.ticker IS NOT NULL
+                  AND cu.ticker NOT IN (
+                    SELECT DISTINCT ticker FROM post_catalyst_outcomes
+                    WHERE outcome IS NOT NULL AND outcome != 'unknown'
+                  )
+                ORDER BY cu.ticker
+                LIMIT %s
+            """, (max_tickers,))
+            tickers = [(r[0], r[1] or r[0]) for r in cur.fetchall()]
+        
+        if not tickers:
+            return {"tickers_processed": 0, "catalysts_seeded": 0,
+                    "note": "all V2 tickers already have outcome rows"}
+        
+        results = []
+        catalysts_seeded = 0
+        llm_failures = 0
+        
+        for ticker, company_name in tickers:
+            prompt = f"""You are populating a learning-loop dataset for biotech catalyst predictions.
+
+For {ticker} ({company_name}), provide {per_ticker} notable HISTORICAL catalysts from the last 5 years (2020-2025) where you have high confidence about both the date and the outcome.
+
+Prioritize:
+1. FDA approvals/rejections (PDUFA decisions)
+2. Phase 3 readouts (top-line results)
+3. Major regulatory milestones (CRL, AdComm)
+
+EXCLUDE: forward-dated events, ambiguous announcements, partnership news, earnings.
+
+Respond with ONLY a JSON object:
+{{
+  "catalysts": [
+    {{
+      "catalyst_date": "YYYY-MM-DD",
+      "catalyst_type": "FDA Decision" | "Phase 3 Readout" | "AdComm" | "Phase 2 Readout",
+      "drug_name": "exact drug name (with code if applicable, e.g., 'risdiplam (Evrysdi)')",
+      "indication": "specific indication treated",
+      "outcome": "approved" | "rejected" | "delayed" | "mixed",
+      "probability_at_time": 0.0-1.0,
+      "rationale": "1-sentence factual citation"
+    }}
+  ]
+}}
+
+If you don't have high-confidence knowledge of {per_ticker} historical catalysts for {ticker}, return fewer (or empty array). Quality over quantity. Do NOT make up dates or outcomes."""
+            
+            try:
+                result, err = call_llm_json(
+                    prompt, max_tokens=800, temperature=0.1,
+                    feature="historical_seed", ticker=ticker,
+                )
+                if not result or err:
+                    llm_failures += 1
+                    results.append({"ticker": ticker, "error": err or "no result"})
+                    continue
+                
+                catalysts = result.get("catalysts", []) or []
+                if not catalysts:
+                    results.append({"ticker": ticker, "catalysts_returned": 0,
+                                     "note": "LLM returned no historical catalysts"})
+                    continue
+                
+                ticker_results = []
+                for cat in catalysts[:per_ticker]:
+                    cat_date = cat.get("catalyst_date")
+                    cat_type = cat.get("catalyst_type")
+                    if not cat_date or not cat_type:
+                        continue
+                    
+                    if dry_run:
+                        ticker_results.append({
+                            "date": cat_date, "type": cat_type,
+                            "drug": cat.get("drug_name"),
+                            "outcome_known": cat.get("outcome"),
+                            "would_seed": True,
+                        })
+                    else:
+                        # Backfill via the tracker — it'll fetch yfinance prices
+                        # and run the full classifier pipeline
+                        try:
+                            br = backfill_one({
+                                "id": None,
+                                "ticker": ticker,
+                                "catalyst_type": cat_type,
+                                "catalyst_date": cat_date,
+                                "drug_name": cat.get("drug_name"),
+                                "indication": cat.get("indication"),
+                                "confidence_score": cat.get("probability_at_time", 0.7),
+                            })
+                            if br.get("status") == "created":
+                                catalysts_seeded += 1
+                            ticker_results.append({
+                                "date": cat_date, "type": cat_type,
+                                "drug": cat.get("drug_name"),
+                                "llm_outcome": cat.get("outcome"),
+                                "actual_outcome": br.get("outcome"),
+                                "actual_1d_pct": br.get("actual_1d_pct"),
+                                "status": br.get("status"),
+                            })
+                        except Exception as e:
+                            ticker_results.append({
+                                "date": cat_date, "type": cat_type,
+                                "error": str(e)[:100],
+                            })
+                
+                results.append({"ticker": ticker, "catalysts": ticker_results})
+            except Exception as e:
+                llm_failures += 1
+                results.append({"ticker": ticker, "error": str(e)[:100]})
+        
+        return {
+            "tickers_processed": len(tickers),
+            "catalysts_seeded": catalysts_seeded,
+            "llm_failures": llm_failures,
+            "dry_run": dry_run,
+            "results": results,
+        }
+    except Exception as e:
+        logger.exception("seed_historical_catalysts failed")
+        raise HTTPException(500, f"error: {e}")
