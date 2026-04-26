@@ -1165,16 +1165,26 @@ async def seed_historical_catalysts(
         db = BiotechDatabase()
         with db.get_conn() as conn:
             cur = conn.cursor()
+            # Only pick LIVE tickers with real yfinance market_cap data —
+            # delisted/acquired tickers (ADAP, AKRO etc.) have no price
+            # history and would all fail. Order by market_cap DESC so we
+            # cover the biggest names first (better historical data quality).
             cur.execute("""
-                SELECT DISTINCT cu.ticker, cu.company_name
+                SELECT cu.ticker, cu.company_name, ss.market_cap
                 FROM catalyst_universe cu
+                INNER JOIN screener_stocks ss ON ss.ticker = cu.ticker
                 WHERE cu.status = 'active'
                   AND cu.ticker IS NOT NULL
+                  AND ss.market_cap IS NOT NULL
+                  AND ss.market_cap > 0
+                  AND COALESCE(ss.description, '') NOT LIKE 'yfinance backfill%%'
+                  AND COALESCE(ss.description, '') NOT LIKE 'yfinance: no data%%'
                   AND cu.ticker NOT IN (
                     SELECT DISTINCT ticker FROM post_catalyst_outcomes
                     WHERE outcome IS NOT NULL AND outcome != 'unknown'
                   )
-                ORDER BY cu.ticker
+                GROUP BY cu.ticker, cu.company_name, ss.market_cap
+                ORDER BY ss.market_cap DESC
                 LIMIT %s
             """, (max_tickers,))
             tickers = [(r[0], r[1] or r[0]) for r in cur.fetchall()]
