@@ -821,13 +821,41 @@ def get_seed_universe() -> List[Dict]:
 # LLM gate (only path that costs money)
 # ────────────────────────────────────────────────────────────
 def _check_budget() -> bool:
-    """Returns True if we have budget remaining today."""
+    """Returns True if we have budget remaining today.
+    
+    Combines two checks:
+    1. In-memory _daily_spend tracker (per-process, resets on restart) —
+       legacy DAILY_LLM_BUDGET_USD env var, default $5.
+    2. DB-backed llm_budgets via services.llm_usage.check_budget() — the
+       Phase 3B accounting system. Picks up hard_cutoff toggles from the
+       Tokens UI without requiring a redeploy.
+    
+    Either check can block. The DB-backed one is authoritative (Tokens UI
+    is the source of truth for real spend), but in-memory is kept as a
+    backup safety net during the first second of a fresh process before
+    DB results have been recorded.
+    """
+    # 1. Legacy in-memory check
     global _daily_spend, _daily_spend_date
     today = date.today()
     if _daily_spend_date != today:
         _daily_spend = 0.0
         _daily_spend_date = today
-    return _daily_spend < DAILY_LLM_BUDGET_USD
+    if _daily_spend >= DAILY_LLM_BUDGET_USD:
+        return False
+    
+    # 2. DB-backed check — only blocks if a hard_cutoff budget is exceeded
+    try:
+        from services.llm_usage import check_budget
+        bc = check_budget(provider="google", feature="universe_seeder")
+        if not bc.get("allowed", True):
+            logger.warning(f"[seeder] DB budget hard cutoff hit: {bc.get('reason')}")
+            return False
+    except Exception:
+        # Best-effort — don't block seed runs if accounting check fails
+        pass
+    
+    return True
 
 
 def _record_spend(usd: float):
