@@ -483,20 +483,46 @@ def backfill_one(catalyst: Dict) -> Dict:
     # Predicted: confidence_score from catalyst_universe (probability), plus reference move
     predicted_prob = catalyst.get("confidence_score")
 
-    # Reference move table — same as frontend uses
+    # Reference move table — calibrated against N=287 historical post-catalyst
+    # outcomes (see /admin/post-catalyst/move-stats). Format: (mean_up_pct, mean_down_pct)
+    # The "up" value is mean(actual_1d_pct) where outcome='approved'/'positive';
+    # the "down" value is mean(actual_1d_pct) where outcome='rejected'.
+    #
+    # Why these are SO MUCH smaller than the prior table:
+    #  - FDA approvals are usually priced-in by the time of the PDUFA date
+    #  - Phase 3 readouts often happen in pre-market with limited 1-day reaction
+    #  - Outsized moves (>25%) are tail events, not the typical case
+    #
+    # Calibration source: 287 outcomes seeded from yfinance + LLM classifier
+    # (commit 3a03cb0 / move-stats endpoint), 2020-2025. Updated (apr 26 2026).
     REF_MOVES = {
-        "FDA Decision": (25, -20), "PDUFA Decision": (25, -20),
-        "AdComm": (15, -12), "Advisory Committee": (15, -12),
-        "Phase 3 Readout": (35, -30), "Phase 3": (35, -30),
-        "Phase 2 Readout": (25, -20), "Phase 2": (25, -20),
-        "Phase 1 Readout": (15, -12), "Phase 1": (15, -12),
-        "Clinical Trial": (12, -10), "Clinical Trial Readout": (20, -18),
-        "NDA submission": (8, -5), "BLA submission": (8, -5),
-        "Regulatory Decision": (22, -18),
-        "Partnership": (10, -3), "Earnings": (6, -5),
-        "Product Launch": (10, -8), "Commercial Launch": (10, -8),
+        # FDA / regulatory — well-sampled (n=129 approved / 30 rejected)
+        "FDA Decision": (4, -5),
+        "PDUFA Decision": (4, -5),
+        "Regulatory Decision": (4, -5),
+        # AdComm — limited data, kept conservative estimates
+        "AdComm": (8, -10),
+        "Advisory Committee": (8, -10),
+        # Phase readouts — well-sampled (Phase 2: 36/18, Phase 3: 24/16)
+        "Phase 3 Readout": (3, -5),  # was (35, -30) — calibrated from N=40
+        "Phase 3": (3, -5),
+        "Phase 2 Readout": (4, -2),  # was (25, -20) — calibrated from N=54
+        "Phase 2": (4, -2),
+        "Phase 1/2 Readout": (8, -6),  # n=3, conservative
+        "Phase 1 Readout": (10, -6),  # n=3, kept higher (early-stage variance)
+        "Phase 1": (10, -6),
+        "Clinical Trial Readout": (5, -3),
+        "Clinical Trial": (5, -3),
+        # Submissions — typically minimal price reaction
+        "NDA submission": (2, -2),
+        "BLA submission": (2, -2),
+        # Other — kept estimates (no historical sample yet)
+        "Partnership": (5, -2),
+        "Earnings": (3, -3),
+        "Product Launch": (4, -4),
+        "Commercial Launch": (4, -4),
     }
-    up, down = REF_MOVES.get(cat_type or "", (10, -8))
+    up, down = REF_MOVES.get(cat_type or "", (4, -4))
     p = float(predicted_prob) if predicted_prob is not None else 0.5
     predicted_move = p * up + (1 - p) * down
 
