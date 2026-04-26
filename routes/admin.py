@@ -3,6 +3,7 @@
 """
 import logging, os
 from datetime import datetime
+from typing import Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
@@ -1573,6 +1574,7 @@ async def recompute_predictions(limit: int = 1000):
     }
 
 
+@router.get("/fda-sources/lookup")
 @router.get("/fda-sources/lookup")
 async def fda_sources_lookup(drug_name: str, indication: Optional[str] = None):
     """Spot-check the FDA + ClinicalTrials.gov facts our system has for a drug.
