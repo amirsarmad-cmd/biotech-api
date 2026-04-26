@@ -1165,28 +1165,30 @@ async def seed_historical_catalysts(
         db = BiotechDatabase()
         with db.get_conn() as conn:
             cur = conn.cursor()
-            # Only pick LIVE tickers with real yfinance market_cap data —
-            # delisted/acquired tickers (ADAP, AKRO etc.) have no price
-            # history and would all fail. Order by market_cap DESC so we
-            # cover the biggest names first (better historical data quality).
+            # Pick tickers in catalyst_universe that haven't been seeded or marked.
+            # Use LEFT JOIN to screener_stocks so V2-only tickers (which never
+            # made it into screener_stocks via the seeder pipeline) still
+            # participate. The seeder will fail gracefully on truly delisted
+            # tickers (no yfinance data → backfill_one returns failed status).
             #
-            # CRITICAL: also exclude tickers we ALREADY tried but where
-            # LLM returned no historical catalysts. Without this the same
-            # tickers get re-queried each batch (seen with ONC, ILMN).
-            # We track this via a marker row: post_catalyst_outcomes with
-            # outcome='no_history_known' written below.
+            # Order by screener_stocks.market_cap DESC NULLS LAST so the LIVE
+            # well-documented names get tried first; V2-only catch up after.
             cur.execute("""
                 SELECT t.ticker, t.company_name FROM (
                     SELECT DISTINCT ON (cu.ticker)
                         cu.ticker, cu.company_name, ss.market_cap
                     FROM catalyst_universe cu
-                    INNER JOIN screener_stocks ss ON ss.ticker = cu.ticker
+                    LEFT JOIN screener_stocks ss ON ss.ticker = cu.ticker
                     WHERE cu.status = 'active'
                       AND cu.ticker IS NOT NULL
-                      AND ss.market_cap IS NOT NULL
-                      AND ss.market_cap > 0
-                      AND COALESCE(ss.description, '') NOT LIKE 'yfinance backfill%%'
-                      AND COALESCE(ss.description, '') NOT LIKE 'yfinance: no data%%'
+                      AND (
+                        ss.ticker IS NULL  -- V2-only tickers, never in screener_stocks
+                        OR (
+                          ss.market_cap IS NOT NULL AND ss.market_cap > 0
+                          AND COALESCE(ss.description, '') NOT LIKE 'yfinance backfill%%'
+                          AND COALESCE(ss.description, '') NOT LIKE 'yfinance: no data%%'
+                        )
+                      )
                       AND cu.ticker NOT IN (
                         SELECT DISTINCT ticker FROM post_catalyst_outcomes
                         WHERE outcome IS NOT NULL
@@ -1194,7 +1196,7 @@ async def seed_historical_catalysts(
                       )
                     ORDER BY cu.ticker, ss.market_cap DESC NULLS LAST
                 ) t
-                ORDER BY t.market_cap DESC
+                ORDER BY t.market_cap DESC NULLS LAST
                 LIMIT %s
             """, (max_tickers,))
             tickers = [(r[0], r[1] or r[0]) for r in cur.fetchall()]
@@ -1370,12 +1372,17 @@ async def seed_historical_diag():
             SELECT COUNT(*) FROM (
                 SELECT DISTINCT ON (cu.ticker) cu.ticker
                 FROM catalyst_universe cu
-                INNER JOIN screener_stocks ss ON ss.ticker = cu.ticker
+                LEFT JOIN screener_stocks ss ON ss.ticker = cu.ticker
                 WHERE cu.status = 'active'
                   AND cu.ticker IS NOT NULL
-                  AND ss.market_cap IS NOT NULL AND ss.market_cap > 0
-                  AND COALESCE(ss.description, '') NOT LIKE 'yfinance backfill%%'
-                  AND COALESCE(ss.description, '') NOT LIKE 'yfinance: no data%%'
+                  AND (
+                    ss.ticker IS NULL
+                    OR (
+                      ss.market_cap IS NOT NULL AND ss.market_cap > 0
+                      AND COALESCE(ss.description, '') NOT LIKE 'yfinance backfill%%'
+                      AND COALESCE(ss.description, '') NOT LIKE 'yfinance: no data%%'
+                    )
+                  )
                   AND cu.ticker NOT IN (
                     SELECT DISTINCT ticker FROM post_catalyst_outcomes
                     WHERE outcome IS NOT NULL AND outcome NOT IN ('unknown')
@@ -1389,19 +1396,24 @@ async def seed_historical_diag():
             SELECT t.ticker, t.market_cap FROM (
                 SELECT DISTINCT ON (cu.ticker) cu.ticker, ss.market_cap
                 FROM catalyst_universe cu
-                INNER JOIN screener_stocks ss ON ss.ticker = cu.ticker
+                LEFT JOIN screener_stocks ss ON ss.ticker = cu.ticker
                 WHERE cu.status = 'active'
                   AND cu.ticker IS NOT NULL
-                  AND ss.market_cap IS NOT NULL AND ss.market_cap > 0
-                  AND COALESCE(ss.description, '') NOT LIKE 'yfinance backfill%%'
-                  AND COALESCE(ss.description, '') NOT LIKE 'yfinance: no data%%'
+                  AND (
+                    ss.ticker IS NULL
+                    OR (
+                      ss.market_cap IS NOT NULL AND ss.market_cap > 0
+                      AND COALESCE(ss.description, '') NOT LIKE 'yfinance backfill%%'
+                      AND COALESCE(ss.description, '') NOT LIKE 'yfinance: no data%%'
+                    )
+                  )
                   AND cu.ticker NOT IN (
                     SELECT DISTINCT ticker FROM post_catalyst_outcomes
                     WHERE outcome IS NOT NULL AND outcome NOT IN ('unknown')
                   )
                 ORDER BY cu.ticker, ss.market_cap DESC NULLS LAST
             ) t
-            ORDER BY t.market_cap DESC
+            ORDER BY t.market_cap DESC NULLS LAST
             LIMIT 8
         """)
         sample = [{"ticker": r[0], "market_cap_m": float(r[1]) if r[1] else 0} for r in cur.fetchall()]
