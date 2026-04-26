@@ -337,9 +337,19 @@ class BiotechDatabase:
                     "last_updated": today.isoformat(),
                 })
             
-            # Add legacy screener_stocks tickers that aren't in V2 universe yet
-            cur.execute("SELECT * FROM screener_stocks WHERE ticker NOT IN %s",
-                        (tuple(v2_tickers) if v2_tickers else ("__none__",),))
+            # Add legacy screener_stocks tickers that aren't in V2 universe yet.
+            # Filter out marker rows (yfinance backfill placeholder, no real catalyst):
+            # - rows with empty catalyst_type AND empty catalyst_date
+            # - rows whose description starts with 'yfinance backfill' or 'yfinance: no data'
+            # These rows exist only to carry market_cap metadata.
+            cur.execute("""
+                SELECT * FROM screener_stocks
+                WHERE ticker NOT IN %s
+                  AND COALESCE(catalyst_type, '') != ''
+                  AND COALESCE(catalyst_date, '') != ''
+                  AND COALESCE(description, '') NOT LIKE 'yfinance backfill%%'
+                  AND COALESCE(description, '') NOT LIKE 'yfinance: no data%%'
+            """, (tuple(v2_tickers) if v2_tickers else ("__none__",),))
             legacy_cols = [d[0] for d in cur.description]
             for r in cur.fetchall():
                 results.append(dict(zip(legacy_cols, r)))
