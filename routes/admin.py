@@ -1475,3 +1475,99 @@ async def move_stats():
             } for r in rows
         ],
     }
+
+
+@router.post("/post-catalyst/recompute-predictions")
+async def recompute_predictions(limit: int = 1000):
+    """Recompute predicted_move_pct for existing post_catalyst_outcomes rows
+    using the current REF_MOVES table in services/post_catalyst_tracker.py.
+    
+    Why: REF_MOVES was recalibrated (commit 559e018). Existing rows have
+    predictions frozen from when they were first seeded with the old aggressive
+    table — accuracy metrics still reflect that. Run this once to bring
+    historical predictions in line with the calibrated values."""
+    from services.database import BiotechDatabase
+    
+    # Inline the calibrated table here so this endpoint doesn't depend on
+    # post_catalyst_tracker exporting it.
+    REF_MOVES = {
+        "FDA Decision": (4, -5),
+        "PDUFA Decision": (4, -5),
+        "Regulatory Decision": (4, -5),
+        "AdComm": (8, -10),
+        "Advisory Committee": (8, -10),
+        "Phase 3 Readout": (3, -5),
+        "Phase 3": (3, -5),
+        "Phase 2 Readout": (4, -2),
+        "Phase 2": (4, -2),
+        "Phase 1/2 Readout": (8, -6),
+        "Phase 1 Readout": (10, -6),
+        "Phase 1": (10, -6),
+        "Clinical Trial Readout": (5, -3),
+        "Clinical Trial": (5, -3),
+        "NDA submission": (2, -2),
+        "BLA submission": (2, -2),
+        "Partnership": (5, -2),
+        "Earnings": (3, -3),
+        "Product Launch": (4, -4),
+        "Commercial Launch": (4, -4),
+    }
+    DEFAULT = (4, -4)
+    
+    db = BiotechDatabase()
+    updated = 0
+    skipped = 0
+    error_changed_total = 0.0
+    
+    with db.get_conn() as conn:
+        cur = conn.cursor()
+        # Pull all outcome rows with predicted_prob set
+        cur.execute("""
+            SELECT id, catalyst_type, predicted_prob, actual_move_pct_30d, actual_move_pct_1d, predicted_move_pct
+            FROM post_catalyst_outcomes
+            WHERE predicted_prob IS NOT NULL
+              AND outcome IS NOT NULL
+              AND outcome NOT IN ('no_history_known')
+            ORDER BY computed_at DESC
+            LIMIT %s
+        """, (limit,))
+        rows = cur.fetchall()
+        
+        for row_id, ctype, prob, actual_30d, actual_1d, old_pred in rows:
+            up, down = REF_MOVES.get(ctype or "", DEFAULT)
+            p = float(prob) if prob is not None else 0.5
+            new_pred = p * up + (1 - p) * down
+            
+            # Recompute error metrics
+            actual_for_error = actual_30d if actual_30d is not None else actual_1d
+            if actual_for_error is None:
+                skipped += 1
+                continue
+            new_err_abs = abs(new_pred - float(actual_for_error))
+            new_err_signed = new_pred - float(actual_for_error)
+            new_dir_correct = (
+                (new_pred > 0 and actual_for_error > 0) or
+                (new_pred < 0 and actual_for_error < 0) or
+                (abs(new_pred) < 1 and abs(actual_for_error) < 5)
+            )
+            
+            cur.execute("""
+                UPDATE post_catalyst_outcomes
+                SET predicted_move_pct = %s,
+                    error_abs_pct = %s,
+                    error_signed_pct = %s,
+                    direction_correct = %s,
+                    last_updated = NOW()
+                WHERE id = %s
+            """, (new_pred, new_err_abs, new_err_signed, new_dir_correct, row_id))
+            updated += 1
+            error_changed_total += abs(float(old_pred or 0) - new_pred)
+        
+        conn.commit()
+    
+    return {
+        "updated": updated,
+        "skipped": skipped,
+        "avg_prediction_change_pts": round(error_changed_total / max(updated, 1), 2),
+        "note": "Predictions recomputed using calibrated REF_MOVES. /v2/post-catalyst/accuracy will reflect changes immediately.",
+    }
