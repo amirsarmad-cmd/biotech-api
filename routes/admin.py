@@ -1429,3 +1429,49 @@ async def seed_historical_diag():
         "by_outcome_count": by_outcome,
         "next_8_candidates": sample,
     }
+
+
+@router.get("/post-catalyst/move-stats")
+async def move_stats():
+    """Distribution of actual_move_pct_1d grouped by catalyst_type + outcome.
+    Used to recalibrate REFERENCE_MOVES in services/post_catalyst_tracker.py."""
+    from services.database import BiotechDatabase
+    db = BiotechDatabase()
+    with db.get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT
+                catalyst_type,
+                outcome,
+                COUNT(*) AS n,
+                ROUND(AVG(actual_move_pct_1d)::numeric, 2) AS avg_1d,
+                ROUND(STDDEV(actual_move_pct_1d)::numeric, 2) AS std_1d,
+                ROUND(MIN(actual_move_pct_1d)::numeric, 2) AS min_1d,
+                ROUND(MAX(actual_move_pct_1d)::numeric, 2) AS max_1d,
+                ROUND(percentile_cont(0.25) WITHIN GROUP (ORDER BY actual_move_pct_1d)::numeric, 2) AS p25,
+                ROUND(percentile_cont(0.50) WITHIN GROUP (ORDER BY actual_move_pct_1d)::numeric, 2) AS median,
+                ROUND(percentile_cont(0.75) WITHIN GROUP (ORDER BY actual_move_pct_1d)::numeric, 2) AS p75
+            FROM post_catalyst_outcomes
+            WHERE actual_move_pct_1d IS NOT NULL
+              AND outcome NOT IN ('no_history_known', 'unknown')
+            GROUP BY catalyst_type, outcome
+            ORDER BY catalyst_type, outcome
+        """)
+        rows = cur.fetchall()
+    return {
+        "total_outcomes_with_moves": sum(r[2] for r in rows),
+        "by_catalyst_outcome": [
+            {
+                "catalyst_type": r[0],
+                "outcome": r[1],
+                "n": r[2],
+                "avg_1d_pct": float(r[3]) if r[3] else None,
+                "std_1d_pct": float(r[4]) if r[4] else None,
+                "min_1d_pct": float(r[5]) if r[5] else None,
+                "max_1d_pct": float(r[6]) if r[6] else None,
+                "p25_1d_pct": float(r[7]) if r[7] else None,
+                "median_1d_pct": float(r[8]) if r[8] else None,
+                "p75_1d_pct": float(r[9]) if r[9] else None,
+            } for r in rows
+        ],
+    }
