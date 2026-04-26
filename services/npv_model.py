@@ -272,10 +272,16 @@ def compute_npv_estimate(
     if full_approval_pct > 30:
         additional_rejection = -(full_approval_pct * 0.3)  # additional 30% of upside lost
         rejection_pct += additional_rejection
-    
+
+    # Clamp rejection_pct so we can never imply a negative stock price.
+    # Floor at -90% — even Theranos-grade rejections rarely take a stock below
+    # 10% of its pre-event price in a single day. Anything more negative is
+    # mathematically valid but operationally unrealistic and confuses users.
+    rejection_pct = max(rejection_pct, -90.0)
+
     # Final prices
     approval_price = current_price * (1 + remaining_upside_pct / 100.0)
-    rejection_price = current_price * (1 + rejection_pct / 100.0)
+    rejection_price = max(0.01, current_price * (1 + rejection_pct / 100.0))
     
     # Expected = prob-weighted
     expected_price = (p_approval * approval_price) + ((1 - p_approval) * rejection_price)
@@ -451,7 +457,9 @@ def get_drug_economics_v2_from_cache(ticker: str, drug_name: str) -> Optional[Di
                                   penetration_min_pct, penetration_max_pct, penetration_mid_pct,
                                   launch_year, peak_sales_year, patent_expiry_date,
                                   competitors, competitive_intensity, first_in_class,
-                                  llm_rationale, llm_provider, computed_at, ttl, indication
+                                  llm_rationale, llm_provider, computed_at, ttl, indication,
+                                  annual_cost_us_net_usd, annual_cost_exus_net_usd,
+                                  revenue_split_us_pct, provenance, confidence_score
                            FROM drug_economics_cache
                            WHERE ticker=%s AND canonical_drug_name=%s""",
                         (ticker, canon))
@@ -487,11 +495,51 @@ def get_drug_economics_v2_from_cache(ticker: str, drug_name: str) -> Optional[Di
                 "llm_provider": row[15],
                 "computed_at": str(row[16]) if row[16] else None,
                 "indication": row[18],
+                "annual_cost_us_net_usd": float(row[19]) if row[19] else None,
+                "annual_cost_exus_net_usd": float(row[20]) if row[20] else None,
+                "revenue_split_us_pct": float(row[21]) if row[21] else None,
+                "provenance": row[22] if isinstance(row[22], dict) else (json.loads(row[22]) if row[22] else None),
+                "confidence_score": float(row[23]) if row[23] is not None else None,
                 "_from_cache": True,
             }
     except Exception as e:
         logger.warning(f"get_drug_economics_v2_from_cache failed: {e}")
         return None
+
+
+def _compute_confidence_score(provenance: Dict) -> float:
+    """Roll up per-field provenance into a single confidence score 0-1.
+    
+    Weighting:
+      high   = 1.0
+      medium = 0.6
+      low    = 0.2
+      missing/null field = 0.0
+    
+    Returns the average across critical fields. Used as a single 'how much
+    should you trust this analysis' indicator.
+    """
+    if not provenance or not isinstance(provenance, dict):
+        return 0.5  # neutral default — unknown
+    
+    # Fields that materially drive the rNPV math
+    critical = [
+        "addressable_population_us", "addressable_population_global",
+        "annual_cost_us_net_usd", "annual_cost_exus_net_usd",
+        "penetration_mid_pct", "patent_expiry_date",
+        "p_event_occurs", "p_positive_outcome", "commercial_success_prob",
+    ]
+    SCORE = {"high": 1.0, "medium": 0.6, "low": 0.2}
+    total = 0.0
+    n = 0
+    for f in critical:
+        entry = provenance.get(f)
+        if not entry or not isinstance(entry, dict):
+            continue  # skip entirely missing — not an automatic fail
+        conf = entry.get("confidence", "low")
+        total += SCORE.get(conf.lower() if isinstance(conf, str) else "low", 0.2)
+        n += 1
+    return round(total / max(n, 1), 3) if n > 0 else 0.5
 
 
 def write_drug_economics_v2_to_cache(ticker: str, drug_name: str, econ_v2: Dict, ttl_days: int = 7) -> bool:
@@ -506,18 +554,27 @@ def write_drug_economics_v2_to_cache(ticker: str, drug_name: str, econ_v2: Dict,
         ttl = datetime.now() + timedelta(days=ttl_days)
         comps = econ_v2.get("competitors") or []
         comps_json = json.dumps(comps) if not isinstance(comps, str) else comps
+        provenance = econ_v2.get("provenance") or {}
+        provenance_json = json.dumps(provenance) if not isinstance(provenance, str) else provenance
+        # Roll up confidence: % of fields tagged 'high' or 'medium' / total
+        conf_score = _compute_confidence_score(provenance) if provenance else None
         with db.get_conn() as conn:
             cur = conn.cursor()
             cur.execute("""INSERT INTO drug_economics_cache
                 (ticker, canonical_drug_name, indication,
                  addressable_population_us, addressable_population_global,
                  annual_cost_min_usd, annual_cost_max_usd, standard_of_care_cost_usd,
+                 annual_cost_us_net_usd, annual_cost_exus_net_usd, revenue_split_us_pct,
                  penetration_min_pct, penetration_max_pct, penetration_mid_pct,
                  launch_year, peak_sales_year, patent_expiry_date,
                  competitors, competitive_intensity, first_in_class,
-                 llm_rationale, llm_provider, computed_at, ttl)
-                VALUES (%s,%s,%s, %s,%s, %s,%s,%s, %s,%s,%s, %s,%s,%s,
-                        %s::jsonb,%s,%s, %s,%s, NOW(), %s)
+                 llm_rationale, llm_provider,
+                 provenance, confidence_score,
+                 computed_at, ttl)
+                VALUES (%s,%s,%s, %s,%s, %s,%s,%s, %s,%s,%s, %s,%s,%s, %s,%s,%s,
+                        %s::jsonb,%s,%s, %s,%s,
+                        %s::jsonb,%s,
+                        NOW(), %s)
                 ON CONFLICT (ticker, canonical_drug_name) DO UPDATE SET
                     indication = EXCLUDED.indication,
                     addressable_population_us = EXCLUDED.addressable_population_us,
@@ -525,6 +582,9 @@ def write_drug_economics_v2_to_cache(ticker: str, drug_name: str, econ_v2: Dict,
                     annual_cost_min_usd = EXCLUDED.annual_cost_min_usd,
                     annual_cost_max_usd = EXCLUDED.annual_cost_max_usd,
                     standard_of_care_cost_usd = EXCLUDED.standard_of_care_cost_usd,
+                    annual_cost_us_net_usd = EXCLUDED.annual_cost_us_net_usd,
+                    annual_cost_exus_net_usd = EXCLUDED.annual_cost_exus_net_usd,
+                    revenue_split_us_pct = EXCLUDED.revenue_split_us_pct,
                     penetration_min_pct = EXCLUDED.penetration_min_pct,
                     penetration_max_pct = EXCLUDED.penetration_max_pct,
                     penetration_mid_pct = EXCLUDED.penetration_mid_pct,
@@ -536,6 +596,8 @@ def write_drug_economics_v2_to_cache(ticker: str, drug_name: str, econ_v2: Dict,
                     first_in_class = EXCLUDED.first_in_class,
                     llm_rationale = EXCLUDED.llm_rationale,
                     llm_provider = EXCLUDED.llm_provider,
+                    provenance = EXCLUDED.provenance,
+                    confidence_score = EXCLUDED.confidence_score,
                     computed_at = NOW(),
                     ttl = EXCLUDED.ttl""",
                 (ticker, canon, econ_v2.get("indication"),
@@ -544,6 +606,9 @@ def write_drug_economics_v2_to_cache(ticker: str, drug_name: str, econ_v2: Dict,
                  econ_v2.get("annual_cost_min_usd"),
                  econ_v2.get("annual_cost_max_usd"),
                  econ_v2.get("standard_of_care_cost_usd"),
+                 econ_v2.get("annual_cost_us_net_usd"),
+                 econ_v2.get("annual_cost_exus_net_usd"),
+                 econ_v2.get("revenue_split_us_pct"),
                  econ_v2.get("penetration_min_pct"),
                  econ_v2.get("penetration_max_pct"),
                  econ_v2.get("penetration_mid_pct"),
@@ -555,6 +620,8 @@ def write_drug_economics_v2_to_cache(ticker: str, drug_name: str, econ_v2: Dict,
                  econ_v2.get("first_in_class"),
                  econ_v2.get("llm_rationale"),
                  econ_v2.get("llm_provider"),
+                 provenance_json,
+                 conf_score,
                  ttl))
             conn.commit()
         logger.info(f"drug_economics_cache written: {ticker}/{canon}")
@@ -625,9 +692,12 @@ If you genuinely don't know a field, set it to null. Don't fabricate. Schema:
   "first_in_class": <true|false — for THIS specific indication, is this drug the first MOA approved?>,
   "addressable_population_us": <integer — US patients eligible for THIS indication only. Not the drug's total patients across all indications. e.g. for Dupixent COPD: ~500k eosinophilic COPD patients, NOT the 27M total Dupixent global patients across all approved uses>,
   "addressable_population_global": <integer — global patients for THIS indication only>,
-  "annual_cost_min_usd": <number — annual list price for this indication, low end>,
-  "annual_cost_max_usd": <number — annual list price for this indication, high end>,
-  "standard_of_care_cost_usd": <number — current SOC annual cost for THIS indication, or null if no SOC>,
+  "annual_cost_min_usd": <number — annual list price for this indication, low end (US gross / WAC)>,
+  "annual_cost_max_usd": <number — annual list price for this indication, high end (US gross / WAC)>,
+  "annual_cost_us_net_usd": <number — annual NET realized price in the US AFTER rebates, GPO discounts, 340B, Medicaid best price, copay assistance. Typical gross-to-net: small molecule branded ~50-70%, biologic ~70-85%, orphan ~80-95%, gene therapy ~95% (one-time). Be explicit: do NOT assume net = gross.>,
+  "annual_cost_exus_net_usd": <number — annual NET realized price ex-US (Europe + Japan + RoW blended). Typical: 50-65% of US net for established markets, lower for cash-pay markets. For US-only / orphan products: 0.>,
+  "revenue_split_us_pct": <number 0-100 — share of global revenue from US. Typical: 60-75% for novel branded; 50-60% for global biologics with strong EU presence; 90-100% for US-orphan-only.>,
+  "standard_of_care_cost_usd": <number — current SOC annual cost for THIS indication (US net), or null if no SOC>,
   "penetration_min_pct": <number 0-100 — pessimistic peak market share within THIS indication's eligible patients>,
   "penetration_max_pct": <number 0-100 — optimistic peak market share>,
   "penetration_mid_pct": <number 0-100 — realistic mid-case peak market share>,
@@ -643,8 +713,26 @@ If you genuinely don't know a field, set it to null. Don't fabricate. Schema:
   "competitors": [<list of named competitor drugs/companies in THIS indication, max 5>],
   "competitive_intensity": "<low | medium | high>",
   "key_risks": [<2-4 short risk bullets specific to this catalyst's outcome>],
-  "rationale": "<3-4 sentence summary justifying the numbers above. Make clear whether you're scoping to a single indication or whole franchise. Cite specific epidemiology / pricing benchmarks where possible.>"
+  "rationale": "<3-4 sentence summary justifying the numbers above. Make clear whether you're scoping to a single indication or whole franchise. Cite specific epidemiology / pricing benchmarks where possible.>",
+  "provenance": {{
+    "<field_name>": {{
+      "source": "<one of: 'openfda' | 'clinicaltrials_gov' | 'sec_edgar' | 'orange_book' | 'polygon_options' | 'finnhub' | 'llm_grounded_web' | 'llm_inference'>",
+      "confidence": "<one of: 'high' | 'medium' | 'low'>",
+      "citation": "<short string — e.g. 'HAEA 2024 prevalence estimate' or 'Takhzyro WAC list price 2024' or 'analyst inference'>"
+    }},
+    ...
+  }}
 }}
+
+PROVENANCE RULES:
+- Every numeric field above (population, pricing, penetration, dates, probabilities, COGS, LOE) MUST have a provenance entry.
+- Use 'llm_grounded_web' for facts you found in the CONTEXT FROM RESEARCH section above.
+- Use 'llm_inference' for values you reasoned from analogues, modality typicals, or standard biotech rules of thumb.
+- Use 'openfda' / 'clinicaltrials_gov' / 'sec_edgar' / 'orange_book' ONLY when those sources are explicitly cited in the research context.
+- 'high' confidence: you have a specific cited number from a reliable source.
+- 'medium' confidence: defensible inference from analogues and benchmarks.
+- 'low' confidence: rough estimate without strong supporting data — also returns 'llm_inference' as source.
+- If you genuinely cannot estimate a field, set the field to null AND its provenance source to 'llm_inference' with confidence 'low' and citation 'no data'.
 
 CALCULATION SANITY CHECK (do this mentally before returning):
 peak_sales_estimate = (addressable_population_global × penetration_mid_pct/100 × annual_cost_avg) / 1e9 → in $B
@@ -874,18 +962,70 @@ def compute_rnpv_full(econ_v2: Dict, p_approval: float,
         # If global missing but US present, estimate global as 2.5x US
         if pop_global == 0 and pop_us > 0:
             pop_global = pop_us * 2.5
+        pop_exus = max(0.0, pop_global - pop_us)
 
+        # ─── Pricing: prefer US/ex-US net split when LLM provides it ─────
+        # Old path (gross × global) systematically overstates peak revenue by
+        # ~30-50% because: (a) US gross WAC isn't realized after rebates;
+        # (b) ex-US prices are typically 50-65% of US.
+        price_us_net = econ_v2.get("annual_cost_us_net_usd")
+        price_exus_net = econ_v2.get("annual_cost_exus_net_usd")
+        revenue_split_us_pct = econ_v2.get("revenue_split_us_pct")
+
+        # Backward-compat: if LLM didn't return the new fields, use old gross
+        # × an implicit gross-to-net haircut to avoid overstatement.
         price_min = float(econ_v2.get("annual_cost_min_usd") or 0)
         price_max = float(econ_v2.get("annual_cost_max_usd") or 0)
-        price_avg = (price_min + price_max) / 2.0 if (price_min and price_max) else (price_max or price_min or 0)
-        if price_avg == 0:
+        price_avg_gross = (price_min + price_max) / 2.0 if (price_min and price_max) else (price_max or price_min or 0)
+
+        # Default gross-to-net by modality (used only if LLM didn't return net price)
+        modality = (econ_v2.get("modality") or "other").lower()
+        DEFAULT_GTN = {
+            "small_molecule": 0.60,
+            "biologic": 0.78,
+            "antibody": 0.78,
+            "cell_gene": 0.92,  # one-time gene therapy ~95%
+            "rna": 0.78,
+            "other": 0.70,
+        }
+        default_gtn = DEFAULT_GTN.get(modality, 0.70)
+
+        if price_us_net is not None and float(price_us_net) > 0:
+            price_us_net = float(price_us_net)
+        elif price_avg_gross > 0:
+            price_us_net = price_avg_gross * default_gtn
+        else:
+            price_us_net = 0
+
+        if price_exus_net is not None and float(price_exus_net) > 0:
+            price_exus_net = float(price_exus_net)
+        elif price_us_net > 0:
+            # Default ex-US net = 60% of US net (standard EU/Japan reference pricing)
+            price_exus_net = price_us_net * 0.60
+        else:
+            price_exus_net = 0
+
+        if price_us_net == 0 and price_exus_net == 0:
             return {"rnpv_m": 0.0, "deterministic_npv_m": 0.0, "revenue_forecast": [],
                     "peak_sales_usd_b": 0.0, "error": "no pricing data",
                     "assumptions_used": {}}
 
         pen_peak = float(econ_v2.get("penetration_mid_pct") or 15.0) / 100.0
-        peak_revenue_usd = pop_global * pen_peak * price_avg
+
+        # Build peak revenue from US + ex-US separately when populations are known
+        peak_revenue_us = pop_us * pen_peak * price_us_net if pop_us > 0 else 0
+        peak_revenue_exus = pop_exus * pen_peak * price_exus_net if pop_exus > 0 else 0
+        peak_revenue_usd = peak_revenue_us + peak_revenue_exus
+
+        # Fallback: if pop_us is missing but global isn't, allocate by revenue_split_us_pct
+        if peak_revenue_usd == 0 and pop_global > 0:
+            split_us = float(revenue_split_us_pct) / 100.0 if revenue_split_us_pct else 0.65
+            blended_price = price_us_net * split_us + price_exus_net * (1 - split_us)
+            peak_revenue_usd = pop_global * pen_peak * blended_price
+
         peak_revenue_m = peak_revenue_usd / 1e6
+        # For backward-compat in assumptions output
+        price_avg = (price_us_net + price_exus_net) / 2.0 if (price_us_net and price_exus_net) else (price_us_net or price_exus_net)
 
         cogs_pct = float(econ_v2.get("cogs_pct_estimate") or w.get("cogs_pct", 0.15))
         cogs_pct = max(0.05, min(0.6, cogs_pct))  # sanity bounds
@@ -1038,8 +1178,14 @@ def compute_rnpv_full(econ_v2: Dict, p_approval: float,
             "dilution_assumed_pct": dilution_assumed_pct if dilution_assumed_pct else None,
             "revenue_forecast": forecast,
             "assumptions_used": {
+                "addressable_population_us": pop_us,
+                "addressable_population_exus": pop_exus,
                 "addressable_population_global": pop_global,
+                "annual_cost_us_net_usd": price_us_net,
+                "annual_cost_exus_net_usd": price_exus_net,
                 "annual_cost_avg_usd": price_avg,
+                "modality": econ_v2.get("modality", "?"),
+                "default_gross_to_net_used": default_gtn if not econ_v2.get("annual_cost_us_net_usd") else None,
                 "penetration_peak_pct": pen_peak * 100,
                 "launch_year": launch_year,
                 "loe_year": loe_year,
@@ -1053,7 +1199,6 @@ def compute_rnpv_full(econ_v2: Dict, p_approval: float,
                 "p_event_occurs": p_event_occurs,
                 "p_positive_outcome": p_positive_outcome,
                 "rnpv_method": rnpv_method,
-                "modality": econ_v2.get("modality", "?"),
                 "first_in_class": econ_v2.get("first_in_class", False),
             },
             "caveats": [
@@ -1083,7 +1228,7 @@ def _params_hash(payload: Dict) -> str:
     # Pick stable fields, ignore order
     keys_of_interest = sorted([
         "ticker", "catalyst_type", "catalyst_date", "drug_name",
-        "discount_rate", "tax_rate", "cogs_pct", "p_approval",
+        "discount_rate", "tax_rate", "cogs_pct", "p_approval", "p_commercial",
         "annual_cost_min_usd", "annual_cost_max_usd",
         "addressable_population_global", "penetration_mid_pct",
         "patent_expiry_date", "loe_dropoff_pct", "time_to_peak_years",

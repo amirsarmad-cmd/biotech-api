@@ -138,19 +138,48 @@ Return ONLY the JSON object."""
             raise RuntimeError(f"All LLM providers failed: {err}")
         
         # Compute total_discount with caps
-        factors = ["litigation", "fda_history", "sec_short", "insider_sell",
-                   "going_concern", "patent_cliff", "governance"]
+        # METHODOLOGY AUDIT: three factors are excluded from total_discount
+        # because they double-count signals that are already applied elsewhere
+        # in the rNPV / move-prediction stack:
+        #
+        #   patent_cliff  → already modeled by loe_dropoff_pct in compute_rnpv_full
+        #                   (year-by-year revenue cliff at LOE date). Don't haircut twice.
+        #   fda_history   → should adjust p_approval / p_event_occurs / p_positive_outcome,
+        #                   not separately discount drug NPV. The catalyst probability
+        #                   field already reflects regulatory history.
+        #   sec_short     → already amplified into the post-event move via
+        #                   high_short_amplifier in compute_npv_estimate's sentiment
+        #                   adjustment. Don't haircut again.
+        #
+        # We still RETURN values + rationales for these for UI transparency
+        # ("why this stock might be risky") but they don't reduce drug NPV.
+        DOUBLE_COUNTED = {"patent_cliff", "fda_history", "sec_short"}
+        all_factors = ["litigation", "fda_history", "sec_short", "insider_sell",
+                       "going_concern", "patent_cliff", "governance"]
         total = 0.0
-        for f in factors:
+        for f in all_factors:
             val = float(result.get(f, 0) or 0)
             # Clamp to max per factor
             max_allowed = DEFAULT_RISK_WEIGHTS.get(f"max_{f}", 0.20)
             val = max(0.0, min(val, max_allowed))
             result[f] = val
-            total += val
-        
+            # Mark double-counted factors as informational only
+            if f in DOUBLE_COUNTED:
+                result[f"{f}_excluded_from_total"] = True
+                result[f"{f}_excluded_reason"] = (
+                    "patent_cliff already modeled by LOE drop-off in DCF"
+                    if f == "patent_cliff" else
+                    "fda_history should adjust p_approval, not haircut NPV"
+                    if f == "fda_history" else
+                    "sec_short already amplified via sentiment adjustment in legacy NPV"
+                )
+            else:
+                total += val
+
         # Total cap
         result["total_discount"] = min(total, DEFAULT_RISK_WEIGHTS["total_cap"])
+        result["factors_in_total"] = [f for f in all_factors if f not in DOUBLE_COUNTED]
+        result["factors_informational_only"] = sorted(DOUBLE_COUNTED)
         result["error"] = None
         return result
     
@@ -193,9 +222,16 @@ def _quant_fallback(cash_runway_months: float, short_pct: float, insider_held: f
         result["sec_short"] = 0.05
         result["sec_short_rationale"] = f"Elevated short interest {short_pct:.0f}%"
     
-    total = sum(result[f] for f in ["litigation","fda_history","sec_short","insider_sell",
-                                     "going_concern","patent_cliff","governance"])
+    # METHODOLOGY AUDIT: see estimate_risk_factors() — exclude double-counted
+    # factors from total even in fallback path.
+    DOUBLE_COUNTED = {"patent_cliff", "fda_history", "sec_short"}
+    in_total = ["litigation", "insider_sell", "going_concern", "governance"]
+    total = sum(result[f] for f in in_total)
     result["total_discount"] = min(total, 0.70)
+    result["factors_in_total"] = in_total
+    result["factors_informational_only"] = sorted(DOUBLE_COUNTED)
+    for f in DOUBLE_COUNTED:
+        result[f"{f}_excluded_from_total"] = True
     return result
 
 

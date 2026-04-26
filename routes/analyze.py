@@ -56,7 +56,20 @@ class NPVRequest(BaseModel):
     catalyst_type: str = "FDA Decision"
     peak_sales_b: float = 3.0
     multiple: float = 3.5
-    p_commercial: float = 0.6
+    # Probability fields — IMPORTANT: these are different probabilities and
+    # should not be conflated. Names match the V2 economic model:
+    #   - p_approval        = P(catalyst event resolves favorably): for FDA Decision,
+    #                         P(approved | event occurs); for Phase 3, P(positive readout).
+    #                         Most analogous to BioMedTracker LBT score.
+    #   - p_commercial      = P(strong commercial uptake | favorable outcome):
+    #                         answers "even if it works, will it sell?"
+    # rNPV math: NPV × p_approval × p_commercial (separate haircuts).
+    p_approval: Optional[float] = None        # primary — preferred input
+    p_commercial: Optional[float] = None      # secondary — defaults to LLM econ_v2.commercial_success_prob
+    # DEPRECATED: legacy field that confused the two. If only p_commercial_legacy
+    # is supplied (e.g., older clients), it's treated as p_approval for backwards
+    # compatibility — but a deprecation warning is logged.
+    p_commercial_legacy: Optional[float] = None  # deprecated alias
     market_cap_m: float = 0.0
     cogs_pct: Optional[float] = 0.15
     opex_pct: Optional[float] = 0.25
@@ -150,7 +163,10 @@ async def analyze_npv(req: NPVRequest):
             "ticker": req.ticker, "catalyst_type": req.catalyst_type,
             "catalyst_date": catalyst_date, "drug_name": drug_name,
             "discount_rate": req.discount_rate, "tax_rate": req.tax_rate,
-            "cogs_pct": req.cogs_pct, "p_approval": req.p_commercial,
+            "cogs_pct": req.cogs_pct,
+            # Use the explicit names — separate cache entries per (p_approval, p_commercial) pair
+            "p_approval": req.p_approval if req.p_approval is not None else req.p_commercial_legacy,
+            "p_commercial": req.p_commercial,
             "time_to_peak_years": req.time_to_peak_years,
             "loe_dropoff_pct": None,  # filled after econ_v2
             # Methodology audit fields — different values MUST produce different cache keys
@@ -201,8 +217,39 @@ async def analyze_npv(req: NPVRequest):
         # ---- Step 3: compute legacy NPV envelope ----
         current_price = float(primary.get("current_price") or 50.0)
         baseline_price = get_baseline_price(req.ticker) or current_price
-        p_approval = req.p_commercial or float(primary.get("probability") or 0.5)
-        
+        # Resolve P(approval) — separate from P(commercial success).
+        #   1. explicit req.p_approval (preferred)
+        #   2. req.p_commercial_legacy (deprecated — emit warning)
+        #   3. catalyst_universe.confidence_score / probability
+        #   4. default 0.5
+        p_approval = None
+        if req.p_approval is not None:
+            p_approval = float(req.p_approval)
+        elif req.p_commercial_legacy is not None:
+            logger.warning(
+                f"NPVRequest using deprecated p_commercial_legacy={req.p_commercial_legacy} as p_approval. "
+                f"Update caller to use p_approval explicitly. ticker={req.ticker}"
+            )
+            p_approval = float(req.p_commercial_legacy)
+        else:
+            p_approval = float(primary.get("probability") or 0.5)
+        p_approval = max(0.0, min(1.0, p_approval))
+
+        # Resolve P(commercial success | approval) — separate from p_approval.
+        # Caller can override; otherwise inherit from V2 econ estimate.
+        p_commercial_resolved = None
+        if req.p_commercial is not None:
+            p_commercial_resolved = float(req.p_commercial)
+        elif econ_v2 and econ_v2.get("commercial_success_prob") is not None:
+            p_commercial_resolved = float(econ_v2["commercial_success_prob"])
+        else:
+            p_commercial_resolved = 0.6  # legacy default
+        p_commercial_resolved = max(0.0, min(1.0, p_commercial_resolved))
+        # If V2 econ has a value, propagate the resolved one back so downstream
+        # uses the user-overridden value (instead of the LLM estimate).
+        if isinstance(econ_v2, dict):
+            econ_v2["commercial_success_prob"] = p_commercial_resolved
+
         legacy_npv = compute_npv_estimate(
             ticker=req.ticker, current_price=current_price,
             market_cap_m=market_cap_m, p_approval=p_approval,
