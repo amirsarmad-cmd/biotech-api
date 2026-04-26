@@ -1334,3 +1334,82 @@ If you don't have high-confidence knowledge of {per_ticker} historical catalysts
     except Exception as e:
         logger.exception("seed_historical_catalysts failed")
         raise HTTPException(500, f"error: {e}")
+
+
+@router.get("/post-catalyst/seed-historical-diag")
+async def seed_historical_diag():
+    """Diagnostic: shows the candidate pool size at each stage of the seeder query."""
+    from services.database import BiotechDatabase
+    db = BiotechDatabase()
+    with db.get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(DISTINCT ticker) FROM catalyst_universe WHERE status='active'")
+        active = cur.fetchone()[0]
+        cur.execute("""
+            SELECT COUNT(DISTINCT cu.ticker)
+            FROM catalyst_universe cu
+            INNER JOIN screener_stocks ss ON ss.ticker = cu.ticker
+            WHERE cu.status = 'active'
+              AND ss.market_cap IS NOT NULL AND ss.market_cap > 0
+              AND COALESCE(ss.description, '') NOT LIKE 'yfinance backfill%%'
+              AND COALESCE(ss.description, '') NOT LIKE 'yfinance: no data%%'
+        """)
+        live = cur.fetchone()[0]
+        cur.execute("""
+            SELECT COUNT(DISTINCT ticker) FROM post_catalyst_outcomes
+            WHERE outcome IS NOT NULL AND outcome NOT IN ('unknown')
+        """)
+        seeded_or_marked = cur.fetchone()[0]
+        cur.execute("""
+            SELECT outcome, COUNT(*) FROM post_catalyst_outcomes
+            WHERE outcome IS NOT NULL
+            GROUP BY outcome ORDER BY 2 DESC
+        """)
+        by_outcome = {r[0]: r[1] for r in cur.fetchall()}
+        cur.execute("""
+            SELECT COUNT(*) FROM (
+                SELECT DISTINCT ON (cu.ticker) cu.ticker
+                FROM catalyst_universe cu
+                INNER JOIN screener_stocks ss ON ss.ticker = cu.ticker
+                WHERE cu.status = 'active'
+                  AND cu.ticker IS NOT NULL
+                  AND ss.market_cap IS NOT NULL AND ss.market_cap > 0
+                  AND COALESCE(ss.description, '') NOT LIKE 'yfinance backfill%%'
+                  AND COALESCE(ss.description, '') NOT LIKE 'yfinance: no data%%'
+                  AND cu.ticker NOT IN (
+                    SELECT DISTINCT ticker FROM post_catalyst_outcomes
+                    WHERE outcome IS NOT NULL AND outcome NOT IN ('unknown')
+                  )
+                ORDER BY cu.ticker, ss.market_cap DESC NULLS LAST
+            ) t
+        """)
+        candidate_pool = cur.fetchone()[0]
+        # Also: sample 5 candidates
+        cur.execute("""
+            SELECT t.ticker, t.market_cap FROM (
+                SELECT DISTINCT ON (cu.ticker) cu.ticker, ss.market_cap
+                FROM catalyst_universe cu
+                INNER JOIN screener_stocks ss ON ss.ticker = cu.ticker
+                WHERE cu.status = 'active'
+                  AND cu.ticker IS NOT NULL
+                  AND ss.market_cap IS NOT NULL AND ss.market_cap > 0
+                  AND COALESCE(ss.description, '') NOT LIKE 'yfinance backfill%%'
+                  AND COALESCE(ss.description, '') NOT LIKE 'yfinance: no data%%'
+                  AND cu.ticker NOT IN (
+                    SELECT DISTINCT ticker FROM post_catalyst_outcomes
+                    WHERE outcome IS NOT NULL AND outcome NOT IN ('unknown')
+                  )
+                ORDER BY cu.ticker, ss.market_cap DESC NULLS LAST
+            ) t
+            ORDER BY t.market_cap DESC
+            LIMIT 8
+        """)
+        sample = [{"ticker": r[0], "market_cap_m": float(r[1]) if r[1] else 0} for r in cur.fetchall()]
+    return {
+        "active_v2_tickers": active,
+        "live_tickers_in_screener": live,
+        "tickers_with_seeded_or_marked": seeded_or_marked,
+        "candidate_pool_remaining": candidate_pool,
+        "by_outcome_count": by_outcome,
+        "next_8_candidates": sample,
+    }
