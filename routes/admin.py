@@ -525,6 +525,8 @@ async def backfill_market_cap(
                 # Skip tickers we tried in the last 24h that came back $0 — likely
                 # delisted / acquired / inaccessible. We mark these by writing a
                 # marker row with description='yfinance: no data ...' and last_updated.
+                # NOTE: % must be escaped as %% in psycopg2 LIKE patterns when the
+                # query also has %s placeholders.
                 cur.execute("""
                     SELECT DISTINCT cu.ticker
                     FROM catalyst_universe cu
@@ -535,7 +537,7 @@ async def backfill_market_cap(
                       AND (
                         ss.last_updated IS NULL
                         OR ss.description IS NULL
-                        OR ss.description NOT LIKE 'yfinance: no data%'
+                        OR ss.description NOT LIKE 'yfinance: no data%%'
                         OR ss.last_updated < (NOW() - INTERVAL '24 hours')::text
                       )
                     ORDER BY cu.ticker
