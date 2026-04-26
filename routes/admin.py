@@ -1036,9 +1036,12 @@ def _refresh_news_counts(limit: int = 50) -> dict:
     Returns: {processed, updated, errors, sample_results}.
     """
     from services.database import BiotechDatabase
-    from services.fetcher import StockDataFetcher
+    from services.fetcher import BiotechDataFetcher
     db = BiotechDatabase()
-    fetcher = StockDataFetcher()
+    fetcher = BiotechDataFetcher(
+        finnhub_api_key=os.getenv("FINNHUB_API_KEY", ""),
+        newsapi_key=os.getenv("NEWSAPI_KEY", ""),
+    )
     
     # Pick tickers with stale or 0 news_count, prioritizing those with
     # near-term catalysts (next 90 days)
