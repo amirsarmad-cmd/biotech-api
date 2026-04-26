@@ -1192,7 +1192,9 @@ async def seed_historical_catalysts(
                       AND cu.ticker NOT IN (
                         SELECT DISTINCT ticker FROM post_catalyst_outcomes
                         WHERE outcome IS NOT NULL
-                          AND outcome NOT IN ('unknown')
+                          -- Exclude any ticker that has any non-null outcome row,
+                          -- including 'unknown' stubs (means yfinance already failed
+                          -- for this ticker — no point retrying every batch)
                       )
                     ORDER BY cu.ticker, ss.market_cap DESC NULLS LAST
                 ) t
@@ -1359,7 +1361,7 @@ async def seed_historical_diag():
         live = cur.fetchone()[0]
         cur.execute("""
             SELECT COUNT(DISTINCT ticker) FROM post_catalyst_outcomes
-            WHERE outcome IS NOT NULL AND outcome NOT IN ('unknown')
+            WHERE outcome IS NOT NULL
         """)
         seeded_or_marked = cur.fetchone()[0]
         cur.execute("""
@@ -1385,7 +1387,7 @@ async def seed_historical_diag():
                   )
                   AND cu.ticker NOT IN (
                     SELECT DISTINCT ticker FROM post_catalyst_outcomes
-                    WHERE outcome IS NOT NULL AND outcome NOT IN ('unknown')
+                    WHERE outcome IS NOT NULL
                   )
                 ORDER BY cu.ticker, ss.market_cap DESC NULLS LAST
             ) t
@@ -1409,7 +1411,7 @@ async def seed_historical_diag():
                   )
                   AND cu.ticker NOT IN (
                     SELECT DISTINCT ticker FROM post_catalyst_outcomes
-                    WHERE outcome IS NOT NULL AND outcome NOT IN ('unknown')
+                    WHERE outcome IS NOT NULL
                   )
                 ORDER BY cu.ticker, ss.market_cap DESC NULLS LAST
             ) t
