@@ -550,6 +550,7 @@ def backfill_one(catalyst: Dict) -> Dict:
                    actual_move_pct_30d = EXCLUDED.actual_move_pct_30d,
                    outcome = EXCLUDED.outcome,
                    outcome_confidence = EXCLUDED.outcome_confidence,
+                   outcome_source = EXCLUDED.outcome_source,
                    outcome_notes = EXCLUDED.outcome_notes,
                    error_abs_pct = EXCLUDED.error_abs_pct,
                    error_signed_pct = EXCLUDED.error_signed_pct,
