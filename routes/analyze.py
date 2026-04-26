@@ -68,6 +68,9 @@ class NPVRequest(BaseModel):
     force_refresh: bool = False  # bypass drug_economics_cache + catalyst_npv_cache
     drug_name_override: Optional[str] = None  # override heuristic drug-name extraction
     description_override: Optional[str] = None  # override description (useful when caller has more context)
+    # Capital structure (per-share NPV)
+    dilution_assumed_pct: Optional[float] = None  # 0-75, default 0 (no dilution)
+    shares_outstanding_m_override: Optional[float] = None  # if caller has authoritative count
 
 
 class NewsImpactRequest(BaseModel):
@@ -212,7 +215,26 @@ async def analyze_npv(req: NPVRequest):
             weights_override["tax_rate"] = req.tax_rate
         if req.cogs_pct is not None:
             weights_override["cogs_pct"] = req.cogs_pct
-        
+        if req.dilution_assumed_pct is not None:
+            weights_override["dilution_assumed_pct"] = req.dilution_assumed_pct
+
+        # Capture shares_outstanding for per-share NPV. Override > yfinance.
+        shares_outstanding_m = None
+        if req.shares_outstanding_m_override:
+            shares_outstanding_m = float(req.shares_outstanding_m_override)
+        else:
+            try:
+                import yfinance as yf
+                tkr_yf = yf.Ticker(req.ticker)
+                yfi = tkr_yf.info or {}
+                so = yfi.get("sharesOutstanding")
+                if so:
+                    shares_outstanding_m = float(so) / 1e6  # convert to millions
+            except Exception as e:
+                logger.info(f"shares_outstanding lookup failed for {req.ticker}: {e}")
+        if shares_outstanding_m and isinstance(econ_v2, dict):
+            econ_v2["shares_outstanding_m"] = shares_outstanding_m
+
         rnpv = compute_rnpv_full(
             econ_v2=econ_v2, p_approval=p_approval,
             market_cap_m=market_cap_m,

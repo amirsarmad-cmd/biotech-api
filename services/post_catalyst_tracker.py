@@ -569,11 +569,52 @@ def backfill_one(catalyst: Dict) -> Dict:
                 error_abs, error_signed, direction_correct,
             ))
             conn.commit()
+        
+        # Best-effort: capture options-implied move and shares outstanding for
+        # this catalyst window. These are written via a separate UPDATE so the
+        # main INSERT path stays simple. Failures here are non-fatal.
+        try:
+            from services.options_implied import get_implied_move_for_catalyst
+            implied = get_implied_move_for_catalyst(ticker, cat_date)
+            implied_pct = implied.get("implied_move_pct") if implied else None
+            implied_src = implied.get("source") if implied else None
+        except Exception as e:
+            logger.info(f"options_implied capture failed for {ticker}@{cat_date}: {e}")
+            implied_pct, implied_src = None, None
+        
+        # Shares outstanding at event — historical lookup via yfinance
+        shares_at_event = None
+        try:
+            import yfinance as yf
+            tkr = yf.Ticker(ticker)
+            info = tkr.info or {}
+            shares_at_event = info.get("sharesOutstanding")
+            if shares_at_event:
+                shares_at_event = float(shares_at_event)
+        except Exception:
+            shares_at_event = None
+        
+        if implied_pct is not None or shares_at_event is not None:
+            try:
+                with _db().get_conn() as conn:
+                    cur = conn.cursor()
+                    cur.execute("""
+                        UPDATE post_catalyst_outcomes
+                        SET options_implied_move_pct = COALESCE(%s, options_implied_move_pct),
+                            options_implied_move_source = COALESCE(%s, options_implied_move_source),
+                            shares_outstanding_at_event = COALESCE(%s, shares_outstanding_at_event)
+                        WHERE ticker = %s AND catalyst_type = %s AND catalyst_date = %s
+                    """, (implied_pct, implied_src, shares_at_event, ticker, cat_type, cat_date))
+                    conn.commit()
+            except Exception as e:
+                logger.info(f"options_implied UPDATE failed for {ticker}@{cat_date}: {e}")
+        
         return {
             "status": "created", "ticker": ticker, "date": cat_date,
             "outcome": outcome, "actual_1d_pct": round(move_1d, 2) if move_1d is not None else None,
             "predicted_pct": round(predicted_move, 2),
             "error_abs_pct": round(error_abs, 2) if error_abs is not None else None,
+            "options_implied_pct": round(implied_pct, 2) if implied_pct else None,
         }
     except Exception as e:
         logger.exception(f"backfill insert failed for {ticker}@{cat_date}: {e}")

@@ -387,6 +387,19 @@ async def get_stock_detail(ticker: str, with_npv: bool = Query(True)):
                 logger.warning(f"NPV compute failed for {ticker}: {e}")
                 npv_result = {"error": f"{type(e).__name__}: {str(e)[:200]}"}
 
+    # Options-implied move for the NPV catalyst (forward-looking market consensus).
+    # Best-effort: yfinance options chains aren't available for all tickers.
+    options_implied = None
+    try:
+        if npv_catalyst_summary and npv_catalyst_summary.get("date"):
+            from services.options_implied import get_implied_move_for_catalyst
+            options_implied = get_implied_move_for_catalyst(
+                ticker=ticker, catalyst_date=npv_catalyst_summary["date"]
+            )
+    except Exception as e:
+        logger.info(f"options_implied lookup failed for {ticker}: {e}")
+        options_implied = None
+
     return _to_jsonable({
         "ticker": ticker,
         "company_name": company_name,
@@ -403,6 +416,7 @@ async def get_stock_detail(ticker: str, with_npv: bool = Query(True)):
             "phase": primary.get("phase"),
         },
         "npv_catalyst": npv_catalyst_summary,
+        "options_implied": options_implied,
         "all_catalysts": [{
             "type": r.get("catalyst_type"),
             "date": r.get("catalyst_date"),

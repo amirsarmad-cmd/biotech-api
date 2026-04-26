@@ -324,6 +324,19 @@ def compute_npv_estimate(
         "sentiment_adj_factor": sentiment_adj_factor,
         "sentiment_notes": sentiment_notes,
         
+        # Methodology transparency — flags known overlaps the user should account for
+        "methodology_notes": [n for n in [
+            ("Short interest is used in TWO places: (a) sec_short risk_factor "
+             "discounts NPV; (b) high_short_amplifier multiplies post-event move size. "
+             "Both reflect the same underlying signal — for high-short tickers, the "
+             "displayed expected move may be amplified-then-discounted from the same input.")
+            if risk_factor_breakdown and (risk_factor_breakdown.get("sec_short", 0) or 0) > 0 else None,
+            ("Going concern flag captures financing risk. If you're using the per-share "
+             "NPV view with dilution_assumed_pct, the dilution penalty addresses the same "
+             "risk — choose ONE view to avoid double-discounting.")
+            if risk_factor_breakdown and (risk_factor_breakdown.get("going_concern", 0) or 0) > 0 else None,
+        ] if n],
+        
         # Metadata
         "ai_error": economics.get("error"),
         "first_in_class": economics.get("first_in_class", False),
@@ -625,6 +638,8 @@ If you genuinely don't know a field, set it to null. Don't fabricate. Schema:
   "loe_dropoff_pct": <number 0-1 — first-year revenue drop after LOE. 0.75 typical small-mol, 0.40 biologic>,
   "cogs_pct_estimate": <number 0-1 — COGS / revenue. small-mol: 0.10-0.15, biologic: 0.18-0.25, cell-gene: 0.35-0.50>,
   "commercial_success_prob": <number 0-1 — P(strong commercial uptake in THIS indication | approval). first-in-class unmet need: 0.75-0.90; me-too crowded: 0.30-0.55>,
+  "p_event_occurs": <number 0-1 — P(this catalyst event actually happens on the stated date — readout reported / PDUFA decision rendered / etc). For a confirmed PDUFA: 0.95+. For an "expected late 2026" trial readout: 0.6-0.8. NOT the probability of success — just timing certainty.>,
+  "p_positive_outcome": <number 0-1 — P(outcome is favorable | event occurs). For a Phase 3 readout in a well-validated MOA: 0.55-0.75. For a first-in-class novel target: 0.30-0.50. For a confirmatory Phase 3 with strong Phase 2: 0.65-0.80. This is what investors typically mean by "probability of approval".>,
   "competitors": [<list of named competitor drugs/companies in THIS indication, max 5>],
   "competitive_intensity": "<low | medium | high>",
   "key_risks": [<2-4 short risk bullets specific to this catalyst's outcome>],
@@ -945,8 +960,68 @@ def compute_rnpv_full(econ_v2: Dict, p_approval: float,
             })
 
         deterministic_npv_m = cumulative_npv
-        # rNPV = NPV × P(approval) × P(commercial | approval)
-        rnpv_m = deterministic_npv_m * p_approval * p_commercial
+        # rNPV with split probability (preferred): NPV × P(event) × P(positive | event) × P(commercial | positive)
+        # When LLM provided split fields, use them. Otherwise fall back to combined p_approval × p_commercial.
+        p_event_occurs = econ_v2.get("p_event_occurs")
+        p_positive_outcome = econ_v2.get("p_positive_outcome")
+        if p_event_occurs is not None and p_positive_outcome is not None:
+            try:
+                p_event_f = max(0.0, min(1.0, float(p_event_occurs)))
+                p_pos_f = max(0.0, min(1.0, float(p_positive_outcome)))
+                rnpv_m = deterministic_npv_m * p_event_f * p_pos_f * p_commercial
+                rnpv_method = "split_probability"
+            except (ValueError, TypeError):
+                rnpv_m = deterministic_npv_m * p_approval * p_commercial
+                rnpv_method = "combined_p_approval"
+        else:
+            rnpv_m = deterministic_npv_m * p_approval * p_commercial
+            rnpv_method = "combined_p_approval"
+
+        # ─── Bear/base/bull scenarios via penetration sensitivity ──────
+        # Critical: LLM economics are interpolative estimates, not point
+        # truth. Compute three scenarios so the UI can show a range.
+        # We re-compute peak_revenue + scale rnpv linearly with peak_revenue
+        # ratio (since the entire revenue curve is proportional to peak).
+        pen_min = float(econ_v2.get("penetration_min_pct") or pen_peak * 100 * 0.5) / 100.0
+        pen_max = float(econ_v2.get("penetration_max_pct") or pen_peak * 100 * 1.5) / 100.0
+        # Cap at sane bounds — LLM sometimes returns 0 or 100
+        pen_min = max(0.005, min(pen_peak, pen_min))
+        pen_max = max(pen_peak, min(0.95, pen_max))
+        scenarios = {
+            "bear": {
+                "rnpv_m": round(rnpv_m * (pen_min / pen_peak), 1) if pen_peak > 0 else 0.0,
+                "peak_sales_usd_b": round(pop_global * pen_min * price_avg / 1e9, 3),
+                "penetration_pct": round(pen_min * 100, 1),
+                "label": "Pessimistic — low market share",
+            },
+            "base": {
+                "rnpv_m": round(rnpv_m, 1),
+                "peak_sales_usd_b": round(peak_revenue_m / 1000.0, 3),
+                "penetration_pct": round(pen_peak * 100, 1),
+                "label": "Base case — LLM mid estimate",
+            },
+            "bull": {
+                "rnpv_m": round(rnpv_m * (pen_max / pen_peak), 1) if pen_peak > 0 else 0.0,
+                "peak_sales_usd_b": round(pop_global * pen_max * price_avg / 1e9, 3),
+                "penetration_pct": round(pen_max * 100, 1),
+                "label": "Optimistic — high market share",
+            },
+        }
+
+        # ─── Per-share NPV with optional dilution adjustment ───────────
+        # If shares_outstanding_m is provided in weights/econ_v2, compute
+        # per-share value of the rNPV. Optionally apply assumed dilution.
+        shares_outstanding_m = float(econ_v2.get("shares_outstanding_m") or 0.0)
+        dilution_assumed_pct = float(weights.get("dilution_assumed_pct", 0.0)) if weights else 0.0
+        dilution_assumed_pct = max(0.0, min(75.0, dilution_assumed_pct))
+        per_share_drug_npv = None
+        per_share_after_dilution = None
+        if shares_outstanding_m > 0:
+            per_share_drug_npv = (rnpv_m * 1e6) / (shares_outstanding_m * 1e6)
+            if dilution_assumed_pct > 0:
+                # New share count after dilution
+                new_shares_m = shares_outstanding_m * (1.0 + dilution_assumed_pct / 100.0)
+                per_share_after_dilution = (rnpv_m * 1e6) / (new_shares_m * 1e6)
 
         # Implied % move on stock = rnpv / market_cap
         fundamental_impact_pct = (rnpv_m / market_cap_m * 100.0) if market_cap_m > 0 else 0.0
@@ -956,6 +1031,11 @@ def compute_rnpv_full(econ_v2: Dict, p_approval: float,
             "deterministic_npv_m": round(deterministic_npv_m, 1),
             "peak_sales_usd_b": round(peak_revenue_m / 1000.0, 3),
             "fundamental_impact_pct": round(fundamental_impact_pct, 2),
+            "scenarios": scenarios,
+            "per_share_drug_npv_usd": round(per_share_drug_npv, 2) if per_share_drug_npv else None,
+            "per_share_after_dilution_usd": round(per_share_after_dilution, 2) if per_share_after_dilution else None,
+            "shares_outstanding_m": shares_outstanding_m if shares_outstanding_m else None,
+            "dilution_assumed_pct": dilution_assumed_pct if dilution_assumed_pct else None,
             "revenue_forecast": forecast,
             "assumptions_used": {
                 "addressable_population_global": pop_global,
@@ -970,9 +1050,18 @@ def compute_rnpv_full(econ_v2: Dict, p_approval: float,
                 "discount_rate": discount_rate,
                 "p_approval": p_approval,
                 "p_commercial": p_commercial,
+                "p_event_occurs": p_event_occurs,
+                "p_positive_outcome": p_positive_outcome,
+                "rnpv_method": rnpv_method,
                 "modality": econ_v2.get("modality", "?"),
                 "first_in_class": econ_v2.get("first_in_class", False),
             },
+            "caveats": [
+                "Drug economics (population, pricing, penetration) are LLM estimates anchored to public research, NOT proprietary biotech data",
+                "Per-share NPV is enterprise-level — does NOT reflect cash position, debt, or pipeline beyond this catalyst",
+                "Bear/base/bull scenarios scale linearly with peak penetration; real downside in failure cases is total loss",
+                "Discount rate, tax rate, and LOE drop-off use defaults — adjustable via NPV settings",
+            ],
             "error": None,
         }
     except Exception as e:
