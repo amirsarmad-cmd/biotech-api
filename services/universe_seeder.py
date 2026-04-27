@@ -1465,10 +1465,39 @@ def _call_gemini_extract(ticker: str, company_name: str) -> List[Dict]:
 
 
 def _canonicalize_drug(name: Optional[str]) -> Optional[str]:
-    """Lowercase + strip + collapse whitespace."""
+    """Normalize drug names so formatting variants collapse to one canonical string.
+
+    The LLM returns drug names in many formats:
+      'lonvoguran ziclumeran'
+      'lonvoguran ziclumeran (lonvo-z)'
+      'lonvoguran ziclumeran (lonvo-z, NTLA-2002)'
+      'Humira (adalimumab)'
+      'XOLAIR®'
+
+    Without normalization these create duplicate rows in catalyst_universe.
+
+    Steps:
+      1. Lowercase
+      2. Strip parenthetical content '(...)' (codes, alternate names)
+      3. Strip trademark / registered symbols ™ ® ©
+      4. Strip leading/trailing punctuation and whitespace
+      5. Collapse internal whitespace
+    """
     if not name:
         return None
-    return " ".join(name.lower().split())
+    import re as _re
+    s = name.lower()
+    # Strip parentheticals (everything between ( and ))
+    s = _re.sub(r'\s*\(.*?\)\s*', ' ', s)
+    # Strip square brackets (often used like '[NTLA-2002]')
+    s = _re.sub(r'\s*\[.*?\]\s*', ' ', s)
+    # Strip trademark/copyright symbols
+    s = _re.sub(r'[™®©℠]', '', s)
+    # Strip trailing/leading punctuation
+    s = s.strip(' .,;:-_')
+    # Collapse whitespace
+    s = " ".join(s.split())
+    return s if s else None
 
 
 # ────────────────────────────────────────────────────────────
