@@ -2284,3 +2284,130 @@ async def sec_capital_structure(ticker: str):
     except Exception as e:
         logger.exception("sec capital_structure failed")
         raise HTTPException(500, f"sec_capital_structure error: {e}")
+
+
+@router.post("/post-catalyst/recompute-abnormal")
+async def recompute_abnormal(max_rows: int = 100):
+    """Backfill sector_move + abnormal_move columns on existing post_catalyst
+    outcomes that don't yet have them. Per ChatGPT critique #4: 'Compare
+    stock_move - XBI_move (sector basket), not raw stock move.'
+
+    Uses XBI as the default basket (small-cap weighted, closer to our universe).
+    Updates rows where any abnormal_move_pct_* is NULL.
+    """
+    try:
+        from services.post_catalyst_tracker import _compute_sector_moves
+        from services.database import BiotechDatabase
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT id, ticker, catalyst_type, catalyst_date,
+                       actual_move_pct_1d, actual_move_pct_7d, actual_move_pct_30d
+                FROM post_catalyst_outcomes
+                WHERE catalyst_date IS NOT NULL
+                  AND (abnormal_move_pct_30d IS NULL
+                       OR abnormal_move_pct_1d IS NULL)
+                ORDER BY catalyst_date DESC
+                LIMIT %s
+            """, (max_rows,))
+            rows = cur.fetchall()
+
+        results = {"attempted": 0, "succeeded": 0, "no_sector_data": 0, "errors": []}
+        for r in rows:
+            outcome_id, ticker, cat_type, cat_date, m1, m7, m30 = r
+            results["attempted"] += 1
+            try:
+                cat_str = cat_date.strftime("%Y-%m-%d") if hasattr(cat_date, "strftime") else str(cat_date)[:10]
+                sector_moves = _compute_sector_moves(cat_str, basket="XBI")
+                if not sector_moves:
+                    results["no_sector_data"] += 1
+                    continue
+                s1 = sector_moves.get("day1_pct")
+                s7 = sector_moves.get("day7_pct")
+                s30 = sector_moves.get("day30_pct")
+                ab1 = float(m1) - s1 if (m1 is not None and s1 is not None) else None
+                ab7 = float(m7) - s7 if (m7 is not None and s7 is not None) else None
+                ab30 = float(m30) - s30 if (m30 is not None and s30 is not None) else None
+                with db.get_conn() as conn:
+                    cur = conn.cursor()
+                    cur.execute("""
+                        UPDATE post_catalyst_outcomes
+                        SET sector_basket = 'XBI',
+                            sector_move_pct_1d = %s,
+                            sector_move_pct_7d = %s,
+                            sector_move_pct_30d = %s,
+                            abnormal_move_pct_1d = %s,
+                            abnormal_move_pct_7d = %s,
+                            abnormal_move_pct_30d = %s
+                        WHERE id = %s
+                    """, (s1, s7, s30, ab1, ab7, ab30, outcome_id))
+                    conn.commit()
+                results["succeeded"] += 1
+            except Exception as e:
+                if len(results["errors"]) < 10:
+                    results["errors"].append({"id": outcome_id, "ticker": ticker, "error": str(e)[:80]})
+        return results
+    except Exception as e:
+        logger.exception("recompute_abnormal failed")
+        raise HTTPException(500, f"recompute_abnormal error: {e}")
+
+
+@router.get("/post-catalyst/move-stats-abnormal")
+async def move_stats_abnormal():
+    """Aggregate accuracy stats keyed on ABNORMAL returns (stock - XBI).
+    
+    Compares against the existing /move-stats endpoint which uses raw moves
+    so we can show the accuracy difference. Per ChatGPT critique: alpha
+    accuracy is the right metric, not raw-return accuracy.
+    """
+    try:
+        from services.database import BiotechDatabase
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            # Stats by catalyst type + outcome on abnormal returns
+            cur.execute("""
+                SELECT catalyst_type, outcome, count(*),
+                       avg(abnormal_move_pct_1d)::numeric(10,2)  avg_ab_1d,
+                       avg(abnormal_move_pct_30d)::numeric(10,2) avg_ab_30d,
+                       avg(actual_move_pct_30d)::numeric(10,2)   avg_raw_30d,
+                       avg(sector_move_pct_30d)::numeric(10,2)   avg_sector_30d
+                FROM post_catalyst_outcomes
+                WHERE outcome IN ('approved','rejected','positive','negative','beat','miss')
+                  AND abnormal_move_pct_30d IS NOT NULL
+                GROUP BY catalyst_type, outcome
+                ORDER BY catalyst_type, outcome
+            """)
+            by_type_outcome = [
+                {"catalyst_type": r[0], "outcome": r[1], "n": r[2],
+                 "avg_abnormal_1d": float(r[3]) if r[3] else None,
+                 "avg_abnormal_30d": float(r[4]) if r[4] else None,
+                 "avg_raw_30d": float(r[5]) if r[5] else None,
+                 "avg_sector_30d": float(r[6]) if r[6] else None}
+                for r in cur.fetchall()
+            ]
+            # Coverage stats
+            cur.execute("""
+                SELECT count(*) total,
+                       count(abnormal_move_pct_30d) with_abnormal,
+                       count(sector_move_pct_30d) with_sector
+                FROM post_catalyst_outcomes
+            """)
+            cov = cur.fetchone()
+            return {
+                "coverage": {
+                    "total_outcomes": cov[0],
+                    "with_abnormal_returns": cov[1],
+                    "abnormal_coverage_pct": round(100.0 * cov[1] / cov[0], 1) if cov[0] else 0,
+                },
+                "by_catalyst_outcome": by_type_outcome,
+                "interpretation": (
+                    "abnormal = stock_move - sector_move (XBI). Positive abnormal "
+                    "for 'approved' outcomes = real catalyst alpha. Compare to "
+                    "avg_raw_30d to see how much was sector drift."
+                ),
+            }
+    except Exception as e:
+        logger.exception("move_stats_abnormal failed")
+        raise HTTPException(500, f"move_stats_abnormal error: {e}")

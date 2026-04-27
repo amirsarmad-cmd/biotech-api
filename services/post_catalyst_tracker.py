@@ -298,6 +298,100 @@ def get_aggregate_accuracy(min_outcomes: int = 10) -> Dict:
 # Price fetching (yfinance)
 # ============================================================
 
+# ============================================================
+# Sector basket pricing (for abnormal return computation)
+# ============================================================
+
+# Sector baskets we support. XBI = SPDR S&P Biotech (small-cap weighted),
+# IBB = iShares Nasdaq Biotech (large-cap weighted). XBI is closer to the
+# typical small-cap biotech in our universe.
+SECTOR_BASKETS = ("XBI", "IBB")
+
+
+def _fetch_sector_basket_window(basket: str, catalyst_date_str: str) -> Optional[Dict]:
+    """Fetch sector ETF prices over the same window as a catalyst.
+    Cached in module-level dict (per-process) so we don't re-fetch XBI for
+    every catalyst on the same day.
+    """
+    cache_key = f"{basket}:{catalyst_date_str[:10]}"
+    if cache_key in _sector_cache:
+        return _sector_cache[cache_key]
+    try:
+        import yfinance as yf
+        from datetime import datetime as _dt
+        cdt = _dt.strptime(catalyst_date_str[:10], "%Y-%m-%d").date()
+        start = cdt - timedelta(days=10)
+        end = cdt + timedelta(days=45)
+        today = date.today()
+        if end > today:
+            end = today
+        t = yf.Ticker(basket)
+        hist = t.history(start=start.isoformat(),
+                         end=(end + timedelta(days=1)).isoformat(),
+                         auto_adjust=True)
+        if hist is None or hist.empty:
+            _sector_cache[cache_key] = None
+            return None
+        hist.index = hist.index.tz_localize(None) if hist.index.tz else hist.index
+        rows_by_date = {dt.date(): float(row["Close"]) for dt, row in hist.iterrows()}
+        out = {"prices_by_date": rows_by_date,
+               "sorted_dates": sorted(rows_by_date.keys()),
+               "basket": basket}
+        _sector_cache[cache_key] = out
+        return out
+    except Exception as e:
+        logger.info(f"sector basket fetch failed for {basket}@{catalyst_date_str}: {e}")
+        _sector_cache[cache_key] = None
+        return None
+
+
+_sector_cache: Dict = {}
+
+
+def _compute_sector_moves(catalyst_date_str: str, basket: str = "XBI"
+                           ) -> Optional[Dict]:
+    """Get sector ETF pre-event price + day1/day7/day30 prices and compute %
+    moves over the same windows used for the stock.
+
+    Returns:
+      {"basket": "XBI", "pre": float, "day1_pct": float, "day7_pct": float,
+       "day30_pct": float}
+    """
+    sw = _fetch_sector_basket_window(basket, catalyst_date_str)
+    if not sw:
+        return None
+    from datetime import datetime as _dt
+    cdt = _dt.strptime(catalyst_date_str[:10], "%Y-%m-%d").date()
+    sorted_dates = sw["sorted_dates"]
+    prices = sw["prices_by_date"]
+
+    def _on_or_before(target):
+        candidates = [d for d in sorted_dates if d <= target]
+        return candidates[-1] if candidates else None
+    def _on_or_after(target):
+        candidates = [d for d in sorted_dates if d >= target]
+        return candidates[0] if candidates else None
+
+    pre_d = _on_or_before(cdt - timedelta(days=1))
+    day0_d = _on_or_after(cdt)
+    day1_d = _on_or_after(cdt + timedelta(days=1))
+    if day1_d == day0_d and day0_d:
+        following = [d for d in sorted_dates if d > day0_d]
+        day1_d = following[0] if following else None
+    day7_d = _on_or_after(cdt + timedelta(days=7))
+    day30_d = _on_or_after(cdt + timedelta(days=30))
+
+    pre = prices.get(pre_d) if pre_d else None
+    if not pre:
+        return None
+    out = {"basket": basket, "pre": pre,
+           "day1_pct": None, "day7_pct": None, "day30_pct": None}
+    for label, d in [("day1_pct", day1_d), ("day7_pct", day7_d), ("day30_pct", day30_d)]:
+        if d and prices.get(d):
+            out[label] = (prices[d] - pre) / pre * 100.0
+    return out
+
+
 def _fetch_price_window(ticker: str, catalyst_date_str: str) -> Optional[Dict]:
     """Fetch price history covering pre_event (~5 trading days before) through
     day30 post-catalyst. Returns dict with parsed prices or None on failure.
@@ -631,6 +725,19 @@ def backfill_one(catalyst: Dict) -> Dict:
                 logger.info(f"[post-catalyst] LLM override for {ticker}@{cat_date}: "
                             f"price-action='{outcome}' → LLM='{llm_outcome}' conf={llm_confidence:.2f}")
 
+    # ─── Abnormal return computation (Critique fix #4) ─────────────────
+    # Raw stock move conflates catalyst-driven move with sector drift.
+    # Compute (stock_move - sector_basket_move) so a +5% biotech move on a
+    # +5% XBI day = 0% alpha (correctly attributed to market, not catalyst).
+    sector_basket = "XBI"  # SPDR S&P Biotech — small-cap weighted, closer to our universe
+    sector_moves = _compute_sector_moves(cat_date, basket=sector_basket)
+    sector_1d = (sector_moves or {}).get("day1_pct")
+    sector_7d = (sector_moves or {}).get("day7_pct")
+    sector_30d = (sector_moves or {}).get("day30_pct")
+    abnormal_1d = (move_1d - sector_1d) if (move_1d is not None and sector_1d is not None) else None
+    abnormal_7d = (move_7d - sector_7d) if (move_7d is not None and sector_7d is not None) else None
+    abnormal_30d = (move_30d - sector_30d) if (move_30d is not None and sector_30d is not None) else None
+
     # Predicted: confidence_score from catalyst_universe (probability), plus reference move
     predicted_prob = catalyst.get("confidence_score")
 
@@ -639,13 +746,20 @@ def backfill_one(catalyst: Dict) -> Dict:
     p = float(predicted_prob) if predicted_prob is not None else 0.5
     predicted_move = p * up + (1 - p) * down
 
-    # Error metrics (vs 30d move, falling back to 1d)
-    actual_for_error = move_30d if move_30d is not None else move_1d
+    # Error metrics — NOW USE ABNORMAL RETURNS as primary, fall back to raw.
+    # The reference move table itself was calibrated against raw moves
+    # historically, but going forward abnormal is the correct metric for
+    # alpha attribution. We track BOTH so we can compare.
+    actual_for_error = abnormal_30d if abnormal_30d is not None else (
+        abnormal_1d if abnormal_1d is not None else (
+            move_30d if move_30d is not None else move_1d
+        )
+    )
     error_abs = abs(predicted_move - actual_for_error) if actual_for_error is not None else None
     error_signed = (predicted_move - actual_for_error) if actual_for_error is not None else None
     direction_correct = None
     if actual_for_error is not None:
-        # Sign of predicted vs actual
+        # Sign of predicted vs actual abnormal move
         direction_correct = (predicted_move > 0 and actual_for_error > 0) or \
                             (predicted_move < 0 and actual_for_error < 0) or \
                             (abs(predicted_move) < 1 and abs(actual_for_error) < 5)
@@ -708,6 +822,31 @@ def backfill_one(catalyst: Dict) -> Dict:
                 error_abs, error_signed, direction_correct,
             ))
             conn.commit()
+
+        # Best-effort: write sector + abnormal returns via separate UPDATE
+        # (separate so main INSERT path stays simple and we can re-run for
+        # rows backfilled before alembic 008 was applied).
+        if any(v is not None for v in (sector_1d, sector_7d, sector_30d,
+                                        abnormal_1d, abnormal_7d, abnormal_30d)):
+            try:
+                with _db().get_conn() as conn:
+                    cur = conn.cursor()
+                    cur.execute("""
+                        UPDATE post_catalyst_outcomes
+                        SET sector_basket = %s,
+                            sector_move_pct_1d = %s,
+                            sector_move_pct_7d = %s,
+                            sector_move_pct_30d = %s,
+                            abnormal_move_pct_1d = %s,
+                            abnormal_move_pct_7d = %s,
+                            abnormal_move_pct_30d = %s
+                        WHERE ticker = %s AND catalyst_type = %s AND catalyst_date = %s
+                    """, (sector_basket, sector_1d, sector_7d, sector_30d,
+                          abnormal_1d, abnormal_7d, abnormal_30d,
+                          ticker, cat_type, cat_date))
+                    conn.commit()
+            except Exception as e:
+                logger.info(f"abnormal returns UPDATE failed for {ticker}@{cat_date}: {e}")
         
         # Best-effort: capture options-implied move and shares outstanding for
         # this catalyst window. These are written via a separate UPDATE so the
