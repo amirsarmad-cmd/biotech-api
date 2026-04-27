@@ -3,7 +3,7 @@
 """
 import logging, os, json
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Dict
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
@@ -3181,3 +3181,308 @@ async def alembic_preflight():
     except Exception as e:
         logger.exception("alembic_preflight failed")
         raise HTTPException(500, f"alembic_preflight error: {e}")
+
+
+# ────────────────────────────────────────────────────────────
+# Backtest abstention layer (migration 012)
+# ────────────────────────────────────────────────────────────
+# After ChatGPT critique that 52.5% direction accuracy across all 358
+# catalysts is meaningless: 'chasing 70% across all events is overfitting,
+# the right target is 70% on tradeable subset with abstention.'
+
+@router.post("/post-catalyst/apply-migration-012")
+async def apply_migration_012():
+    """One-shot for migration 012 — abstention layer + 3-day actuals.
+    Idempotent. Run if the Dockerfile-startup alembic upgrade swallowed
+    the migration silently (same failure mode that bit 011)."""
+    try:
+        from services.database import BiotechDatabase
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                ALTER TABLE post_catalyst_outcomes
+                ADD COLUMN IF NOT EXISTS actual_move_pct_3d NUMERIC,
+                ADD COLUMN IF NOT EXISTS abnormal_move_pct_3d NUMERIC,
+                ADD COLUMN IF NOT EXISTS sector_move_pct_3d NUMERIC,
+                ADD COLUMN IF NOT EXISTS day3_price NUMERIC,
+                ADD COLUMN IF NOT EXISTS trade_signal TEXT,
+                ADD COLUMN IF NOT EXISTS tradeable BOOLEAN DEFAULT FALSE,
+                ADD COLUMN IF NOT EXISTS error_abs_abnormal_3d_pct NUMERIC,
+                ADD COLUMN IF NOT EXISTS direction_correct_3d BOOLEAN
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_pco_tradeable
+                ON post_catalyst_outcomes(tradeable, trade_signal)
+                WHERE tradeable = TRUE
+            """)
+            cur.execute("""
+                UPDATE alembic_version_biotech
+                SET version_num = '012_abstention_layer'
+                WHERE version_num = '011_manual_override'
+            """)
+            stamped = cur.rowcount
+            cur.execute("SELECT version_num FROM alembic_version_biotech")
+            new_v = cur.fetchone()[0]
+            conn.commit()
+        return {"success": True, "new_alembic_version": new_v, "stamped_rows": stamped}
+    except Exception as e:
+        logger.exception("apply_migration_012 failed")
+        raise HTTPException(500, f"apply_migration_012 error: {e}")
+
+
+@router.post("/post-catalyst/backfill-3d-and-signals")
+async def backfill_3d_and_signals(max_rows: int = 100, only_compute_signals: bool = False):
+    """Two-phase backfill:
+
+    Phase A (only_compute_signals=False, default):
+      For up to max_rows post_catalyst_outcomes rows missing actual_move_pct_3d:
+        1. Re-fetch the price window via _fetch_price_window (yfinance + Polygon
+           fallback). Now also picks day3 + day3 sector basket.
+        2. Compute actual_move_pct_3d, sector_move_pct_3d, abnormal_move_pct_3d.
+        3. Persist day3_price, day3 moves, abnormal_3d, error metrics.
+
+    Phase B (always runs after phase A):
+      For ALL rows: classify trade_signal via services.catalyst_signal.
+      Computes direction_correct_3d using sign(predicted) vs sign(abnormal_3d).
+      Sets tradeable = (signal in LONG/SHORT).
+      Sets error_abs_abnormal_3d_pct = |predicted - abnormal_3d| where data exists.
+
+    Pass only_compute_signals=True to skip phase A (useful when you've
+    already filled the 3d columns and just want to re-classify after
+    tweaking signal thresholds).
+
+    Returns: {phase_a_processed, phase_a_succeeded, phase_b_classified,
+              tradeable_count, signal_distribution}
+    """
+    try:
+        from services.database import BiotechDatabase
+        from services.post_catalyst_tracker import (
+            _fetch_price_window, _compute_sector_moves,
+        )
+        from services.catalyst_signal import classify_trade_signal, is_tradeable
+        db = BiotechDatabase()
+        results = {
+            "phase_a_processed": 0,
+            "phase_a_succeeded": 0,
+            "phase_a_skipped_no_window": 0,
+            "phase_b_classified": 0,
+            "tradeable_count": 0,
+            "signal_distribution": {},
+            "errors": [],
+        }
+
+        # ── Phase A: backfill 3d actuals ──────────────────────────────
+        if not only_compute_signals:
+            with db.get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute("""
+                    SELECT id, ticker, catalyst_date, pre_event_price
+                    FROM post_catalyst_outcomes
+                    WHERE actual_move_pct_3d IS NULL
+                      AND catalyst_date IS NOT NULL
+                      AND pre_event_price IS NOT NULL
+                      AND (last_error IS NULL OR last_error NOT LIKE %s)
+                    ORDER BY catalyst_date DESC
+                    LIMIT %s
+                """, ('no_data:%', max_rows))
+                rows = cur.fetchall()
+
+            for outcome_id, ticker, cat_date, pre_event_price in rows:
+                results["phase_a_processed"] += 1
+                try:
+                    cat_str = cat_date.strftime("%Y-%m-%d") if hasattr(cat_date, "strftime") else str(cat_date)[:10]
+                    pw = _fetch_price_window(ticker, cat_str)
+                    if not pw or not pw.get("_data_present"):
+                        results["phase_a_skipped_no_window"] += 1
+                        continue
+                    day3_price = pw.get("day3_price")
+                    pre = float(pre_event_price)
+                    move_3d = ((day3_price - pre) / pre * 100.0) if (day3_price and pre) else None
+                    # Sector moves at 3d
+                    sector_moves = _compute_sector_moves(cat_str, basket="XBI") or {}
+                    sector_3d = sector_moves.get("day3_pct")
+                    abnormal_3d = (
+                        float(move_3d) - float(sector_3d)
+                        if move_3d is not None and sector_3d is not None else None
+                    )
+                    with db.get_conn() as conn:
+                        cur = conn.cursor()
+                        cur.execute("""
+                            UPDATE post_catalyst_outcomes
+                            SET day3_price = %s,
+                                actual_move_pct_3d = %s,
+                                sector_move_pct_3d = %s,
+                                abnormal_move_pct_3d = %s
+                            WHERE id = %s
+                        """, (day3_price, move_3d, sector_3d, abnormal_3d, outcome_id))
+                        conn.commit()
+                    results["phase_a_succeeded"] += 1
+                except Exception as e:
+                    if len(results["errors"]) < 10:
+                        results["errors"].append({"id": outcome_id, "ticker": ticker, "phase": "A", "error": str(e)[:100]})
+
+        # ── Phase B: classify signals (always runs) ──────────────────
+        # Pull every row with a predicted_move_pct, classify, persist.
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT pco.id, pco.ticker, pco.catalyst_type, pco.catalyst_date,
+                       pco.predicted_move_pct, pco.abnormal_move_pct_3d,
+                       cu.confidence_score, cu.date_precision
+                FROM post_catalyst_outcomes pco
+                LEFT JOIN catalyst_universe cu
+                  ON cu.ticker = pco.ticker
+                 AND cu.catalyst_type = pco.catalyst_type
+                 AND cu.catalyst_date::text = pco.catalyst_date::text
+                 AND cu.status = 'active'
+                WHERE pco.predicted_move_pct IS NOT NULL
+            """)
+            rows = cur.fetchall()
+
+        sig_dist: Dict[str, int] = {}
+        tradeable_n = 0
+        for outcome_id, ticker, cat_type, cat_date, pred, abnormal_3d, conf, dprec in rows:
+            try:
+                # Options-implied move from the cached options table is not
+                # always populated for historical rows. We compute the signal
+                # WITHOUT the options check for historical rows (passing None
+                # disables that gate). This is conservative — we keep slightly
+                # more rows in the tradeable set than strict scoring would.
+                signal = classify_trade_signal(
+                    predicted_move_pct=float(pred) if pred is not None else None,
+                    confidence_score=float(conf) if conf is not None else None,
+                    catalyst_type=cat_type,
+                    date_precision=dprec,
+                    options_implied_move_pct=None,  # historical rows lack live options
+                )
+                tradeable_flag = is_tradeable(signal)
+                # Direction correctness on 3d abnormal target
+                dir_correct_3d = None
+                err_3d = None
+                if abnormal_3d is not None and pred is not None:
+                    err_3d = abs(float(abnormal_3d) - float(pred))
+                    if tradeable_flag:
+                        dir_correct_3d = (
+                            (float(pred) > 0 and float(abnormal_3d) > 0)
+                            or (float(pred) < 0 and float(abnormal_3d) < 0)
+                        )
+                with db.get_conn() as conn:
+                    cur = conn.cursor()
+                    cur.execute("""
+                        UPDATE post_catalyst_outcomes
+                        SET trade_signal = %s,
+                            tradeable = %s,
+                            direction_correct_3d = %s,
+                            error_abs_abnormal_3d_pct = %s
+                        WHERE id = %s
+                    """, (signal, tradeable_flag, dir_correct_3d, err_3d, outcome_id))
+                    conn.commit()
+                results["phase_b_classified"] += 1
+                sig_dist[signal] = sig_dist.get(signal, 0) + 1
+                if tradeable_flag:
+                    tradeable_n += 1
+            except Exception as e:
+                if len(results["errors"]) < 10:
+                    results["errors"].append({"id": outcome_id, "ticker": ticker, "phase": "B", "error": str(e)[:100]})
+
+        results["signal_distribution"] = sig_dist
+        results["tradeable_count"] = tradeable_n
+        return results
+    except Exception as e:
+        logger.exception("backfill_3d_and_signals failed")
+        raise HTTPException(500, f"backfill_3d_and_signals error: {e}")
+
+
+@router.get("/post-catalyst/aggregate-v2")
+async def post_catalyst_aggregate_v2():
+    """Three-tier accuracy breakdown that addresses the user's pushback
+    on the broken single 52.5% number:
+
+      all_events      — the noise floor across 358 rows. Direction on raw 30D.
+      tradeable_events — high-confidence subset (LONG/SHORT signals only).
+                          Direction on 3D abnormal-vs-XBI. The number that matters.
+      no_trade_events — subset by abstention reason. Lets you see WHY the
+                          system is selective.
+
+    A useful screener should target:
+      tradeable direction ≥ 65-70%, coverage 25-40%.
+    """
+    try:
+        from services.database import BiotechDatabase
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            # All-event metrics (legacy 30D-raw target)
+            cur.execute("""
+                SELECT
+                    COUNT(*) AS total,
+                    COUNT(*) FILTER (WHERE direction_correct) AS direction_hits,
+                    AVG(error_abs_pct) AS avg_abs_error_raw_30d
+                FROM post_catalyst_outcomes
+                WHERE actual_move_pct_30d IS NOT NULL
+                  AND predicted_move_pct IS NOT NULL
+            """)
+            r = cur.fetchone()
+            total_all = r[0] or 0
+            hits_all = r[1] or 0
+            avg_err_30d = float(r[2]) if r[2] is not None else None
+
+            # Tradeable-event metrics (3D abnormal-vs-XBI target)
+            cur.execute("""
+                SELECT
+                    COUNT(*) AS total,
+                    COUNT(*) FILTER (WHERE direction_correct_3d) AS direction_hits_3d,
+                    AVG(error_abs_abnormal_3d_pct) AS avg_abs_error_abnormal_3d,
+                    COUNT(*) FILTER (WHERE abnormal_move_pct_3d IS NOT NULL) AS with_3d_data
+                FROM post_catalyst_outcomes
+                WHERE tradeable = TRUE
+            """)
+            r = cur.fetchone()
+            total_tradeable = r[0] or 0
+            hits_tradeable = r[1] or 0
+            avg_err_abnormal_3d = float(r[2]) if r[2] is not None else None
+            with_3d = r[3] or 0
+
+            # Signal distribution across all rows
+            cur.execute("""
+                SELECT trade_signal, COUNT(*) AS n
+                FROM post_catalyst_outcomes
+                WHERE trade_signal IS NOT NULL
+                GROUP BY 1
+                ORDER BY n DESC
+            """)
+            distribution = [{"signal": r[0], "count": r[1]} for r in cur.fetchall()]
+
+        return {
+            "all_events": {
+                "count": total_all,
+                "direction_hits": hits_all,
+                "direction_accuracy_pct": (
+                    round(100.0 * hits_all / total_all, 1) if total_all > 0 else None
+                ),
+                "avg_abs_error_pct": round(avg_err_30d, 1) if avg_err_30d is not None else None,
+                "_target": "raw 30D move (noisy — sector + macro contaminated)",
+            },
+            "tradeable_events": {
+                "count": total_tradeable,
+                "direction_hits": hits_tradeable,
+                "with_3d_data": with_3d,
+                "direction_accuracy_pct": (
+                    round(100.0 * hits_tradeable / total_tradeable, 1) if total_tradeable > 0 else None
+                ),
+                "coverage_pct": (
+                    round(100.0 * total_tradeable / total_all, 1) if total_all > 0 else None
+                ),
+                "avg_abs_error_pct": round(avg_err_abnormal_3d, 1) if avg_err_abnormal_3d is not None else None,
+                "_target": "3D abnormal return vs XBI (sector-adjusted)",
+            },
+            "signal_distribution": distribution,
+            "interpretation": {
+                "noise_floor": "all_events.direction_accuracy ~50% is biotech baseline",
+                "actionable_target": "tradeable_events.direction_accuracy ≥ 65-70% with coverage 25-40%",
+            },
+        }
+    except Exception as e:
+        logger.exception("aggregate_v2 failed")
+        raise HTTPException(500, f"aggregate_v2 error: {e}")

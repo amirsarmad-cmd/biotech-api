@@ -393,6 +393,7 @@ def _compute_sector_moves(catalyst_date_str: str, basket: str = "XBI"
     if day1_d == day0_d and day0_d:
         following = [d for d in sorted_dates if d > day0_d]
         day1_d = following[0] if following else None
+    day3_d = _on_or_after(cdt + timedelta(days=3))
     day7_d = _on_or_after(cdt + timedelta(days=7))
     day30_d = _on_or_after(cdt + timedelta(days=30))
 
@@ -400,8 +401,8 @@ def _compute_sector_moves(catalyst_date_str: str, basket: str = "XBI"
     if not pre:
         return None
     out = {"basket": basket, "pre": pre,
-           "day1_pct": None, "day7_pct": None, "day30_pct": None}
-    for label, d in [("day1_pct", day1_d), ("day7_pct", day7_d), ("day30_pct", day30_d)]:
+           "day1_pct": None, "day3_pct": None, "day7_pct": None, "day30_pct": None}
+    for label, d in [("day1_pct", day1_d), ("day3_pct", day3_d), ("day7_pct", day7_d), ("day30_pct", day30_d)]:
         if d and prices.get(d):
             out[label] = (prices[d] - pre) / pre * 100.0
     return out
@@ -466,6 +467,7 @@ def _fetch_price_window_polygon(ticker: str, catalyst_date_str: str) -> Optional
         if day1_d == day0_d and day0_d:
             following = [d for d in sorted_dates if d > day0_d]
             day1_d = following[0] if following else None
+        day3_d = _on_or_after(cdt + timedelta(days=3))
         day7_d = _on_or_after(cdt + timedelta(days=7))
         day30_d = _on_or_after(cdt + timedelta(days=30))
 
@@ -488,6 +490,7 @@ def _fetch_price_window_polygon(ticker: str, catalyst_date_str: str) -> Optional
             "pre_event_price": pre_event_price,
             "day0_price": day0_price,
             "day1_price": _close(day1_d),
+            "day3_price": _close(day3_d),
             "day7_price": _close(day7_d),
             "day30_price": _close(day30_d),
             "preevent_avg_volume_30d": avg_pre_vol,
@@ -575,6 +578,11 @@ def _fetch_price_window_yfinance(ticker: str, catalyst_date_str: str) -> Optiona
             day1_d = following[0] if following else None
         # Day7: ~5 trading days after day0 → ~7 calendar
         day7_d = _on_or_after(cdt + timedelta(days=7))
+        # Day3: ~2-3 trading days after day0 → ~3 calendar. Filling the
+        # gap between 1d and 7d so we have the canonical
+        # 3-day catalyst window (per backtest critique: "3D abnormal
+        # is the right target, 30D raw is too noisy").
+        day3_d = _on_or_after(cdt + timedelta(days=3))
         # Day30: ~22 trading days after day0 → ~30 calendar
         day30_d = _on_or_after(cdt + timedelta(days=30))
 
@@ -587,6 +595,7 @@ def _fetch_price_window_yfinance(ticker: str, catalyst_date_str: str) -> Optiona
         pre_event_price = _close(pre_event_d)
         day0_price = _close(day0_d)
         day1_price = _close(day1_d)
+        day3_price = _close(day3_d)
         day7_price = _close(day7_d)
         day30_price = _close(day30_d)
 
@@ -603,6 +612,7 @@ def _fetch_price_window_yfinance(ticker: str, catalyst_date_str: str) -> Optiona
             "pre_event_price": pre_event_price,
             "day0_price": day0_price,
             "day1_price": day1_price,
+            "day3_price": day3_price,
             "day7_price": day7_price,
             "day30_price": day30_price,
             "preevent_avg_volume_30d": avg_pre_vol,
