@@ -1578,17 +1578,25 @@ def write_catalysts_to_db(catalysts: List[Dict], conn) -> Dict:
                 if normalized_precision != "exact":
                     c["date_precision"] = normalized_precision
                 
-                # Try INSERT, fall back to UPDATE on conflict
+                # Try INSERT, fall back to UPDATE on conflict.
+                # Conflict key uses canonical_drug_name (not raw drug_name)
+                # so formatting variations like 'lonvoguran ziclumeran' vs
+                # 'lonvoguran ziclumeran (lonvo-z)' upsert into the same row.
+                # The unique INDEX is partial — only enforced when canonical
+                # drug name is non-null AND status='active'. NULL drug rows
+                # (company-level catalysts) can have multiple entries.
                 cur.execute("""
                     INSERT INTO catalyst_universe
                         (ticker, company_name, catalyst_type, catalyst_date, date_precision,
                          description, drug_name, canonical_drug_name, indication, phase,
                          source, source_url, confidence_score, status, last_updated)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'active', NOW())
-                    ON CONFLICT (ticker, catalyst_type, catalyst_date, drug_name)
+                    ON CONFLICT (ticker, catalyst_type, catalyst_date, canonical_drug_name)
+                    WHERE canonical_drug_name IS NOT NULL AND status = 'active'
                     DO UPDATE SET
                         company_name = EXCLUDED.company_name,
                         description = EXCLUDED.description,
+                        drug_name = EXCLUDED.drug_name,
                         indication = EXCLUDED.indication,
                         phase = EXCLUDED.phase,
                         confidence_score = EXCLUDED.confidence_score,
