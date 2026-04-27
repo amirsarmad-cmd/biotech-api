@@ -199,9 +199,26 @@ def classify_trade_signal(
 # (optionally) options-implied move + IV percentile. Higher = stock has
 # rallied into the catalyst, more risk of sell-the-news.
 
-# Thresholds for priced-in classification
-PRICED_IN_HIGH_THRESHOLD = 0.65   # composite ≥ this → CROWDED, expect sell-the-news
-PRICED_IN_LOW_THRESHOLD  = 0.45   # composite ≤ this → CLEAN, real long edge
+# Thresholds for priced-in classification — calibrated against the
+# 358-row backtest after observing per-runup-bucket V1 accuracy:
+#
+#   Bucket                    Judged   V1 LONG acc    Inverse
+#   Washed out (≤-5%)         40       55.0%          45.0%
+#   Flat (-5 to +5%)          40       77.5%          22.5%   ← real LONG alpha
+#   Mild runup (+5 to +20%)   36       55.6%          44.4%   ← coin flip, skip
+#   Strong runup (≥+20%)      21       33.3%          66.7%   ← sell-the-news
+#
+# V2 should target the FLAT bucket for LONG_UNDERPRICED (high V1 acc)
+# and the STRONG-runup bucket for SHORT_SELL_THE_NEWS (high inverse acc).
+#
+# Mapping: runup +20% → priced_in 0.83. Runup -5% → 0.375. Runup +5% → 0.583.
+#
+# Set thresholds to map runup buckets to V2 signals as follows:
+#   priced_in ≤ 0.60  →  LONG_UNDERPRICED (catches washed-out + flat)
+#   priced_in ≥ 0.80  →  SHORT_SELL_THE_NEWS (catches strong runup only)
+#   else (0.60-0.80)  →  NO_TRADE_PRICED_IN (mild runup coin-flip zone)
+PRICED_IN_HIGH_THRESHOLD = 0.80   # composite ≥ this → CROWDED, sell-the-news
+PRICED_IN_LOW_THRESHOLD  = 0.60   # composite ≤ this → CLEAN, real long edge
 
 
 def compute_priced_in_score(
