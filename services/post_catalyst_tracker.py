@@ -407,7 +407,118 @@ def _compute_sector_moves(catalyst_date_str: str, basket: str = "XBI"
     return out
 
 
+def _fetch_price_window_polygon(ticker: str, catalyst_date_str: str) -> Optional[Dict]:
+    """Polygon-backed price window fetcher. Same return shape as
+    _fetch_price_window. Used when yfinance returns nothing.
+
+    Polygon is more reliable than yfinance for historical aggs but costs
+    one API call per backfill. We don't make this primary because yfinance
+    is free and works for ~78% of cases.
+    """
+    try:
+        from datetime import datetime as _dt
+        from services.polygon_data import _http_get, _get_api_key
+        if not _get_api_key():
+            return None
+
+        cdt = _dt.strptime(catalyst_date_str[:10], "%Y-%m-%d").date()
+        start = cdt - timedelta(days=30)
+        end = cdt + timedelta(days=45)
+        today = date.today()
+        if end > today:
+            end = today
+
+        # Polygon's range/1/day endpoint: /v2/aggs/ticker/{ticker}/range/1/day/{from}/{to}
+        url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start.isoformat()}/{end.isoformat()}"
+        data = _http_get(url, params={"adjusted": "true", "limit": 200}, timeout=15)
+        if not data or not data.get("results"):
+            return None
+
+        # Build rows_by_date keyed by trading date
+        rows_by_date = {}
+        for bar in data["results"]:
+            # Polygon timestamps are in milliseconds UTC
+            ts_ms = bar.get("t")
+            if not ts_ms:
+                continue
+            d = _dt.utcfromtimestamp(ts_ms / 1000).date()
+            rows_by_date[d] = {
+                "close": float(bar.get("c") or 0),
+                "high": float(bar.get("h") or 0),
+                "low": float(bar.get("l") or 0),
+                "volume": float(bar.get("v") or 0),
+            }
+        if not rows_by_date:
+            return None
+
+        sorted_dates = sorted(rows_by_date.keys())
+
+        def _on_or_before(target):
+            cs = [d for d in sorted_dates if d <= target]
+            return cs[-1] if cs else None
+        def _on_or_after(target):
+            cs = [d for d in sorted_dates if d >= target]
+            return cs[0] if cs else None
+
+        pre_event_d = _on_or_before(cdt - timedelta(days=1))
+        day0_d = _on_or_after(cdt)
+        day1_d = _on_or_after(cdt + timedelta(days=1)) if day0_d else None
+        if day1_d == day0_d and day0_d:
+            following = [d for d in sorted_dates if d > day0_d]
+            day1_d = following[0] if following else None
+        day7_d = _on_or_after(cdt + timedelta(days=7))
+        day30_d = _on_or_after(cdt + timedelta(days=30))
+
+        pre_dates = [d for d in sorted_dates if d < cdt and (cdt - d).days <= 30]
+        avg_pre_vol = (sum(rows_by_date[d]["volume"] for d in pre_dates) / len(pre_dates)) if pre_dates else None
+
+        def _close(d): return rows_by_date[d]["close"] if d else None
+        pre_event_price = _close(pre_event_d)
+        day0_price = _close(day0_d)
+
+        max_intraday_pct = None
+        if day0_d and pre_event_price:
+            day0 = rows_by_date[day0_d]
+            mh = (day0["high"] - pre_event_price) / pre_event_price * 100.0
+            ml = (day0["low"] - pre_event_price) / pre_event_price * 100.0
+            max_intraday_pct = max(abs(mh), abs(ml)) * (1 if abs(mh) > abs(ml) else -1)
+
+        return {
+            "pre_event_date": pre_event_d.isoformat() if pre_event_d else None,
+            "pre_event_price": pre_event_price,
+            "day0_price": day0_price,
+            "day1_price": _close(day1_d),
+            "day7_price": _close(day7_d),
+            "day30_price": _close(day30_d),
+            "preevent_avg_volume_30d": avg_pre_vol,
+            "postevent_volume_1d": rows_by_date[day0_d]["volume"] if day0_d else None,
+            "postevent_max_intraday_move_pct": max_intraday_pct,
+            "_data_present": all([pre_event_price, day0_price]),
+            "_source": "polygon",
+        }
+    except Exception as e:
+        logger.warning(f"_fetch_price_window_polygon failed for {ticker}@{catalyst_date_str}: {e}")
+        return None
+
+
 def _fetch_price_window(ticker: str, catalyst_date_str: str) -> Optional[Dict]:
+    """Fetch price history covering pre_event (~5 trading days before) through
+    day30 post-catalyst. Returns dict with parsed prices or None on failure.
+
+    Two-tier source preference:
+      1. yfinance (free)
+      2. Polygon (paid, used when yfinance returns nothing — covers the
+         ~22% of historical biotechs where yfinance can't find the ticker
+         e.g. delisted, M&A'd, or pre-IPO date issues)
+    """
+    yf_result = _fetch_price_window_yfinance(ticker, catalyst_date_str)
+    if yf_result and yf_result.get("_data_present"):
+        return yf_result
+    # yfinance returned None or stub — try Polygon
+    return _fetch_price_window_polygon(ticker, catalyst_date_str)
+
+
+def _fetch_price_window_yfinance(ticker: str, catalyst_date_str: str) -> Optional[Dict]:
     """Fetch price history covering pre_event (~5 trading days before) through
     day30 post-catalyst. Returns dict with parsed prices or None on failure.
     """
@@ -498,9 +609,10 @@ def _fetch_price_window(ticker: str, catalyst_date_str: str) -> Optional[Dict]:
             "postevent_volume_1d": rows_by_date[day0_d]["volume"] if day0_d else None,
             "postevent_max_intraday_move_pct": max_intraday_pct,
             "_data_present": all([pre_event_price, day0_price]),
+            "_source": "yfinance",
         }
     except Exception as e:
-        logger.warning(f"_fetch_price_window failed for {ticker}@{catalyst_date_str}: {e}")
+        logger.warning(f"_fetch_price_window_yfinance failed for {ticker}@{catalyst_date_str}: {e}")
         return None
 
 

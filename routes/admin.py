@@ -250,7 +250,7 @@ async def test_anthropic_tier3(ticker: str, company_name: str = ""):
 
     Bypasses Gemini and OpenAI; calls _call_anthropic_extract directly so
     we can verify the wiring without waiting for both upstream tiers to
-    return empty. Use sparingly — each call is ~\$0.012 + 30-90s latency.
+    return empty. Use sparingly — each call is ~$0.012 + 30-90s latency.
 
     Returns: {"catalysts": [...], "n": int, "ticker": str}
     """
@@ -2365,6 +2365,79 @@ async def post_catalyst_sector_coverage():
     except Exception as e:
         logger.exception("sector_coverage failed")
         raise HTTPException(500, f"sector_coverage error: {e}")
+
+
+@router.post("/post-catalyst/retry-stubs-with-polygon")
+async def retry_stub_rows_with_polygon(max_rows: int = 50):
+    """Re-run backfill for post_catalyst_outcomes rows that have no
+    actual_move_pct (yfinance failed at original backfill). Now that
+    _fetch_price_window has Polygon as a fallback, those tickers may be
+    fetchable via Polygon's historical aggs endpoint.
+
+    Selects rows where actual_move_pct_1d IS NULL AND outcome_label IS NULL
+    (the 'stub' state). Re-runs backfill_one which now tries yfinance first,
+    then Polygon. Updates the row in place if successful.
+
+    Returns: {attempted, succeeded, still_failed, errors}
+    """
+    try:
+        from services.post_catalyst_tracker import _fetch_price_window
+        from services.database import BiotechDatabase
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT id, ticker, catalyst_type, catalyst_date
+                FROM post_catalyst_outcomes
+                WHERE actual_move_pct_1d IS NULL
+                  AND catalyst_date IS NOT NULL
+                ORDER BY catalyst_date DESC
+                LIMIT %s
+            """, (max_rows,))
+            rows = cur.fetchall()
+
+        results = {"attempted": 0, "succeeded": 0, "still_failed": 0, "by_source": {"yfinance": 0, "polygon": 0}, "errors": []}
+        for outcome_id, ticker, cat_type, cat_date in rows:
+            results["attempted"] += 1
+            try:
+                cat_str = cat_date.strftime("%Y-%m-%d") if hasattr(cat_date, "strftime") else str(cat_date)[:10]
+                pw = _fetch_price_window(ticker, cat_str)
+                if not pw or not pw.get("_data_present"):
+                    results["still_failed"] += 1
+                    continue
+                pre = pw["pre_event_price"]
+                m1 = ((pw["day1_price"] - pre) / pre * 100.0) if (pw.get("day1_price") and pre) else None
+                m7 = ((pw["day7_price"] - pre) / pre * 100.0) if (pw.get("day7_price") and pre) else None
+                m30 = ((pw["day30_price"] - pre) / pre * 100.0) if (pw.get("day30_price") and pre) else None
+                source = pw.get("_source", "unknown")
+                results["by_source"][source] = results["by_source"].get(source, 0) + 1
+                with db.get_conn() as conn:
+                    cur = conn.cursor()
+                    cur.execute("""
+                        UPDATE post_catalyst_outcomes
+                        SET actual_move_pct_1d = %s,
+                            actual_move_pct_7d = %s,
+                            actual_move_pct_30d = %s,
+                            preevent_avg_volume_30d = COALESCE(preevent_avg_volume_30d, %s),
+                            postevent_volume_1d = COALESCE(postevent_volume_1d, %s),
+                            postevent_max_intraday_move_pct = COALESCE(postevent_max_intraday_move_pct, %s)
+                        WHERE id = %s
+                    """, (
+                        m1, m7, m30,
+                        pw.get("preevent_avg_volume_30d"),
+                        pw.get("postevent_volume_1d"),
+                        pw.get("postevent_max_intraday_move_pct"),
+                        outcome_id,
+                    ))
+                    conn.commit()
+                results["succeeded"] += 1
+            except Exception as e:
+                if len(results["errors"]) < 10:
+                    results["errors"].append({"id": outcome_id, "ticker": ticker, "error": str(e)[:80]})
+        return results
+    except Exception as e:
+        logger.exception("retry_stubs_with_polygon failed")
+        raise HTTPException(500, f"retry_stubs error: {e}")
 
 
 @router.post("/post-catalyst/recompute-abnormal")
