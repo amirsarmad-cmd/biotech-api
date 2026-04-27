@@ -171,16 +171,21 @@ def fetch_historical_options_chain(ticker: str, as_of_date: str,
         underlying_price = float(bar.get("c") or bar.get("close") or 0) or None
 
     # ─── Step 2: List contracts active on as_of_date ─────────────────
+    # Polygon's reference endpoint with expired=true returns ALL contracts
+    # that ever existed, sorted ascending by expiration. Without an explicit
+    # expiration_date.gte filter, we'd get options from 2010 first (useless).
+    # Always require expiration >= as_of_date so we only get contracts that
+    # were still trading.
     params = {
         "underlying_ticker": ticker,
         "as_of": as_of_date,
-        "expired": "true",  # include contracts that have since expired (we want historical)
+        "expired": "true",  # include contracts that have since expired
         "limit": 1000,
         "order": "asc",
         "sort": "expiration_date",
+        # CRITICAL: only contracts not yet expired as-of as_of_date
+        "expiration_date.gte": expiration_after or as_of_date,
     }
-    if expiration_after:
-        params["expiration_date.gte"] = expiration_after
     if expiration_before:
         params["expiration_date.lte"] = expiration_before
 
@@ -215,8 +220,8 @@ def fetch_historical_options_chain(ticker: str, as_of_date: str,
         near_money = raw_contracts[:60]  # fallback safety cap
 
     # ─── Step 4: Fetch OHLC for each near-the-money contract on as_of_date ─
-    # This is the expensive step — sequential calls with 100ms gap to respect
-    # any per-second cap. For 60 contracts at 100ms = 6s total.
+    # This is the expensive step — sequential calls per Polygon best practice
+    # for non-bulk endpoints. For 60 contracts at ~80ms = ~5s total.
     contracts = []
     n_priced = 0
     for c in near_money:
