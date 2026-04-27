@@ -534,6 +534,65 @@ async def get_stock_detail(ticker: str, with_npv: bool = Query(True)):
     primary_materiality = _materiality_score(primary_dict, market_cap_m)
     npv_materiality = _materiality_score(npv_catalyst, market_cap_m) if npv_catalyst else None
 
+    # ─── Setup-quality score ──────────────────────────────────────────
+    # Filters on SETUP, not just catalyst presence. Per user pushback after
+    # NTLA Phase 3 readout that succeeded but stock dropped 30% on the day:
+    # 'a good catalyst on a bad setup' (crowded long, euphoric retail, near
+    # 52w highs) is a sell-the-news trade. This is independent of catalyst
+    # probability and complements materiality.
+    setup_quality = None
+    try:
+        from services.setup_quality import compute_setup_quality
+        # Minimal fundamentals (re-uses already-fetched yf_info if available)
+        fund_data = None  # don't call /fundamentals here — yf_info is enough
+        # Days to catalyst
+        days_to_catalyst = None
+        try:
+            from datetime import datetime as _dt, date as _date
+            anchor_date = (npv_catalyst_summary or primary).get("date") or primary.get("catalyst_date")
+            if anchor_date:
+                d = _dt.strptime(str(anchor_date)[:10], "%Y-%m-%d").date()
+                days_to_catalyst = max(0, (d - _date.today()).days)
+        except Exception:
+            pass
+        # Pull 60-day price history (cached via yfinance)
+        history_bars = []
+        try:
+            import yfinance as yf
+            from datetime import date as _date2, timedelta as _td2
+            t60 = yf.Ticker(ticker)
+            h = t60.history(period="3mo", auto_adjust=True)
+            if not h.empty:
+                for idx, row in h.iterrows():
+                    history_bars.append({
+                        "date": idx.strftime("%Y-%m-%d") if hasattr(idx, "strftime") else str(idx)[:10],
+                        "close": float(row.get("Close", 0)) or None,
+                        "volume": float(row.get("Volume", 0)) or None,
+                    })
+        except Exception as e:
+            logger.info(f"history pull for setup_quality failed for {ticker}: {e}")
+        # Sentiment — best-effort from the primary catalyst's sentiment_score
+        sentiment_score = primary.get("sentiment_score")
+        # yf_info is only defined if with_npv was True. Pull lazily otherwise.
+        info_for_setup = locals().get("yf_info") or {}
+        if not info_for_setup:
+            try:
+                import yfinance as yf
+                info_for_setup = (yf.Ticker(ticker).info or {})
+            except Exception:
+                info_for_setup = {}
+        setup_quality = compute_setup_quality(
+            info=info_for_setup,
+            history=history_bars,
+            fundamentals=fund_data,
+            options_implied=options_implied,
+            social_sentiment=sentiment_score,
+            days_to_catalyst=days_to_catalyst,
+        )
+    except Exception as e:
+        logger.info(f"setup_quality compute failed for {ticker}: {e}")
+        setup_quality = None
+
     # Rank ALL catalysts by materiality so user can see why one was picked
     all_with_materiality = []
     for r in rows_sorted:
@@ -578,6 +637,7 @@ async def get_stock_detail(ticker: str, with_npv: bool = Query(True)):
             if npv_catalyst_summary else None
         ),
         "options_implied": options_implied,
+        "setup_quality": setup_quality,
         "all_catalysts": all_with_materiality,
         "npv": npv_result,
         "scores": {
