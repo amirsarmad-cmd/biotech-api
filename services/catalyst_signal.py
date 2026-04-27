@@ -93,19 +93,16 @@ REF_SCENARIOS: Dict[str, Tuple[float, float]] = {
 
 # Thresholds calibrated for our model's compressed reference moves.
 # Original critique recommended 5% but our REF_MOVES are smaller (Phase 3
-# top scenario is +3, FDA is +4/-5). Lowered to 3% so that high-confidence
-# directional bets aren't all rejected as small-edge.
-DEFAULT_MIN_SCENARIO_PCT = 3.0
+# top scenario is +3, FDA is +4/-5). We use 5% — anything less is small-edge
+# even by the calibrated table.
+DEFAULT_MIN_SCENARIO_PCT = 5.0
 # Probability bias: |p - 0.5| must EXCEED this for a directional bet.
-# 0.05 means p must be ≥ 0.55 (LONG) or ≤ 0.45 (SHORT). Set just below
-# 0.10 so float arithmetic on p=0.6 (which produces 0.09999... in Python)
-# doesn't get caught on the boundary.
-DEFAULT_PROB_BIAS_THRESHOLD = 0.05
-# Hard data-quality floor — separate from the probability used for
-# direction. In our system the LLM's confidence_score doubles as both,
-# but we only fail-stop on truly low values to allow medium-conviction
-# directional bets through.
-DEFAULT_MIN_CONFIDENCE = 0.30
+# 0.15 means p must be ≥ 0.65 (LONG) or ≤ 0.35 (SHORT). Calibrated against
+# the full 358-row backtest after observing that p=0.55-0.65 events show
+# essentially random direction outcomes vs XBI on the 3D window.
+DEFAULT_PROB_BIAS_THRESHOLD = 0.15
+# Hard data-quality floor.
+DEFAULT_MIN_CONFIDENCE = 0.55
 DEFAULT_OPTIONS_RATIO_FLOOR = 0.35  # predicted_edge / options_implied must be ≥ this
 
 
