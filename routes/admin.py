@@ -2339,7 +2339,7 @@ async def inspect_unfilled_stubs(limit: int = 30):
             cur = conn.cursor()
             cur.execute("""
                 SELECT id, ticker, catalyst_type, catalyst_date,
-                       outcome_label, actual_move_pct_1d
+                       outcome, last_error, backfill_attempts, actual_move_pct_1d
                 FROM post_catalyst_outcomes
                 WHERE actual_move_pct_1d IS NULL
                   AND catalyst_date IS NOT NULL
@@ -2351,14 +2351,15 @@ async def inspect_unfilled_stubs(limit: int = 30):
                 "SELECT COUNT(*) FROM post_catalyst_outcomes WHERE actual_move_pct_1d IS NULL"
             )
             total_null = cur.fetchone()[0]
-            # Histogram of catalyst_date age
+            # Histogram of catalyst_date age. catalyst_date is TEXT (ISO), cast
+            # to date for the bucketing.
             cur.execute("""
                 SELECT
                   CASE
-                    WHEN catalyst_date >= CURRENT_DATE - INTERVAL '90 days' THEN '0-90d'
-                    WHEN catalyst_date >= CURRENT_DATE - INTERVAL '1 year' THEN '90d-1y'
-                    WHEN catalyst_date >= CURRENT_DATE - INTERVAL '3 years' THEN '1-3y'
-                    WHEN catalyst_date >= CURRENT_DATE - INTERVAL '10 years' THEN '3-10y'
+                    WHEN catalyst_date::date >= CURRENT_DATE - INTERVAL '90 days' THEN '0-90d'
+                    WHEN catalyst_date::date >= CURRENT_DATE - INTERVAL '1 year' THEN '90d-1y'
+                    WHEN catalyst_date::date >= CURRENT_DATE - INTERVAL '3 years' THEN '1-3y'
+                    WHEN catalyst_date::date >= CURRENT_DATE - INTERVAL '10 years' THEN '3-10y'
                     ELSE '10y+'
                   END AS age_bucket,
                   COUNT(*)
@@ -2378,8 +2379,10 @@ async def inspect_unfilled_stubs(limit: int = 30):
                     "id": r[0],
                     "ticker": r[1],
                     "catalyst_type": r[2],
-                    "catalyst_date": r[3].strftime("%Y-%m-%d") if hasattr(r[3], "strftime") else str(r[3])[:10],
-                    "outcome_label": r[4],
+                    "catalyst_date": str(r[3])[:10],
+                    "outcome": r[4],
+                    "last_error": r[5],
+                    "backfill_attempts": r[6],
                 }
                 for r in rows
             ],
@@ -2438,11 +2441,13 @@ async def retry_stub_rows_with_polygon(max_rows: int = 50):
     _fetch_price_window has Polygon as a fallback, those tickers may be
     fetchable via Polygon's historical aggs endpoint.
 
-    Selects rows where actual_move_pct_1d IS NULL AND outcome_label IS NULL
-    (the 'stub' state). Re-runs backfill_one which now tries yfinance first,
-    then Polygon. Updates the row in place if successful.
+    Selects rows where actual_move_pct_1d IS NULL AND last_error IS NULL
+    (i.e. never attempted, OR previously attempted and didn't get marked).
+    Re-runs _fetch_price_window which now tries yfinance first, then Polygon.
+    Updates the row in place if successful; on failure, increments
+    backfill_attempts and sets last_error so the row doesn't re-qualify.
 
-    Returns: {attempted, succeeded, still_failed, errors}
+    Returns: {attempted, succeeded, still_failed, by_source, errors}
     """
     try:
         from services.post_catalyst_tracker import _fetch_price_window
@@ -2455,6 +2460,7 @@ async def retry_stub_rows_with_polygon(max_rows: int = 50):
                 FROM post_catalyst_outcomes
                 WHERE actual_move_pct_1d IS NULL
                   AND catalyst_date IS NOT NULL
+                  AND (last_error IS NULL OR last_error NOT LIKE 'no_data:%')
                 ORDER BY catalyst_date DESC
                 LIMIT %s
             """, (max_rows,))
@@ -2467,6 +2473,19 @@ async def retry_stub_rows_with_polygon(max_rows: int = 50):
                 cat_str = cat_date.strftime("%Y-%m-%d") if hasattr(cat_date, "strftime") else str(cat_date)[:10]
                 pw = _fetch_price_window(ticker, cat_str)
                 if not pw or not pw.get("_data_present"):
+                    # Mark as no-data so this row doesn't re-qualify forever.
+                    # Common cause: ticker delisted or catalyst_date outside
+                    # both yfinance and Polygon archive coverage.
+                    with db.get_conn() as conn:
+                        cur = conn.cursor()
+                        cur.execute(
+                            """UPDATE post_catalyst_outcomes
+                               SET last_error = 'no_data: yfinance+polygon both empty',
+                                   backfill_attempts = COALESCE(backfill_attempts, 0) + 1
+                               WHERE id = %s""",
+                            (outcome_id,),
+                        )
+                        conn.commit()
                     results["still_failed"] += 1
                     continue
                 pre = pw["pre_event_price"]
