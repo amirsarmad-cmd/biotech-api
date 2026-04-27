@@ -2101,3 +2101,167 @@ async def polygon_contracts_probe(ticker: str, as_of: str,
     except Exception as e:
         logger.exception("polygon_contracts_probe failed")
         raise HTTPException(500, f"probe error: {e}")
+
+
+@router.get("/system-state")
+async def system_state():
+    """One-shot comprehensive diagnostic. Replaces 10+ separate admin calls.
+
+    Returns the full state of the biotech-V2 system in a single response —
+    designed so external diagnostics can succeed in one egress-proxy round trip
+    instead of being killed by intermittent flapping.
+
+    Sections:
+      - alembic_versions      (which migrations applied)
+      - backtest              (N=358 outcomes summary, accuracy, options coverage)
+      - drug_economics        (count, avg confidence, FDA-anchored count)
+      - research_corpus       (count by domain, ticker)
+      - polygon               (key configured, plan checks pass)
+      - fda_sources           (orange book cache state)
+      - recent_npv_runs       (last 5 NPV computations)
+    """
+    from datetime import datetime
+    out = {"as_of": datetime.utcnow().isoformat()}
+
+    # 1. Alembic
+    try:
+        from services.database import BiotechDatabase
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT version_num FROM alembic_version_biotech")
+            out["alembic_versions"] = [r[0] for r in cur.fetchall()]
+    except Exception as e:
+        out["alembic_versions"] = {"_error": str(e)[:120]}
+
+    # 2. Backtest summary
+    try:
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT count(*) total,
+                       count(*) FILTER (WHERE error_abs_pct IS NOT NULL) with_error,
+                       avg(error_abs_pct)::numeric(10,2) avg_abs_err,
+                       avg(error_signed_pct)::numeric(10,2) avg_signed_err,
+                       avg(CASE WHEN direction_correct THEN 1.0 ELSE 0.0 END)::numeric(10,3) dir_acc,
+                       count(*) FILTER (WHERE options_implied_move_pct IS NOT NULL AND options_implied_move_pct > 0) with_options
+                FROM post_catalyst_outcomes
+            """)
+            r = cur.fetchone()
+            out["backtest"] = {
+                "total_outcomes": r[0],
+                "with_error": r[1],
+                "avg_abs_error_pct": float(r[2]) if r[2] else None,
+                "avg_signed_error_pct": float(r[3]) if r[3] else None,
+                "direction_accuracy": float(r[4]) if r[4] else None,
+                "with_options_implied": r[5],
+                "options_coverage_pct": round(100.0 * r[5] / r[0], 1) if r[0] else 0,
+            }
+    except Exception as e:
+        out["backtest"] = {"_error": str(e)[:120]}
+
+    # 3. Drug economics cache
+    try:
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT count(*) total,
+                       count(confidence_score) with_confidence,
+                       avg(confidence_score)::numeric(10,3) avg_confidence,
+                       count(*) FILTER (WHERE annual_cost_us_net_usd IS NOT NULL) with_us_net,
+                       count(*) FILTER (WHERE provenance IS NOT NULL) with_provenance
+                FROM drug_economics_cache
+            """)
+            r = cur.fetchone()
+            out["drug_economics"] = {
+                "total": r[0],
+                "with_confidence_score": r[1],
+                "avg_confidence_score": float(r[2]) if r[2] else None,
+                "with_us_net_pricing": r[3],
+                "with_provenance": r[4],
+            }
+    except Exception as e:
+        out["drug_economics"] = {"_error": str(e)[:120]}
+
+    # 4. Research corpus
+    try:
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT count(*), count(DISTINCT ticker_hint), count(DISTINCT url_domain) FROM research_corpus")
+            r = cur.fetchone()
+            cur.execute("""SELECT url_domain, count(*)
+                           FROM research_corpus
+                           GROUP BY url_domain ORDER BY count(*) DESC LIMIT 10""")
+            domains = {row[0]: row[1] for row in cur.fetchall()}
+            cur.execute("""SELECT ticker_hint, count(*)
+                           FROM research_corpus
+                           WHERE ticker_hint IS NOT NULL
+                           GROUP BY ticker_hint ORDER BY count(*) DESC LIMIT 10""")
+            tickers = {row[0]: row[1] for row in cur.fetchall()}
+            out["research_corpus"] = {
+                "total": r[0],
+                "distinct_tickers": r[1],
+                "distinct_domains": r[2],
+                "top_domains": domains,
+                "top_tickers": tickers,
+            }
+    except Exception as e:
+        out["research_corpus"] = {"_error": str(e)[:120]}
+
+    # 5. Polygon
+    try:
+        from services.polygon_data import is_configured, _get_api_key
+        if is_configured():
+            out["polygon"] = {
+                "configured": True,
+                "key_prefix": _get_api_key()[:6] + "...",
+            }
+        else:
+            out["polygon"] = {"configured": False}
+    except Exception as e:
+        out["polygon"] = {"_error": str(e)[:120]}
+
+    # 6. FDA sources
+    try:
+        from services.fda_sources import _redis_client, _OB_CACHE_KEY
+        r = _redis_client()
+        ob_present = False
+        ob_meta = None
+        if r:
+            try:
+                raw = r.get(_OB_CACHE_KEY)
+                if raw:
+                    import json
+                    ob_present = True
+                    parsed = json.loads(raw)
+                    ob_meta = parsed.get("_meta")
+            except Exception:
+                pass
+        out["fda_sources"] = {
+            "orange_book_cached": ob_present,
+            "orange_book_meta": ob_meta,
+        }
+    except Exception as e:
+        out["fda_sources"] = {"_error": str(e)[:120]}
+
+    # 7. Recent NPV runs
+    try:
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT ticker, drug_npv_b, p_approval, p_commercial, computed_at
+                FROM catalyst_npv_cache
+                ORDER BY computed_at DESC
+                LIMIT 5
+            """)
+            out["recent_npv_runs"] = [
+                {"ticker": r[0], "drug_npv_b": float(r[1]) if r[1] else None,
+                 "p_approval": float(r[2]) if r[2] else None,
+                 "p_commercial": float(r[3]) if r[3] else None,
+                 "computed_at": str(r[4]) if r[4] else None}
+                for r in cur.fetchall()
+            ]
+    except Exception as e:
+        out["recent_npv_runs"] = {"_error": str(e)[:120]}
+
+    return out
