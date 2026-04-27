@@ -101,6 +101,129 @@ def _pick_npv_catalyst(catalysts: List[Dict]) -> Optional[Dict]:
     return drug_cats[0]
 
 
+def _materiality_score(catalyst: Dict, market_cap_m: Optional[float]) -> Dict:
+    """Compute a materiality score (0-1) explaining WHY this catalyst matters
+    for THIS stock, with a human-readable justification.
+
+    Per ChatGPT pass-4 critique #2:
+      'Add a catalyst materiality score:
+         materiality_score = asset_rNPV/market_cap × time_proximity ×
+                             event_binary_score × ownership × liquidity'
+
+    We don't have asset_rNPV at /stocks/{ticker} (that's computed at
+    /analyze/npv). So we approximate with:
+      - tier_score: catalyst type priority (FDA > Phase 3 > Phase 2 > other)
+      - proximity_score: closer = more material (decays after 12mo)
+      - probability_score: extreme probabilities (very high or very low)
+        carry more decision-relevance than middling ones
+      - binary_score: boolean catalysts (FDA/Phase 3) carry more re-rating
+        potential than non-binary (earnings)
+
+    Returns:
+      {
+        "score": 0-1 float,
+        "tier_score": 0-1,
+        "proximity_score": 0-1,
+        "probability_score": 0-1,
+        "binary_score": 0-1,
+        "rationale": "Phase 3 FDA-relevant readout in 27 days. High binary
+                      re-rating potential. Single-event outcome.",
+      }
+    """
+    if not catalyst:
+        return {"score": 0.0, "rationale": "No catalyst"}
+
+    t = (catalyst.get("catalyst_type") or "").lower()
+    p = float(catalyst.get("probability") or 0.5)
+    date_str = catalyst.get("catalyst_date") or ""
+
+    # Tier score (0-1)
+    if "fda" in t or "approval" in t or "pdufa" in t:
+        tier_score, tier_label = 1.0, "FDA decision"
+    elif "phase 3" in t or "phase iii" in t:
+        tier_score, tier_label = 0.85, "Phase 3 readout"
+    elif "phase 2" in t or "phase ii" in t:
+        tier_score, tier_label = 0.55, "Phase 2 readout"
+    elif "phase" in t or "clinical" in t or "readout" in t:
+        tier_score, tier_label = 0.45, "Clinical readout"
+    elif "earnings" in t:
+        tier_score, tier_label = 0.20, "Earnings"
+    else:
+        tier_score, tier_label = 0.30, "Other"
+
+    # Proximity score: peak at 30-90 days out, decays after
+    proximity_score = 0.5
+    days_out_str = ""
+    try:
+        from datetime import date as _date, datetime as _dt
+        d = _dt.strptime(date_str, "%Y-%m-%d").date()
+        days_out = (d - _date.today()).days
+        if days_out < 0:
+            proximity_score = 0.0
+            days_out_str = f"{abs(days_out)}d ago"
+        elif days_out <= 7:
+            proximity_score = 1.0
+            days_out_str = f"{days_out}d out"
+        elif days_out <= 30:
+            proximity_score = 0.95
+            days_out_str = f"{days_out}d out"
+        elif days_out <= 90:
+            proximity_score = 0.85
+            days_out_str = f"{days_out}d out"
+        elif days_out <= 180:
+            proximity_score = 0.65
+            days_out_str = f"~{days_out//30}mo out"
+        elif days_out <= 365:
+            proximity_score = 0.45
+            days_out_str = f"~{days_out//30}mo out"
+        else:
+            proximity_score = 0.25
+            days_out_str = f"{days_out//365}y+ out"
+    except Exception:
+        pass
+
+    # Probability score: extreme probabilities = clearer trade thesis
+    # 50% → 0.0, 0% or 100% → 1.0
+    probability_score = abs(p - 0.5) * 2
+
+    # Binary score: clinical/regulatory = binary, earnings = continuous
+    binary_score = 1.0 if (tier_score >= 0.45) else 0.3
+
+    # Composite — weighted average
+    score = (
+        tier_score * 0.35 +
+        proximity_score * 0.30 +
+        probability_score * 0.15 +
+        binary_score * 0.20
+    )
+
+    # Human-readable rationale
+    parts = []
+    parts.append(f"{tier_label}")
+    if days_out_str:
+        parts.append(f"in {days_out_str}")
+    if binary_score >= 0.9:
+        parts.append("binary outcome")
+    if probability_score < 0.3:
+        parts.append(f"50/50 ({p*100:.0f}%) — high uncertainty")
+    elif p >= 0.85:
+        parts.append(f"high P ({p*100:.0f}%) — mostly priced in")
+    elif p <= 0.15:
+        parts.append(f"low P ({p*100:.0f}%) — already discounted")
+
+    rationale = ". ".join(parts) + "."
+    return {
+        "score": round(score, 3),
+        "tier_score": round(tier_score, 3),
+        "tier_label": tier_label,
+        "proximity_score": round(proximity_score, 3),
+        "probability_score": round(probability_score, 3),
+        "binary_score": round(binary_score, 3),
+        "days_out": days_out_str,
+        "rationale": rationale,
+    }
+
+
 def _get_live_price(ticker: str) -> Optional[float]:
     """
     Best-effort price fetch with 4 fallbacks, each with explicit logging.
@@ -400,6 +523,38 @@ async def get_stock_detail(ticker: str, with_npv: bool = Query(True)):
         logger.info(f"options_implied lookup failed for {ticker}: {e}")
         options_implied = None
 
+    # Compute materiality score for primary + npv catalysts
+    # Per ChatGPT pass-4 critique #2: explain WHY this catalyst is the focus
+    primary_dict = {
+        "catalyst_type": primary.get("catalyst_type"),
+        "catalyst_date": primary.get("catalyst_date"),
+        "probability": primary.get("probability"),
+    }
+    primary_materiality = _materiality_score(primary_dict, market_cap_m)
+    npv_materiality = _materiality_score(npv_catalyst, market_cap_m) if npv_catalyst else None
+
+    # Rank ALL catalysts by materiality so user can see why one was picked
+    all_with_materiality = []
+    for r in rows_sorted:
+        r_dict = {
+            "catalyst_type": r.get("catalyst_type"),
+            "catalyst_date": r.get("catalyst_date"),
+            "probability": r.get("probability"),
+        }
+        m = _materiality_score(r_dict, market_cap_m)
+        all_with_materiality.append({
+            "type": r.get("catalyst_type"),
+            "date": r.get("catalyst_date"),
+            "probability": r.get("probability"),
+            "description": r.get("description"),
+            "drug_name": r.get("drug_name"),
+            "indication": r.get("indication"),
+            "phase": r.get("phase"),
+            "source": r.get("source"),
+            "materiality_score": m["score"],
+            "materiality_rationale": m["rationale"],
+        })
+
     return _to_jsonable({
         "ticker": ticker,
         "company_name": company_name,
@@ -414,19 +569,14 @@ async def get_stock_detail(ticker: str, with_npv: bool = Query(True)):
             "drug_name": primary.get("drug_name"),
             "indication": primary.get("indication"),
             "phase": primary.get("phase"),
+            "materiality": primary_materiality,
         },
-        "npv_catalyst": npv_catalyst_summary,
+        "npv_catalyst": (
+            {**npv_catalyst_summary, "materiality": npv_materiality}
+            if npv_catalyst_summary else None
+        ),
         "options_implied": options_implied,
-        "all_catalysts": [{
-            "type": r.get("catalyst_type"),
-            "date": r.get("catalyst_date"),
-            "probability": r.get("probability"),
-            "description": r.get("description"),
-            "drug_name": r.get("drug_name"),
-            "indication": r.get("indication"),
-            "phase": r.get("phase"),
-            "source": r.get("source"),
-        } for r in rows_sorted],
+        "all_catalysts": all_with_materiality,
         "npv": npv_result,
         "scores": {
             "overall": primary.get("overall_score"),
