@@ -165,5 +165,35 @@ def get_implied_move_for_catalyst(
     catalyst_date: str,
 ) -> Optional[Dict]:
     """Convenience: pick the option expiry covering this catalyst date.
-    Returns same shape as get_implied_move."""
+    Returns same shape as get_implied_move.
+
+    Two-tier source preference:
+      1. Polygon /v3/snapshot/options/{ticker}  — primary (paid, more reliable)
+      2. yfinance .option_chain                  — fallback (free but rate-limited
+                                                  and intermittently empty)
+
+    Polygon is preferred because yfinance is unstable: it goes silent for
+    minutes at a time, returns empty option_chain DataFrames during outages,
+    and aggressively rate-limits during burst seed runs. Polygon's paid
+    snapshot endpoint is more consistent. We keep yfinance as a fallback
+    so the system still works if POLYGON_API_KEY isn't set or Polygon is
+    misconfigured.
+    """
+    import os
+    # Try Polygon first if configured. If POLYGON_DISABLE_OPTIONS env is set,
+    # skip Polygon and go straight to yfinance (manual override for debugging).
+    polygon_disabled = os.getenv("POLYGON_DISABLE_OPTIONS", "").lower() in ("true", "1", "yes")
+    if not polygon_disabled:
+        try:
+            from services.polygon_data import is_configured, get_implied_move_polygon
+            if is_configured():
+                result = get_implied_move_polygon(ticker, target_date=catalyst_date)
+                if result:
+                    return result
+                # Polygon configured but returned None — log and fall through
+                logger.info(f"Polygon implied_move empty for {ticker} {catalyst_date}, falling back to yfinance")
+        except Exception as e:
+            logger.warning(f"Polygon implied_move failed for {ticker}: {e}, falling back to yfinance")
+
+    # Fallback: yfinance
     return get_implied_move(ticker=ticker, target_date=catalyst_date)

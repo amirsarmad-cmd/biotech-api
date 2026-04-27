@@ -452,6 +452,211 @@ def backfill_historical_implied_move(ticker: str, catalyst_date: str,
 # News — Layer 2 source for research_corpus
 # ────────────────────────────────────────────────────────────
 
+def fetch_current_options_snapshot(ticker: str,
+                                    expiration_after: Optional[str] = None) -> Optional[Dict]:
+    """Fetch the CURRENT options chain snapshot for ticker via Polygon's
+    /v3/snapshot/options/{ticker} endpoint.
+
+    Unlike fetch_historical_options_chain (used for backfill), this returns
+    real-time prices with bid/ask/mark and IV per contract — what we need
+    to compute current ATM-straddle implied move for an upcoming catalyst.
+
+    Args:
+      ticker:           underlying ticker
+      expiration_after: only return contracts expiring on or after this
+                        YYYY-MM-DD. Used to focus on the post-catalyst expiry.
+
+    Returns:
+      {
+        "ticker": str,
+        "underlying_price": float,
+        "contracts": [
+          {"ticker", "type", "strike", "expiration",
+           "bid", "ask", "last", "mark", "iv", "volume"}, ...
+        ],
+        "n_contracts": int,
+      }
+      or None on failure.
+    """
+    cache_key = f"polygon:opt_snapshot:{ticker}:{expiration_after or ''}"
+    cached = _cached_get(cache_key)
+    if cached is not None:
+        cached["_from_cache"] = True
+        return cached
+
+    params = {"limit": 250}
+    if expiration_after:
+        params["expiration_date.gte"] = expiration_after
+    data = _http_get(
+        f"{POLYGON_BASE}/v3/snapshot/options/{ticker}",
+        params=params, timeout=15,
+    )
+    if not data or data.get("_status") in (403, 404):
+        return None
+
+    results = data.get("results") or []
+    if not results:
+        return None
+
+    # Underlying price: first contract carries it under details.last_quote
+    # or via underlying_asset.price. We fall back to whatever we can find.
+    underlying_price = None
+    contracts = []
+    for r in results:
+        details = r.get("details") or {}
+        day = r.get("day") or {}
+        last_quote = r.get("last_quote") or {}
+        last_trade = r.get("last_trade") or {}
+        underlying = r.get("underlying_asset") or {}
+
+        if underlying_price is None:
+            underlying_price = (
+                underlying.get("price")
+                or underlying.get("last_price")
+                or None
+            )
+
+        bid = float(last_quote.get("bid") or 0)
+        ask = float(last_quote.get("ask") or 0)
+        last = float(last_trade.get("price") or day.get("close") or 0)
+        # mark = midpoint of bid/ask if both > 0, else last trade
+        mark = (bid + ask) / 2 if (bid > 0 and ask > 0 and ask > bid) else last
+        iv = r.get("implied_volatility")  # already 0..1 decimal
+        volume = day.get("volume") or 0
+
+        contracts.append({
+            "ticker": details.get("ticker"),
+            "type": details.get("contract_type"),       # 'call' | 'put'
+            "strike": details.get("strike_price"),
+            "expiration": details.get("expiration_date"),  # YYYY-MM-DD
+            "bid": bid,
+            "ask": ask,
+            "last": last,
+            "mark": mark,
+            "iv": iv,
+            "volume": volume,
+        })
+
+    out = {
+        "ticker": ticker,
+        "underlying_price": underlying_price,
+        "contracts": contracts,
+        "n_contracts": len(contracts),
+        "_source": "polygon_snapshot",
+        "_from_cache": False,
+    }
+    _cached_set(cache_key, out, ttl_sec=600)  # 10-min TTL — options change fast
+    return out
+
+
+def get_implied_move_polygon(
+    ticker: str,
+    target_date: Optional[str] = None,
+) -> Optional[Dict]:
+    """Compute ATM-straddle implied move using Polygon's current snapshot.
+
+    Drop-in replacement for services.options_implied.get_implied_move
+    (which uses yfinance). Same return shape.
+
+    Picks the FIRST expiry on or after target_date so we cover the catalyst
+    event. ATM strike = strike with both call+put present, closest to spot.
+    Mark = midpoint of bid/ask if both quoted, else last trade.
+
+    Returns:
+      {
+        implied_move_pct: float,
+        expiry: str,
+        atm_strike: float,
+        straddle_premium: float,
+        stock_price: float,
+        days_to_expiry: int,
+        source: 'polygon_snapshot',
+        annualized_iv_pct: float | None,
+        call_price: float,
+        put_price: float,
+      }
+      or None if data unavailable.
+    """
+    import math
+    from datetime import datetime as _dt, date as _date
+
+    expiration_after = target_date[:10] if target_date else None
+    snapshot = fetch_current_options_snapshot(ticker, expiration_after=expiration_after)
+    if not snapshot or not snapshot.get("contracts"):
+        return None
+
+    spot = snapshot.get("underlying_price")
+    if not spot or spot <= 0:
+        return None
+    spot = float(spot)
+
+    contracts = snapshot["contracts"]
+    # Group by expiration date
+    expiries = sorted({c["expiration"] for c in contracts if c.get("expiration")})
+    if not expiries:
+        return None
+
+    # Pick expiry: nearest >= target_date, else first available
+    chosen_expiry = None
+    if target_date:
+        try:
+            target_d = _dt.strptime(target_date[:10], "%Y-%m-%d").date()
+            future = [e for e in expiries
+                      if _dt.strptime(e, "%Y-%m-%d").date() >= target_d]
+            chosen_expiry = future[0] if future else expiries[-1]
+        except (ValueError, IndexError):
+            chosen_expiry = expiries[0]
+    else:
+        chosen_expiry = expiries[0]
+
+    # Filter to contracts on the chosen expiry
+    expiry_contracts = [c for c in contracts if c.get("expiration") == chosen_expiry]
+    calls = {c["strike"]: c for c in expiry_contracts if c.get("type") == "call" and c.get("strike")}
+    puts = {c["strike"]: c for c in expiry_contracts if c.get("type") == "put" and c.get("strike")}
+
+    common_strikes = set(calls.keys()) & set(puts.keys())
+    if not common_strikes:
+        return None
+
+    atm_strike = min(common_strikes, key=lambda k: abs(k - spot))
+    call_c = calls[atm_strike]
+    put_c = puts[atm_strike]
+    call_price = call_c.get("mark", 0) or 0
+    put_price = put_c.get("mark", 0) or 0
+    if call_price <= 0 or put_price <= 0:
+        return None
+
+    straddle = call_price + put_price
+    implied_move_pct = (straddle / spot) * 100.0
+
+    try:
+        exp_d = _dt.strptime(chosen_expiry, "%Y-%m-%d").date()
+        dte = (exp_d - _date.today()).days
+    except ValueError:
+        dte = 0
+
+    annualized_iv = None
+    if dte > 0:
+        try:
+            T = dte / 365.0
+            annualized_iv = (straddle / spot) * math.sqrt(math.pi / (2 * T)) * 100
+        except (ValueError, ZeroDivisionError):
+            annualized_iv = None
+
+    return {
+        "implied_move_pct": round(implied_move_pct, 2),
+        "expiry": chosen_expiry,
+        "atm_strike": float(atm_strike),
+        "straddle_premium": round(straddle, 2),
+        "stock_price": spot,
+        "days_to_expiry": dte,
+        "source": "polygon_snapshot",
+        "annualized_iv_pct": round(annualized_iv, 1) if annualized_iv else None,
+        "call_price": round(float(call_price), 2),
+        "put_price": round(float(put_price), 2),
+    }
+
+
 def fetch_news(ticker: str, published_utc_gte: Optional[str] = None,
                 published_utc_lte: Optional[str] = None,
                 limit: int = 50) -> Optional[Dict]:

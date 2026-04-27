@@ -1758,6 +1758,25 @@ async def polygon_status():
         raise HTTPException(500, f"polygon_status error: {e}")
 
 
+@router.get("/polygon/test-implied-move")
+async def polygon_test_implied_move(ticker: str, target_date: str):
+    """Direct test of Polygon current-snapshot implied move computation.
+
+    Bypasses the yfinance-fallback layer in services.options_implied so we
+    can verify Polygon is the source. Returns the polygon-only result or
+    {available: false} if Polygon failed or returned empty.
+    """
+    try:
+        from services.polygon_data import get_implied_move_polygon
+        result = get_implied_move_polygon(ticker=ticker, target_date=target_date)
+        if result is None:
+            return {"available": False, "ticker": ticker, "target_date": target_date}
+        return {"available": True, **result}
+    except Exception as e:
+        logger.exception("polygon test_implied_move failed")
+        raise HTTPException(500, f"polygon test_implied_move error: {e}")
+
+
 @router.get("/polygon/options-chain")
 async def polygon_options_chain(ticker: str, as_of: str):
     """Fetch historical options chain for a ticker on a specific date.
@@ -2313,7 +2332,12 @@ async def recompute_abnormal(max_rows: int = 100):
     stock_move - XBI_move (sector basket), not raw stock move.'
 
     Uses XBI as the default basket (small-cap weighted, closer to our universe).
-    Updates rows where any abnormal_move_pct_* is NULL.
+    Updates rows where sector_basket IS NULL (never attempted).
+
+    On success: sector_basket='XBI', sector_move_pct_*, abnormal_move_pct_* set.
+    On no-data (e.g. catalyst_date outside available XBI history):
+      sector_basket='no_data' so the row is marked attempted and excluded
+      from future runs. Otherwise the same 50 rows would re-qualify forever.
     """
     try:
         from services.post_catalyst_tracker import _compute_sector_moves
@@ -2326,8 +2350,7 @@ async def recompute_abnormal(max_rows: int = 100):
                        actual_move_pct_1d, actual_move_pct_7d, actual_move_pct_30d
                 FROM post_catalyst_outcomes
                 WHERE catalyst_date IS NOT NULL
-                  AND (abnormal_move_pct_30d IS NULL
-                       OR abnormal_move_pct_1d IS NULL)
+                  AND sector_basket IS NULL
                 ORDER BY catalyst_date DESC
                 LIMIT %s
             """, (max_rows,))
@@ -2341,6 +2364,16 @@ async def recompute_abnormal(max_rows: int = 100):
                 cat_str = cat_date.strftime("%Y-%m-%d") if hasattr(cat_date, "strftime") else str(cat_date)[:10]
                 sector_moves = _compute_sector_moves(cat_str, basket="XBI")
                 if not sector_moves:
+                    # Mark as attempted-but-no-data so it doesn't re-qualify forever.
+                    # Common cause: catalyst_date predates XBI inception or falls
+                    # outside yfinance's available history window.
+                    with db.get_conn() as conn:
+                        cur = conn.cursor()
+                        cur.execute(
+                            "UPDATE post_catalyst_outcomes SET sector_basket = 'no_data' WHERE id = %s",
+                            (outcome_id,),
+                        )
+                        conn.commit()
                     results["no_sector_data"] += 1
                     continue
                 s1 = sector_moves.get("day1_pct")
