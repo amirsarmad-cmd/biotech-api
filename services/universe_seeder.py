@@ -30,19 +30,31 @@ logger = logging.getLogger(__name__)
 # Configuration
 # ────────────────────────────────────────────────────────────
 LLM_ENABLED = os.getenv("LLM_ENABLED", "false").lower() in ("true", "1", "yes")
-# Primary: gemini-2.5-flash with Google Search grounding (real-time facts, ~$0.0003/call)
-# Fallback: openai gpt-4o (no grounding but better factual recall than mini, ~$0.003/call)
-LLM_PROVIDER = os.getenv("UNIVERSE_LLM_PROVIDER", "gemini")  # 'gemini' | 'openai'
+# Three-tier fallback chain for catalyst extraction:
+#   Primary:   gemini-2.5-flash with Google Search grounding (real-time facts, ~$0.0003/call)
+#   Tier 2:    openai gpt-4o (no grounding but reliable, ~$0.003/call)
+#   Tier 3:    anthropic claude-sonnet-4-5 with web_search tool (~$0.012/call)
+#              — only used when both Gemini and OpenAI return zero catalysts
+#              for tickers where the user needs to discover unknown pipeline data.
+# Anthropic's web_search complements OpenAI's static knowledge: when GPT-4o
+# returns {"catalysts":[]} for mid-cap biotechs (because its knowledge cutoff
+# misses recent pipeline news), Claude+web_search can actively search SEC
+# filings, FDA calendar, and ClinicalTrials.gov via the live web.
+LLM_PROVIDER = os.getenv("UNIVERSE_LLM_PROVIDER", "gemini")  # 'gemini' | 'openai' | 'anthropic'
 LLM_MODEL_GEMINI = os.getenv("UNIVERSE_LLM_MODEL_GEMINI", "gemini-2.5-flash")
 LLM_MODEL_OPENAI = os.getenv("UNIVERSE_LLM_MODEL_OPENAI", "gpt-4o")
+LLM_MODEL_ANTHROPIC = os.getenv("UNIVERSE_LLM_MODEL_ANTHROPIC", "claude-sonnet-4-5")
 GEMINI_GROUNDING = os.getenv("UNIVERSE_GROUNDING", "true").lower() in ("true", "1", "yes")
+ANTHROPIC_TIER3_ENABLED = os.getenv("UNIVERSE_ANTHROPIC_TIER3", "true").lower() in ("true", "1", "yes")
 DAILY_LLM_BUDGET_USD = float(os.getenv("DAILY_LLM_BUDGET_USD", "5.00"))
-COST_PER_GEMINI_CALL_USD = 0.0003   # gemini-2.5-flash with grounding
-COST_PER_OPENAI_CALL_USD = 0.003    # gpt-4o
+COST_PER_GEMINI_CALL_USD = 0.0003     # gemini-2.5-flash with grounding
+COST_PER_OPENAI_CALL_USD = 0.003      # gpt-4o
+COST_PER_ANTHROPIC_CALL_USD = 0.012   # claude-sonnet-4-5 + web_search
 MAX_TICKERS_PER_RUN = int(os.getenv("MAX_TICKERS_PER_RUN", "50"))  # safety throttle
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
 # In-memory daily spend tracker (resets on container restart)
 _daily_spend = 0.0
@@ -942,21 +954,52 @@ def extract_catalysts_for_ticker(ticker: str, company_name: str) -> Tuple[List[D
                 meta["error"] = f"gemini_failed: {type(e).__name__}"
                 # fall through to OpenAI
 
-    # Fallback: OpenAI gpt-4o
+    # Tier 2: OpenAI gpt-4o (no grounding, fast, ~$0.003/call)
+    openai_returned_empty = False
     if not OPENAI_API_KEY:
         meta["error"] = (meta.get("error") or "") + "; OPENAI_API_KEY not set"
-        return [], meta
-    try:
-        catalysts = _call_openai_extract(ticker, company_name)
-        _record_spend(COST_PER_OPENAI_CALL_USD)
-        # If we already recorded gemini cost, append rather than replace cost
-        meta["cost_usd"] = round(meta.get("cost_usd", 0.0) + COST_PER_OPENAI_CALL_USD, 4)
-        meta["source"] = "llm_openai_after_gemini_empty" if gemini_returned_empty else "llm_openai"
-        return catalysts, meta
-    except Exception as e:
-        meta["error"] = (meta.get("error") or "") + f"; openai_failed: {type(e).__name__}: {e}"
-        logger.exception(f"OpenAI extract failed for {ticker}")
-        return [], meta
+    else:
+        try:
+            catalysts = _call_openai_extract(ticker, company_name)
+            _record_spend(COST_PER_OPENAI_CALL_USD)
+            meta["cost_usd"] = round(meta.get("cost_usd", 0.0) + COST_PER_OPENAI_CALL_USD, 4)
+            if catalysts:
+                meta["source"] = "llm_openai_after_gemini_empty" if gemini_returned_empty else "llm_openai"
+                return catalysts, meta
+            # OpenAI knew nothing about this ticker. Common for mid-cap biotechs
+            # whose pipeline news post-dates the GPT-4o knowledge cutoff. Fall
+            # through to Anthropic+web_search for an active web check.
+            openai_returned_empty = True
+            logger.info(f"OpenAI returned 0 catalysts for {ticker}, trying Anthropic+web_search")
+        except Exception as e:
+            meta["error"] = (meta.get("error") or "") + f"; openai_failed: {type(e).__name__}: {e}"
+            logger.warning(f"OpenAI extract failed for {ticker}, trying Anthropic+web_search: {e}")
+
+    # Tier 3: Anthropic Claude with web_search tool
+    # Activates only when:
+    #   - feature flag UNIVERSE_ANTHROPIC_TIER3 is on
+    #   - ANTHROPIC_API_KEY is configured
+    #   - both Gemini and OpenAI returned empty (or failed)
+    # ~4× the cost of OpenAI, so we don't burn it on every call. Used to
+    # plug the gap for mid-cap biotechs that older models don't know about.
+    if (ANTHROPIC_TIER3_ENABLED and ANTHROPIC_API_KEY and openai_returned_empty):
+        try:
+            catalysts = _call_anthropic_extract(ticker, company_name)
+            _record_spend(COST_PER_ANTHROPIC_CALL_USD)
+            meta["cost_usd"] = round(meta.get("cost_usd", 0.0) + COST_PER_ANTHROPIC_CALL_USD, 4)
+            if catalysts:
+                meta["source"] = "llm_anthropic_websearch_after_openai_empty"
+                return catalysts, meta
+            meta["error"] = (meta.get("error") or "") + "; anthropic_returned_empty"
+            logger.info(f"Anthropic+web_search also returned 0 for {ticker}")
+        except Exception as e:
+            meta["error"] = (meta.get("error") or "") + f"; anthropic_failed: {type(e).__name__}: {e}"
+            logger.warning(f"Anthropic extract failed for {ticker}: {e}")
+
+    # All tiers exhausted. Return empty.
+    if openai_returned_empty:
+        meta["source"] = "llm_all_tiers_empty"
+    return [], meta
 
 
 def _mock_catalysts(ticker: str, company_name: str) -> List[Dict]:
@@ -1120,6 +1163,128 @@ def _call_openai_extract(ticker: str, company_name: str) -> List[Dict]:
             "source": "llm_openai",
             "source_url": None,
             "confidence_score": item.get("confidence_score", 0.6),
+        })
+    return out
+
+
+def _call_anthropic_extract(ticker: str, company_name: str) -> List[Dict]:
+    """Tier-3 fallback: Anthropic Claude with web_search tool.
+
+    Used when both Gemini (grounding) and OpenAI (static knowledge) returned
+    zero catalysts. Claude's web_search tool actively searches the live web
+    for SEC 8-K filings, FDA calendar, ClinicalTrials.gov, and recent press
+    releases — useful for mid-cap biotechs whose pipeline news post-dates
+    GPT-4o's knowledge cutoff.
+
+    More expensive (~$0.012/call vs $0.003 for OpenAI) so reserved for the
+    cases where the cheaper providers genuinely don't know.
+    """
+    import time as _t
+    prompt = _build_extraction_prompt(ticker, company_name) + (
+        "\n\nIMPORTANT: Use the web_search tool to find recent SEC 8-K filings, FDA calendar entries, "
+        "ClinicalTrials.gov listings, and press releases for this specific ticker. "
+        "Search queries like '{ticker} FDA decision 2026', '{ticker} phase 3 readout', "
+        "'{ticker} clinical trial completion'. Use tool results to ground every catalyst — "
+        "do not return events you cannot verify from search results."
+    ).format(ticker=ticker)
+
+    t0 = _t.time()
+    status = "success"
+    err_msg = None
+    tokens_in = 0
+    tokens_out = 0
+    text_blocks: List[str] = []
+
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=90.0)
+        # Claude with web_search tool — agentic loop. The model decides when
+        # to call web_search; we keep stepping until it stops requesting it.
+        msg = client.messages.create(
+            model=LLM_MODEL_ANTHROPIC,
+            max_tokens=2500,
+            messages=[{"role": "user", "content": prompt}],
+            tools=[{
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "max_uses": 4,  # cap to bound latency + cost
+            }],
+        )
+        # Token usage
+        usage = getattr(msg, "usage", None)
+        if usage:
+            tokens_in = getattr(usage, "input_tokens", 0) or 0
+            tokens_out = getattr(usage, "output_tokens", 0) or 0
+        # Collect ALL text blocks from the response (may be interleaved
+        # with tool_use/tool_result blocks when web_search is invoked)
+        for block in msg.content:
+            if hasattr(block, "type") and block.type == "text":
+                text_blocks.append(block.text)
+            elif hasattr(block, "text") and block.text:
+                # Fallback for older SDK shapes
+                text_blocks.append(block.text)
+    except Exception as e:
+        status = "error"
+        err_msg = str(e)[:300]
+        logger.warning(f"[anthropic] {ticker} call failed: {err_msg}")
+    finally:
+        try:
+            from services.llm_usage import record_usage
+            record_usage(
+                provider="anthropic", model=LLM_MODEL_ANTHROPIC,
+                feature="universe_seeder", ticker=ticker,
+                tokens_input=tokens_in, tokens_output=tokens_out,
+                duration_ms=int((_t.time() - t0) * 1000),
+                status=status, error_message=err_msg,
+            )
+        except Exception:
+            pass
+
+    if status == "error" or not text_blocks:
+        return []
+
+    # Concatenate all text blocks. Find the FIRST complete JSON object —
+    # Claude often produces a "Based on web searches..." preamble before
+    # the JSON, so we have to dig.
+    combined = "\n".join(text_blocks).strip()
+    json_text = _extract_first_json_object(combined)
+    if not json_text:
+        logger.warning(f"[anthropic] {ticker} returned text but no parseable JSON")
+        return []
+
+    try:
+        parsed = json.loads(json_text)
+    except Exception as e:
+        logger.warning(f"[anthropic] {ticker} JSON parse failed: {e}")
+        return []
+    if isinstance(parsed, dict):
+        for k in ("catalysts", "results", "data", "items"):
+            if k in parsed and isinstance(parsed[k], list):
+                parsed = parsed[k]
+                break
+        else:
+            parsed = []
+    if not isinstance(parsed, list):
+        parsed = []
+
+    out = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        out.append({
+            "ticker": ticker,
+            "company_name": company_name,
+            "catalyst_type": item.get("catalyst_type", "Unknown"),
+            "catalyst_date": item.get("catalyst_date"),
+            "date_precision": item.get("date_precision", "exact"),
+            "description": item.get("description", ""),
+            "drug_name": item.get("drug_name"),
+            "canonical_drug_name": _canonicalize_drug(item.get("drug_name")),
+            "indication": item.get("indication"),
+            "phase": item.get("phase"),
+            "source": "llm_anthropic_websearch",
+            "source_url": None,
+            "confidence_score": item.get("confidence_score", 0.7),  # higher default — web-grounded
         })
     return out
 
