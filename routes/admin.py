@@ -244,6 +244,26 @@ async def seed_universe_v2_async(req: AsyncSeedRequest):
     return {"job_id": job_id, "status": "queued", "start_idx": req.start_idx, "max_tickers": req.max_tickers}
 
 
+@router.post("/universe/test-tier3-anthropic")
+async def test_anthropic_tier3(ticker: str, company_name: str = ""):
+    """Direct test of the tier-3 Anthropic+web_search extractor.
+
+    Bypasses Gemini and OpenAI; calls _call_anthropic_extract directly so
+    we can verify the wiring without waiting for both upstream tiers to
+    return empty. Use sparingly — each call is ~\$0.012 + 30-90s latency.
+
+    Returns: {"catalysts": [...], "n": int, "ticker": str}
+    """
+    from services.universe_seeder import _call_anthropic_extract, ANTHROPIC_API_KEY
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(503, "ANTHROPIC_API_KEY not configured")
+    try:
+        cats = _call_anthropic_extract(ticker, company_name or ticker)
+        return {"ticker": ticker, "n": len(cats), "catalysts": cats}
+    except Exception as e:
+        raise HTTPException(500, f"anthropic extract failed: {type(e).__name__}: {e}")
+
+
 @router.post("/universe/v2-seed-mark-stale")
 async def mark_stale_jobs(stale_minutes: int = 10):
     """Mark in-memory bg jobs that have been 'running' for >stale_minutes as 'stale'.
