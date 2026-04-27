@@ -2060,3 +2060,44 @@ async def polygon_options_chain_raw(ticker: str, as_of: str, sample: int = 5):
     except Exception as e:
         logger.exception("polygon_options_chain_raw failed")
         raise HTTPException(500, f"raw chain error: {e}")
+
+
+@router.get("/polygon/aggs-probe")
+async def polygon_aggs_probe(contract_ticker: str, as_of: str):
+    """Single-call probe of /v2/aggs/ticker/{contract}/range/1/day/{as_of}/{as_of}.
+    Used to verify whether per-option historical OHLC actually returns data
+    (some Polygon plans may not include this). FAST — one HTTP call.
+    
+    Example: contract_ticker=O:AAPL260116C00200000, as_of=2026-01-16
+    """
+    try:
+        from services.polygon_data import _http_get, POLYGON_BASE
+        url = f"{POLYGON_BASE}/v2/aggs/ticker/{contract_ticker}/range/1/day/{as_of}/{as_of}"
+        data = _http_get(url, params={"adjusted": "true"}, timeout=8)
+        return {
+            "contract": contract_ticker, "as_of": as_of, "url": url,
+            "raw_response": data,
+        }
+    except Exception as e:
+        logger.exception("polygon_aggs_probe failed")
+        raise HTTPException(500, f"probe error: {e}")
+
+
+@router.get("/polygon/contracts-probe")
+async def polygon_contracts_probe(ticker: str, as_of: str,
+                                    expired: str = "true"):
+    """Single-call probe of /v3/reference/options/contracts.
+    Returns first 5 contracts so we can see what's available."""
+    try:
+        from services.polygon_data import _http_get, POLYGON_BASE
+        params = {
+            "underlying_ticker": ticker, "as_of": as_of, "expired": expired,
+            "limit": 5, "order": "asc", "sort": "expiration_date",
+            "expiration_date.gte": as_of,
+        }
+        data = _http_get(f"{POLYGON_BASE}/v3/reference/options/contracts", params=params)
+        return {"ticker": ticker, "as_of": as_of, "expired": expired,
+                "raw_response": data}
+    except Exception as e:
+        logger.exception("polygon_contracts_probe failed")
+        raise HTTPException(500, f"probe error: {e}")
