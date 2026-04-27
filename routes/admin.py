@@ -3323,50 +3323,63 @@ async def backfill_3d_and_signals(max_rows: int = 100, only_compute_signals: boo
                         results["errors"].append({"id": outcome_id, "ticker": ticker, "phase": "A", "error": str(e)[:100]})
 
         # ── Phase B: classify signals (always runs) ──────────────────
-        # Pull every row with a predicted_move_pct, classify, persist.
+        # Pull every row with a predicted_prob, classify via the new
+        # probability-bias + scenario-magnitude logic. predicted_prob is
+        # the catalyst's confidence_score at prediction time (used as
+        # P(approval)). predicted_move_pct is the tiny EV that we
+        # explicitly DON'T use as a directional signal — it collapses
+        # 60/40 bets to ~0%, masking the model's actual conviction.
         with db.get_conn() as conn:
             cur = conn.cursor()
             cur.execute("""
                 SELECT pco.id, pco.ticker, pco.catalyst_type, pco.catalyst_date,
-                       pco.predicted_move_pct, pco.abnormal_move_pct_3d,
-                       cu.confidence_score, cu.date_precision
+                       pco.predicted_prob, pco.predicted_move_pct,
+                       pco.abnormal_move_pct_3d,
+                       cu.date_precision
                 FROM post_catalyst_outcomes pco
                 LEFT JOIN catalyst_universe cu
                   ON cu.ticker = pco.ticker
                  AND cu.catalyst_type = pco.catalyst_type
                  AND cu.catalyst_date::text = pco.catalyst_date::text
                  AND cu.status = 'active'
-                WHERE pco.predicted_move_pct IS NOT NULL
             """)
             rows = cur.fetchall()
 
+        from services.catalyst_signal import (
+            classify_trade_signal, is_tradeable,
+            predicted_direction_from_probability,
+        )
         sig_dist: Dict[str, int] = {}
         tradeable_n = 0
-        for outcome_id, ticker, cat_type, cat_date, pred, abnormal_3d, conf, dprec in rows:
+        for outcome_id, ticker, cat_type, cat_date, pred_prob, pred_ev, abnormal_3d, dprec in rows:
             try:
-                # Options-implied move from the cached options table is not
-                # always populated for historical rows. We compute the signal
-                # WITHOUT the options check for historical rows (passing None
-                # disables that gate). This is conservative — we keep slightly
-                # more rows in the tradeable set than strict scoring would.
+                # Direction signal driven by P(approval), not by EV.
                 signal = classify_trade_signal(
-                    predicted_move_pct=float(pred) if pred is not None else None,
-                    confidence_score=float(conf) if conf is not None else None,
+                    probability=float(pred_prob) if pred_prob is not None else None,
                     catalyst_type=cat_type,
+                    confidence_score=float(pred_prob) if pred_prob is not None else None,
                     date_precision=dprec,
                     options_implied_move_pct=None,  # historical rows lack live options
                 )
                 tradeable_flag = is_tradeable(signal)
-                # Direction correctness on 3d abnormal target
+
+                # Direction correctness on 3D abnormal target.
+                # Predicted direction comes from probability bias (LONG if p>0.5,
+                # SHORT if p<0.5). Actual direction comes from sign of 3D
+                # abnormal return vs XBI, with a 3% deadband to avoid flipping
+                # on near-zero noise.
+                pred_dir = predicted_direction_from_probability(
+                    float(pred_prob) if pred_prob is not None else None
+                )
                 dir_correct_3d = None
                 err_3d = None
-                if abnormal_3d is not None and pred is not None:
-                    err_3d = abs(float(abnormal_3d) - float(pred))
-                    if tradeable_flag:
-                        dir_correct_3d = (
-                            (float(pred) > 0 and float(abnormal_3d) > 0)
-                            or (float(pred) < 0 and float(abnormal_3d) < 0)
-                        )
+                if abnormal_3d is not None:
+                    ab = float(abnormal_3d)
+                    if pred_ev is not None:
+                        err_3d = abs(ab - float(pred_ev))
+                    if tradeable_flag and pred_dir is not None and abs(ab) >= 3.0:
+                        actual_dir = 1 if ab > 0 else -1
+                        dir_correct_3d = (pred_dir == actual_dir)
                 with db.get_conn() as conn:
                     cur = conn.cursor()
                     cur.execute("""
