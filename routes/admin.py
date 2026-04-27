@@ -2325,6 +2325,48 @@ async def sec_capital_structure(ticker: str):
         raise HTTPException(500, f"sec_capital_structure error: {e}")
 
 
+@router.get("/post-catalyst/sector-coverage")
+async def post_catalyst_sector_coverage():
+    """Distribution of sector_basket values across post_catalyst_outcomes.
+    Used to debug abnormal-returns recompute coverage.
+    """
+    try:
+        from services.database import BiotechDatabase
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT
+                    COALESCE(sector_basket, 'NULL') AS basket,
+                    COUNT(*) AS n,
+                    SUM(CASE WHEN actual_move_pct_1d IS NOT NULL THEN 1 ELSE 0 END) AS with_actual_1d,
+                    SUM(CASE WHEN abnormal_move_pct_1d IS NOT NULL THEN 1 ELSE 0 END) AS with_abnormal_1d,
+                    SUM(CASE WHEN abnormal_move_pct_30d IS NOT NULL THEN 1 ELSE 0 END) AS with_abnormal_30d
+                FROM post_catalyst_outcomes
+                GROUP BY 1
+                ORDER BY n DESC
+            """)
+            rows = cur.fetchall()
+            cur.execute("SELECT COUNT(*) FROM post_catalyst_outcomes")
+            total = cur.fetchone()[0]
+        return {
+            "total_outcomes": total,
+            "by_sector_basket": [
+                {
+                    "basket": r[0],
+                    "n": r[1],
+                    "with_actual_1d": r[2],
+                    "with_abnormal_1d": r[3],
+                    "with_abnormal_30d": r[4],
+                }
+                for r in rows
+            ],
+        }
+    except Exception as e:
+        logger.exception("sector_coverage failed")
+        raise HTTPException(500, f"sector_coverage error: {e}")
+
+
 @router.post("/post-catalyst/recompute-abnormal")
 async def recompute_abnormal(max_rows: int = 100):
     """Backfill sector_move + abnormal_move columns on existing post_catalyst
