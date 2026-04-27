@@ -360,6 +360,26 @@ async def analyze_npv(req: NPVRequest):
             logger.warning(f"compute_move_estimates failed (non-fatal): {e}")
             move_estimates = None
 
+        # ---- Step 4.6: Equity value with cash/debt/dilution adjustment ----
+        # ChatGPT critique #5: "Add cash/debt/dilution-adjusted equity value,
+        # not only asset rNPV divided by market cap."
+        # Pull SEC EDGAR balance sheet → compute per-share value, dilution risk.
+        equity_value = None
+        cap_structure = None
+        try:
+            from services.sec_financials import fetch_capital_structure, compute_equity_value
+            cap_structure = fetch_capital_structure(req.ticker)
+            if cap_structure and not cap_structure.get("_error"):
+                rnpv_m = float((rnpv or {}).get("rnpv_m") or 0)
+                if rnpv_m > 0:
+                    equity_value = compute_equity_value(
+                        rnpv_m=rnpv_m,
+                        cap_struct=cap_structure,
+                        dilution_assumed_pct=req.dilution_assumed_pct,
+                    )
+        except Exception as e:
+            logger.info(f"equity_value computation failed (non-fatal): {e}")
+
         # ---- Step 5: persist to cache ----
         result_payload = {
             "ticker": req.ticker,
@@ -381,6 +401,9 @@ async def analyze_npv(req: NPVRequest):
             },
             # 4 distinct move types — UI should show all separately
             "move_estimates": move_estimates,
+            # Capital-structure-aware equity value — replaces naive rNPV/market_cap
+            "equity_value": equity_value,
+            "capital_structure": cap_structure,
         }
         try:
             write_npv_cached(req.ticker, None, params_hash_val, result_payload, ttl_days=1)

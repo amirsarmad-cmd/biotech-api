@@ -2265,3 +2265,22 @@ async def system_state():
         out["recent_npv_runs"] = {"_error": str(e)[:120]}
 
     return out
+
+
+@router.get("/sec/capital-structure")
+async def sec_capital_structure(ticker: str):
+    """Inspect SEC EDGAR capital structure for a ticker — cash, debt, shares,
+    burn rate, runway. Used to spot-check the data feeding equity_value
+    computation in /analyze/npv.
+    """
+    try:
+        from services.sec_financials import fetch_capital_structure
+        result = fetch_capital_structure(ticker.upper())
+        if not result:
+            raise HTTPException(404, "no SEC data for ticker")
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("sec capital_structure failed")
+        raise HTTPException(500, f"sec_capital_structure error: {e}")
