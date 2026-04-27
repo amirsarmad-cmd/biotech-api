@@ -3836,8 +3836,12 @@ async def post_catalyst_aggregate_v3():
 @router.get("/post-catalyst/runup-buckets")
 async def runup_buckets():
     """Diagnostic per the user's request: bucket V1 LONG signals by
-    runup_30d_pct and report direction accuracy in each bucket. Validates
-    the 'inverse hypothesis' empirically.
+    runup_30d_pct and report direction accuracy in each bucket.
+
+    Same denominator fix as aggregate-v3: 'judged' = rows where
+    |abnormal_3d| ≥ 3% (deadband excluded). Without this fix, accuracy
+    is artificially deflated because deadband rows are counted as
+    'not hits' in a simple COUNT(*) FILTER division.
 
     Buckets:
       runup ≥ +20%    Stock has run, expect priced-in / sell-the-news
@@ -3859,8 +3863,9 @@ async def runup_buckets():
                         WHEN runup_pre_event_30d_pct >= -5 THEN '2_flat_-5_to_5'
                         ELSE                                    '1_washed_out_<=-5'
                     END AS bucket,
-                    COUNT(*) AS n,
-                    COUNT(*) FILTER (WHERE direction_correct_3d = TRUE) AS hits_v1,
+                    COUNT(*) AS total,
+                    COUNT(*) FILTER (WHERE direction_correct_3d IS NOT NULL) AS judged,
+                    COUNT(*) FILTER (WHERE direction_correct_3d = TRUE) AS hits,
                     AVG(abnormal_move_pct_3d) AS avg_abnormal_3d,
                     AVG(runup_pre_event_30d_pct) AS avg_runup
                 FROM post_catalyst_outcomes
@@ -3873,12 +3878,14 @@ async def runup_buckets():
             rows = cur.fetchall()
         buckets = []
         for r in rows:
-            bucket, n, hits, avg_ab, avg_ru = r
-            acc = round(100.0 * hits / n, 1) if n > 0 else None
+            bucket, total, judged, hits, avg_ab, avg_ru = r
+            acc = round(100.0 * hits / judged, 1) if judged > 0 else None
             inv = round(100.0 - acc, 1) if acc is not None else None
             buckets.append({
                 "bucket": bucket,
-                "count": n,
+                "count": total,
+                "judged": judged,
+                "deadband_excluded": total - judged,
                 "v1_hits": hits,
                 "v1_direction_accuracy_pct": acc,
                 "inverse_accuracy_pct": inv,
@@ -3886,10 +3893,10 @@ async def runup_buckets():
                 "avg_runup_pct": round(float(avg_ru), 1) if avg_ru is not None else None,
             })
         return {
-            "method": "Tradeable V1 signals (LONG/SHORT) bucketed by pre-event 30d runup. Direction scored against 3D abnormal-vs-XBI.",
+            "method": "Tradeable V1 signals (LONG/SHORT) bucketed by pre-event 30d runup. Direction scored against 3D abnormal-vs-XBI. 'judged' excludes deadband (|abnormal_3d| < 3%) rows where there's no clear actual direction.",
             "buckets": buckets,
             "interpretation": {
-                "expected": "If user's hypothesis holds: high-runup buckets show inverse accuracy ≥ 65% (i.e., V1 LONG signals are wrong, fade them). Low-runup / washed-out buckets show normal V1 accuracy (V1 LONG is right, hold it).",
+                "denominator_note": "v1_direction_accuracy_pct uses 'judged' as denominator. The user's original '31.7%' V1 accuracy used total-as-denominator which artificially deflates because deadband rows count as 'not-hits' rather than being excluded.",
             },
         }
     except Exception as e:
