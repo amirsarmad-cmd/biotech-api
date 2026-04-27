@@ -2029,3 +2029,34 @@ async def orange_book_discover_url():
         "probes": probes,
         "likely_orange_book_url": likely,
     }
+
+
+@router.get("/polygon/options-chain-raw")
+async def polygon_options_chain_raw(ticker: str, as_of: str, sample: int = 5):
+    """Dump raw sample contracts from a chain — for debugging compute_implied_move."""
+    try:
+        from services.polygon_data import fetch_historical_options_chain
+        chain = fetch_historical_options_chain(ticker=ticker.upper(), as_of_date=as_of)
+        if not chain or chain.get("_status") == "not_available":
+            return {"status": "not_available"}
+        contracts = chain.get("contracts") or []
+        # Sample diverse contracts: 5 calls and 5 puts at varying strikes
+        calls = [c for c in contracts if c.get("type") == "call"][:sample]
+        puts = [c for c in contracts if c.get("type") == "put"][:sample]
+        # Group by expiration to see what's available
+        exps = sorted(set((c.get("expiration"), c.get("type")) for c in contracts if c.get("expiration")))
+        exp_summary = {}
+        for exp, ct in exps:
+            exp_summary.setdefault(exp, {"calls": 0, "puts": 0})
+            exp_summary[exp][ct + "s"] += 1
+        return {
+            "ticker": ticker, "as_of": as_of,
+            "underlying_price": chain.get("underlying_price"),
+            "n_contracts": chain.get("n_contracts"),
+            "expirations": exp_summary,
+            "sample_calls": calls,
+            "sample_puts": puts,
+        }
+    except Exception as e:
+        logger.exception("polygon_options_chain_raw failed")
+        raise HTTPException(500, f"raw chain error: {e}")

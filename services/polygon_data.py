@@ -186,8 +186,23 @@ def fetch_historical_options_chain(ticker: str, as_of_date: str,
         day = r.get("day") or {}
         greeks = r.get("greeks") or {}
         underlying = r.get("underlying_asset") or {}
+        last_quote = r.get("last_quote") or {}
+        last_trade = r.get("last_trade") or {}
         if underlying_price is None and underlying.get("price"):
             underlying_price = float(underlying["price"])
+        # Capture multiple price sources — last_price prefers in order:
+        #  1. day.close (settlement-style)
+        #  2. last_trade.price (most recent trade)
+        #  3. day.last_quote_price
+        last_price = (day.get("close")
+                      or last_trade.get("price")
+                      or day.get("last_quote_price"))
+        bid = last_quote.get("bid")
+        ask = last_quote.get("ask")
+        # Mid = (bid + ask) / 2 when both available
+        mid = None
+        if bid is not None and ask is not None and bid > 0 and ask > 0:
+            mid = (float(bid) + float(ask)) / 2.0
         contracts.append({
             "ticker": details.get("ticker"),
             "type": (details.get("contract_type") or "").lower(),
@@ -197,7 +212,10 @@ def fetch_historical_options_chain(ticker: str, as_of_date: str,
             "delta": greeks.get("delta"),
             "gamma": greeks.get("gamma"),
             "open_interest": r.get("open_interest"),
-            "last_price": day.get("close") if day.get("close") is not None else day.get("last_quote_price"),
+            "last_price": last_price,
+            "bid": bid,
+            "ask": ask,
+            "mid": mid,
             "volume": day.get("volume"),
         })
 
@@ -288,15 +306,50 @@ def compute_implied_move_from_chain(chain: Dict, target_dte_min: int = 7,
     if not atm_call or not atm_put:
         return None
 
-    # Use last_price; could fall back to (bid+ask)/2 if available
-    call_mid = atm_call.get("last_price") or 0
-    put_mid = atm_put.get("last_price") or 0
-    if not call_mid or not put_mid:
+    # Use mid (bid+ask)/2 first; fall back to last_price; if both unavailable
+    # try IV-based price reconstruction (rough Black-Scholes ATM approximation).
+    def _option_price(c):
+        if c.get("mid"):
+            return float(c["mid"]), "mid"
+        if c.get("last_price") and float(c["last_price"]) > 0:
+            return float(c["last_price"]), "last_price"
+        return None, None
+
+    call_price, call_method = _option_price(atm_call)
+    put_price, put_method = _option_price(atm_put)
+
+    # If still missing, fall back to IV-based ATM straddle approximation:
+    # ATM straddle ≈ S × σ × √(T/365) × 2 × 0.4 × √(2/π) ≈ 0.8 × S × σ × √(T/365)
+    if (not call_price or not put_price) and (atm_call.get("iv") or atm_put.get("iv")):
+        try:
+            from datetime import datetime as _dt
+            iv = atm_call.get("iv") or atm_put.get("iv")
+            exp_dt = _dt.strptime(best_exp, "%Y-%m-%d").date()
+            dte = (exp_dt - as_of_dt).days
+            if iv and dte > 0:
+                # Approximate ATM straddle from IV (annualized)
+                straddle_approx = 0.8 * underlying * float(iv) * (dte / 365.0) ** 0.5
+                # 1-stdev from IV directly
+                implied_move_pct = 100 * float(iv) * (dte / 365.0) ** 0.5
+                return {
+                    "implied_move_pct": round(implied_move_pct, 2),
+                    "expiration": best_exp,
+                    "dte": dte,
+                    "atm_strike": atm_strike,
+                    "atm_call_iv": atm_call.get("iv"),
+                    "atm_put_iv": atm_put.get("iv"),
+                    "underlying_price": underlying,
+                    "method": "iv_direct",
+                    "_fallback_reason": "no quote/trade prices on ATM contracts",
+                }
+        except Exception:
+            pass
+
+    if not call_price or not put_price:
         return None
 
-    straddle = float(call_mid) + float(put_mid)
+    straddle = call_price + put_price
     # 1-stdev expected move ≈ 85% of straddle premium / underlying
-    # (Empirical adjustment for the fact that ATM straddle slightly overstates 1-stdev)
     implied_move_pct = 0.85 * straddle / underlying * 100
 
     exp_dt = datetime.strptime(best_exp, "%Y-%m-%d").date()
@@ -305,8 +358,10 @@ def compute_implied_move_from_chain(chain: Dict, target_dte_min: int = 7,
         "expiration": best_exp,
         "dte": (exp_dt - as_of_dt).days,
         "atm_strike": atm_strike,
-        "atm_call_mid": call_mid,
-        "atm_put_mid": put_mid,
+        "atm_call_mid": call_price,
+        "atm_put_mid": put_price,
+        "atm_call_method": call_method,
+        "atm_put_method": put_method,
         "underlying_price": underlying,
         "method": "atm_straddle_85pct",
     }
