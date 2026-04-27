@@ -637,13 +637,32 @@ async def get_stock_detail(ticker: str, with_npv: bool = Query(True)):
         from datetime import datetime as _dt, timezone as _tz
         last_upd = primary.get("_last_updated")
         if last_upd:
-            # last_upd may be datetime or string; normalize
+            # last_upd may be datetime or ISO string. _row_to_dict in
+            # routes/universe.py calls .isoformat() on datetime fields
+            # before they reach us, so we usually see a string here.
+            last_iso = None
+            last_dt = None
             if hasattr(last_upd, "isoformat"):
+                # Native datetime (rare path now that _row_to_dict normalizes)
                 last_iso = last_upd.isoformat()
-                hrs = (_dt.now(_tz.utc) - last_upd).total_seconds() / 3600.0
+                last_dt = last_upd
             else:
                 last_iso = str(last_upd)
-                hrs = None
+                # Parse ISO string. Python's fromisoformat handles 'YYYY-MM-DDTHH:MM:SS.ffffff+00:00'
+                try:
+                    last_dt = _dt.fromisoformat(last_iso)
+                except (ValueError, TypeError):
+                    last_dt = None
+            hrs = None
+            if last_dt is not None:
+                # Make sure the datetime is timezone-aware before subtracting.
+                # Naive datetimes would raise TypeError; default to UTC if naive.
+                if last_dt.tzinfo is None:
+                    last_dt = last_dt.replace(tzinfo=_tz.utc)
+                try:
+                    hrs = (_dt.now(_tz.utc) - last_dt).total_seconds() / 3600.0
+                except (TypeError, ValueError):
+                    hrs = None
             catalyst_data_health = {
                 "source": primary.get("source") or "unknown",
                 "source_url": primary.get("_source_url"),
