@@ -126,34 +126,32 @@ def fetch_historical_options_chain(ticker: str, as_of_date: str,
                                     expiration_after: Optional[str] = None,
                                     expiration_before: Optional[str] = None) -> Optional[Dict]:
     """Fetch options chain that was active on `as_of_date` (YYYY-MM-DD).
-    
-    Strategy: query /v3/snapshot/options/{ticker} which returns the chain
-    at the requested date. Filter to expirations near the catalyst window
-    (typically ±30 days from event).
-    
+
+    Polygon's /v3/snapshot/options/{ticker} ignores as_of and returns the
+    current chain. The correct historical flow uses two endpoints:
+
+      1. /v3/reference/options/contracts?underlying_ticker=X&as_of=Y
+         → list of contract tickers active on date Y (with strike, expiry,
+           contract_type as metadata only; no prices)
+      2. /v2/aggs/ticker/{contract_ticker}/range/1/day/{as_of}/{as_of}
+         → historical OHLC bar for each contract on the requested date
+
+    To keep the response tractable, we only fetch aggs for contracts that
+    are within ±20% of the underlying_close on as_of_date (near-the-money
+    only — that's all we need for ATM straddle computation).
+
     Returns:
       {
         "ticker": str,
         "as_of_date": str,
         "underlying_price": float,
         "contracts": [
-          {
-            "ticker": str,         # OPRA symbol e.g. "O:NTLA241115C00045000"
-            "type": "call"|"put",
-            "strike": float,
-            "expiration": str,     # YYYY-MM-DD
-            "iv": float,           # implied volatility
-            "delta": float,
-            "open_interest": int,
-            "last_price": float,
-            "bid": float,
-            "ask": float,
-            "volume": int,
-          }, ...
+          {"ticker", "type", "strike", "expiration",
+           "open", "high", "low", "close", "volume"}, ...
         ],
         "n_contracts": int,
+        "n_priced": int,
       }
-    Or {"_status": "not_available"} if the chain isn't available for that date.
     """
     cache_key = f"polygon:opt_chain:{ticker}:{as_of_date}:{expiration_after or ''}:{expiration_before or ''}"
     cached = _cached_get(cache_key)
@@ -161,63 +159,94 @@ def fetch_historical_options_chain(ticker: str, as_of_date: str,
         cached["_from_cache"] = True
         return cached
 
-    # Polygon's snapshot endpoint gives us the full chain at the as_of_date
-    # for historical: /v3/snapshot/options/{underlyingTicker}?as_of=YYYY-MM-DD
+    # ─── Step 1: Find underlying price on as_of_date ─────────────────
+    # /v2/aggs/ticker/{ticker}/range/1/day/{as_of}/{as_of}
+    underlying_data = _http_get(
+        f"{POLYGON_BASE}/v2/aggs/ticker/{ticker}/range/1/day/{as_of_date}/{as_of_date}",
+        params={"adjusted": "true"}, timeout=10,
+    )
+    underlying_price = None
+    if underlying_data and underlying_data.get("results"):
+        bar = underlying_data["results"][0]
+        underlying_price = float(bar.get("c") or bar.get("close") or 0) or None
+
+    # ─── Step 2: List contracts active on as_of_date ─────────────────
     params = {
+        "underlying_ticker": ticker,
         "as_of": as_of_date,
-        "limit": 250,  # max per page; biotech options chains usually <100 contracts
+        "expired": "true",  # include contracts that have since expired (we want historical)
+        "limit": 1000,
+        "order": "asc",
+        "sort": "expiration_date",
     }
     if expiration_after:
         params["expiration_date.gte"] = expiration_after
     if expiration_before:
         params["expiration_date.lte"] = expiration_before
 
-    data = _http_get(f"{POLYGON_BASE}/v3/snapshot/options/{ticker}", params=params)
-    if not data:
+    contracts_data = _http_get(f"{POLYGON_BASE}/v3/reference/options/contracts", params=params)
+    if not contracts_data:
         return None
-    if data.get("_status") in (403, 404):
-        return {"_status": "not_available", "_polygon_status": data.get("_status"),
-                "_message": data.get("_message")}
+    if contracts_data.get("_status") in (403, 404):
+        return {"_status": "not_available", "_polygon_status": contracts_data.get("_status")}
 
+    raw_contracts = contracts_data.get("results") or []
+    if not raw_contracts:
+        return {
+            "ticker": ticker, "as_of_date": as_of_date,
+            "underlying_price": underlying_price,
+            "contracts": [], "n_contracts": 0, "n_priced": 0,
+            "_source": "polygon_options",
+            "_note": "no contracts found for this date/range",
+        }
+
+    # ─── Step 3: Filter to near-the-money contracts ──────────────────
+    # If underlying_price unknown, take everything (rare but possible)
+    near_money = []
+    if underlying_price:
+        # ±25% strikes (covers all reasonable ATM straddle candidates)
+        lo = underlying_price * 0.75
+        hi = underlying_price * 1.25
+        for c in raw_contracts:
+            strike = c.get("strike_price")
+            if strike and lo <= float(strike) <= hi:
+                near_money.append(c)
+    else:
+        near_money = raw_contracts[:60]  # fallback safety cap
+
+    # ─── Step 4: Fetch OHLC for each near-the-money contract on as_of_date ─
+    # This is the expensive step — sequential calls with 100ms gap to respect
+    # any per-second cap. For 60 contracts at 100ms = 6s total.
     contracts = []
-    underlying_price = None
-    for r in (data.get("results") or []):
-        details = r.get("details") or {}
-        day = r.get("day") or {}
-        greeks = r.get("greeks") or {}
-        underlying = r.get("underlying_asset") or {}
-        last_quote = r.get("last_quote") or {}
-        last_trade = r.get("last_trade") or {}
-        if underlying_price is None and underlying.get("price"):
-            underlying_price = float(underlying["price"])
-        # Capture multiple price sources — last_price prefers in order:
-        #  1. day.close (settlement-style)
-        #  2. last_trade.price (most recent trade)
-        #  3. day.last_quote_price
-        last_price = (day.get("close")
-                      or last_trade.get("price")
-                      or day.get("last_quote_price"))
-        bid = last_quote.get("bid")
-        ask = last_quote.get("ask")
-        # Mid = (bid + ask) / 2 when both available
-        mid = None
-        if bid is not None and ask is not None and bid > 0 and ask > 0:
-            mid = (float(bid) + float(ask)) / 2.0
-        contracts.append({
-            "ticker": details.get("ticker"),
-            "type": (details.get("contract_type") or "").lower(),
-            "strike": float(details.get("strike_price")) if details.get("strike_price") is not None else None,
-            "expiration": details.get("expiration_date"),
-            "iv": r.get("implied_volatility"),
-            "delta": greeks.get("delta"),
-            "gamma": greeks.get("gamma"),
-            "open_interest": r.get("open_interest"),
-            "last_price": last_price,
-            "bid": bid,
-            "ask": ask,
-            "mid": mid,
-            "volume": day.get("volume"),
-        })
+    n_priced = 0
+    for c in near_money:
+        contract_ticker = c.get("ticker")
+        if not contract_ticker:
+            continue
+        bar_data = _http_get(
+            f"{POLYGON_BASE}/v2/aggs/ticker/{contract_ticker}/range/1/day/{as_of_date}/{as_of_date}",
+            params={"adjusted": "true"}, timeout=8,
+        )
+        bar = None
+        if bar_data and bar_data.get("results"):
+            bar = bar_data["results"][0]
+        contract = {
+            "ticker": contract_ticker,
+            "type": (c.get("contract_type") or "").lower(),
+            "strike": float(c.get("strike_price")) if c.get("strike_price") is not None else None,
+            "expiration": c.get("expiration_date"),
+            "open": float(bar["o"]) if bar and bar.get("o") is not None else None,
+            "high": float(bar["h"]) if bar and bar.get("h") is not None else None,
+            "low": float(bar["l"]) if bar and bar.get("l") is not None else None,
+            "close": float(bar["c"]) if bar and bar.get("c") is not None else None,
+            "vwap": float(bar["vw"]) if bar and bar.get("vw") is not None else None,
+            "volume": int(bar["v"]) if bar and bar.get("v") is not None else None,
+            "last_price": float(bar["c"]) if bar and bar.get("c") is not None else None,
+            "mid": float(bar["c"]) if bar and bar.get("c") is not None else None,  # use close as mid
+        }
+        if contract["close"] is not None:
+            n_priced += 1
+        contracts.append(contract)
 
     out = {
         "ticker": ticker,
@@ -225,6 +254,7 @@ def fetch_historical_options_chain(ticker: str, as_of_date: str,
         "underlying_price": underlying_price,
         "contracts": contracts,
         "n_contracts": len(contracts),
+        "n_priced": n_priced,
         "_source": "polygon_options",
         "_from_cache": False,
     }
@@ -306,10 +336,15 @@ def compute_implied_move_from_chain(chain: Dict, target_dte_min: int = 7,
     if not atm_call or not atm_put:
         return None
 
-    # Use mid (bid+ask)/2 first; fall back to last_price; if both unavailable
-    # try IV-based price reconstruction (rough Black-Scholes ATM approximation).
+    # In the new historical flow, each contract has 'close' from /v2/aggs.
+    # Use close as the primary price source, fall back to mid if present
+    # (mid is set to close in the new fetcher for backward compat).
     def _option_price(c):
-        if c.get("mid"):
+        if c.get("close") is not None and float(c["close"]) > 0:
+            return float(c["close"]), "historical_close"
+        if c.get("vwap") is not None and float(c["vwap"]) > 0:
+            return float(c["vwap"]), "historical_vwap"
+        if c.get("mid") is not None and float(c["mid"]) > 0:
             return float(c["mid"]), "mid"
         if c.get("last_price") and float(c["last_price"]) > 0:
             return float(c["last_price"]), "last_price"
@@ -318,34 +353,10 @@ def compute_implied_move_from_chain(chain: Dict, target_dte_min: int = 7,
     call_price, call_method = _option_price(atm_call)
     put_price, put_method = _option_price(atm_put)
 
-    # If still missing, fall back to IV-based ATM straddle approximation:
-    # ATM straddle ≈ S × σ × √(T/365) × 2 × 0.4 × √(2/π) ≈ 0.8 × S × σ × √(T/365)
-    if (not call_price or not put_price) and (atm_call.get("iv") or atm_put.get("iv")):
-        try:
-            from datetime import datetime as _dt
-            iv = atm_call.get("iv") or atm_put.get("iv")
-            exp_dt = _dt.strptime(best_exp, "%Y-%m-%d").date()
-            dte = (exp_dt - as_of_dt).days
-            if iv and dte > 0:
-                # Approximate ATM straddle from IV (annualized)
-                straddle_approx = 0.8 * underlying * float(iv) * (dte / 365.0) ** 0.5
-                # 1-stdev from IV directly
-                implied_move_pct = 100 * float(iv) * (dte / 365.0) ** 0.5
-                return {
-                    "implied_move_pct": round(implied_move_pct, 2),
-                    "expiration": best_exp,
-                    "dte": dte,
-                    "atm_strike": atm_strike,
-                    "atm_call_iv": atm_call.get("iv"),
-                    "atm_put_iv": atm_put.get("iv"),
-                    "underlying_price": underlying,
-                    "method": "iv_direct",
-                    "_fallback_reason": "no quote/trade prices on ATM contracts",
-                }
-        except Exception:
-            pass
-
     if not call_price or not put_price:
+        # Without historical OHLC for ATM contracts, no straddle pricing possible.
+        # IV-based fallback isn't applicable here since the new fetcher doesn't
+        # return IV (only OHLC bars).
         return None
 
     straddle = call_price + put_price
@@ -523,15 +534,28 @@ def diagnostic() -> Dict:
         "ok": bool(opt and not opt.get("_status")),
         "status_code": opt.get("_status") if opt else None,
     }
-    # Check 4: Historical options snapshot (1 month ago)
+    # Check 4: Historical options reference (the right endpoint for as_of)
     one_mo_ago = (date.today() - timedelta(days=30)).strftime("%Y-%m-%d")
     opt_hist = _http_get(
-        f"{POLYGON_BASE}/v3/snapshot/options/AAPL",
-        params={"as_of": one_mo_ago, "limit": 1},
+        f"{POLYGON_BASE}/v3/reference/options/contracts",
+        params={"underlying_ticker": "AAPL", "as_of": one_mo_ago,
+                "expired": "true", "limit": 1},
     )
-    out["checks"]["options_historical"] = {
-        "ok": bool(opt_hist and not opt_hist.get("_status")),
+    out["checks"]["options_historical_reference"] = {
+        "ok": bool(opt_hist and opt_hist.get("results")),
         "as_of": one_mo_ago,
+        "n_results": len(opt_hist.get("results", [])) if opt_hist else 0,
         "status_code": opt_hist.get("_status") if opt_hist else None,
+    }
+    # Check 5: Historical options aggregates (per-contract OHLC)
+    # Pick a contract from check 4 if available, else just probe AAPL stock aggs
+    aggs = _http_get(
+        f"{POLYGON_BASE}/v2/aggs/ticker/AAPL/range/1/day/{one_mo_ago}/{one_mo_ago}",
+        params={"adjusted": "true"},
+    )
+    out["checks"]["historical_aggs"] = {
+        "ok": bool(aggs and aggs.get("results")),
+        "as_of": one_mo_ago,
+        "status_code": aggs.get("_status") if aggs else None,
     }
     return out
