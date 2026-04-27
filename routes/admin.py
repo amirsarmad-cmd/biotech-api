@@ -2919,3 +2919,83 @@ async def catalyst_ingestion_health(hours: int = 24):
     except Exception as e:
         logger.exception("ingestion_health failed")
         raise HTTPException(500, f"ingestion_health error: {e}")
+
+
+@router.post("/db/apply-migration-011")
+async def apply_migration_011():
+    """One-shot endpoint to run migration 011 on demand. Use when the
+    Dockerfile's `alembic upgrade head` failed silently and the table
+    doesn't exist. Idempotent — uses IF NOT EXISTS everywhere.
+
+    Returns the new alembic version + list of tables affected.
+    """
+    try:
+        from services.database import BiotechDatabase
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            # 1. Add is_manual_override column to catalyst_universe
+            cur.execute("""
+                ALTER TABLE catalyst_universe
+                ADD COLUMN IF NOT EXISTS is_manual_override BOOLEAN DEFAULT FALSE
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_cu_manual
+                ON catalyst_universe(is_manual_override)
+                WHERE is_manual_override = TRUE
+            """)
+            # 2. catalyst_ingestion_log
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS catalyst_ingestion_log (
+                    id SERIAL PRIMARY KEY,
+                    ticker TEXT NOT NULL,
+                    attempt_at TIMESTAMPTZ DEFAULT NOW(),
+                    source TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    catalysts_found INTEGER DEFAULT 0,
+                    error_class TEXT,
+                    error_message TEXT,
+                    duration_ms INTEGER
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_cil_ticker_attempt
+                ON catalyst_ingestion_log(ticker, attempt_at DESC)
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_cil_status
+                ON catalyst_ingestion_log(status, attempt_at DESC)
+            """)
+            # 3. Stamp the alembic version
+            cur.execute("""
+                UPDATE alembic_version_biotech
+                SET version_num = '011_manual_override_and_ingestion_log'
+                WHERE version_num = '010_recanonicalize_dedup'
+            """)
+            stamped = cur.rowcount
+            # 4. Verify
+            cur.execute("SELECT version_num FROM alembic_version_biotech")
+            new_v = cur.fetchone()[0]
+            cur.execute("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_name = 'catalyst_universe' AND column_name = 'is_manual_override'
+            """)
+            col_present = cur.fetchone() is not None
+            cur.execute("""
+                SELECT EXISTS (
+                  SELECT 1 FROM information_schema.tables
+                  WHERE table_name = 'catalyst_ingestion_log'
+                )
+            """)
+            log_table = cur.fetchone()[0]
+            conn.commit()
+        return {
+            "success": True,
+            "new_alembic_version": new_v,
+            "is_manual_override_column_present": col_present,
+            "catalyst_ingestion_log_table_present": log_table,
+            "stamped_rows": stamped,
+        }
+    except Exception as e:
+        logger.exception("apply_migration_011 failed")
+        raise HTTPException(500, f"apply_migration_011 error: {e}")
