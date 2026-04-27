@@ -2714,51 +2714,106 @@ async def add_manual_catalyst(payload: ManualCatalystPayload):
     """Insert a manual catalyst override. The is_manual_override flag
     keeps the seeder from overwriting it on next refresh.
 
+    The UNIQUE constraint on catalyst_universe is on canonical_drug_name
+    (not drug_name) — different formattings of the same drug should
+    upsert into the same row. We compute canonical_drug_name with the
+    same function the seeder uses.
+
     Returns the inserted row ID.
     """
     try:
         from services.database import BiotechDatabase
+        from services.universe_seeder import _canonicalize_drug
+        canonical = _canonicalize_drug(payload.drug_name)
         db = BiotechDatabase()
         with db.get_conn() as conn:
             cur = conn.cursor()
-            cur.execute("""
-                INSERT INTO catalyst_universe (
-                    ticker, company_name, catalyst_type, catalyst_date,
-                    description, drug_name, indication, phase,
-                    source, source_url, confidence_score, verified, status,
-                    is_manual_override, last_updated, created_at
-                ) VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s,
-                    'manual', %s, %s, TRUE, 'active',
-                    TRUE, NOW(), NOW()
-                )
-                ON CONFLICT (ticker, catalyst_type, catalyst_date, drug_name)
-                DO UPDATE SET
-                    description = EXCLUDED.description,
-                    indication = EXCLUDED.indication,
-                    phase = EXCLUDED.phase,
-                    source_url = EXCLUDED.source_url,
-                    confidence_score = EXCLUDED.confidence_score,
-                    is_manual_override = TRUE,
-                    source = 'manual',
-                    verified = TRUE,
-                    status = 'active',
-                    last_updated = NOW()
-                RETURNING id
-            """, (
-                payload.ticker.upper().strip(),
-                None,  # company_name will be filled by trigger or next seeder run
-                payload.catalyst_type,
-                payload.catalyst_date,
-                payload.description,
-                payload.drug_name,
-                payload.indication,
-                payload.phase,
-                payload.source_url,
-                payload.probability,
-            ))
+            # The unique index is partial: WHERE canonical_drug_name IS NOT NULL
+            # AND status='active'. So ON CONFLICT only fires when canonical
+            # is non-null. For NULL canonical (company-level catalysts), we
+            # check for an existing row first and either UPDATE or INSERT.
+            if canonical:
+                cur.execute("""
+                    INSERT INTO catalyst_universe (
+                        ticker, company_name, catalyst_type, catalyst_date,
+                        description, drug_name, canonical_drug_name,
+                        indication, phase,
+                        source, source_url, confidence_score, verified, status,
+                        is_manual_override, last_updated, created_at
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        'manual', %s, %s, TRUE, 'active',
+                        TRUE, NOW(), NOW()
+                    )
+                    ON CONFLICT (ticker, catalyst_type, catalyst_date, canonical_drug_name)
+                    WHERE canonical_drug_name IS NOT NULL AND status = 'active'
+                    DO UPDATE SET
+                        description = EXCLUDED.description,
+                        drug_name = EXCLUDED.drug_name,
+                        indication = EXCLUDED.indication,
+                        phase = EXCLUDED.phase,
+                        source_url = EXCLUDED.source_url,
+                        confidence_score = EXCLUDED.confidence_score,
+                        is_manual_override = TRUE,
+                        source = 'manual',
+                        verified = TRUE,
+                        status = 'active',
+                        last_updated = NOW()
+                    RETURNING id
+                """, (
+                    payload.ticker.upper().strip(),
+                    None,  # company_name will be filled by next seeder run
+                    payload.catalyst_type, payload.catalyst_date,
+                    payload.description, payload.drug_name, canonical,
+                    payload.indication, payload.phase,
+                    payload.source_url, payload.probability,
+                ))
+            else:
+                # NULL canonical → no unique constraint. Look for existing
+                # company-level row at this (ticker, type, date) and update
+                # or insert manually.
+                cur.execute("""
+                    SELECT id FROM catalyst_universe
+                    WHERE ticker = %s AND catalyst_type = %s
+                      AND catalyst_date = %s AND canonical_drug_name IS NULL
+                      AND status = 'active'
+                    LIMIT 1
+                """, (payload.ticker.upper().strip(), payload.catalyst_type,
+                      payload.catalyst_date))
+                existing = cur.fetchone()
+                if existing:
+                    cur.execute("""
+                        UPDATE catalyst_universe
+                        SET description = %s, indication = %s, phase = %s,
+                            source_url = %s, confidence_score = %s,
+                            is_manual_override = TRUE,
+                            source = 'manual', verified = TRUE,
+                            last_updated = NOW()
+                        WHERE id = %s
+                        RETURNING id
+                    """, (payload.description, payload.indication, payload.phase,
+                          payload.source_url, payload.probability,
+                          existing[0]))
+                else:
+                    cur.execute("""
+                        INSERT INTO catalyst_universe (
+                            ticker, catalyst_type, catalyst_date, description,
+                            drug_name, canonical_drug_name, indication, phase,
+                            source, source_url, confidence_score, verified,
+                            status, is_manual_override, last_updated, created_at
+                        ) VALUES (
+                            %s, %s, %s, %s, %s, NULL, %s, %s,
+                            'manual', %s, %s, TRUE, 'active', TRUE, NOW(), NOW()
+                        )
+                        RETURNING id
+                    """, (
+                        payload.ticker.upper().strip(),
+                        payload.catalyst_type, payload.catalyst_date,
+                        payload.description, payload.drug_name,
+                        payload.indication, payload.phase,
+                        payload.source_url, payload.probability,
+                    ))
             new_id = cur.fetchone()[0]
-            # Log the manual addition into the ingestion log
             cur.execute("""
                 INSERT INTO catalyst_ingestion_log
                   (ticker, source, status, catalysts_found)
