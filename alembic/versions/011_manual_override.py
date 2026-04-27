@@ -19,12 +19,17 @@ Two changes:
    timeout'). Without this, failures are silent and the user has no way
    to diagnose why a stock has stale/missing data.
 
-Revision ID: 011_manual_override_and_ingestion_log
+Revision ID: 011_manual_override
+
+NB: revision ID kept short because alembic_version_biotech.version_num
+is varchar(32). A longer ID like '011_manual_override_and_ingestion_log'
+made alembic upgrade fail silently — the migration ran but the version
+stamp couldn't fit, rolling back the whole transaction.
 """
 from alembic import op
 
 
-revision = '011_manual_override_and_ingestion_log'
+revision = '011_manual_override'
 down_revision = '010_recanonicalize_dedup'
 branch_labels = None
 depends_on = None

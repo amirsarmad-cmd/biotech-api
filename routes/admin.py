@@ -2969,7 +2969,7 @@ async def apply_migration_011():
             # 3. Stamp the alembic version
             cur.execute("""
                 UPDATE alembic_version_biotech
-                SET version_num = '011_manual_override_and_ingestion_log'
+                SET version_num = '011_manual_override'
                 WHERE version_num = '010_recanonicalize_dedup'
             """)
             stamped = cur.rowcount
