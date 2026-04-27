@@ -408,10 +408,30 @@ async def analyze_npv(req: NPVRequest):
         # but ATM facilities + shelf registrations + warrants live in narrative
         # filings (S-3, 424B5, 8-K). For micro-caps, the CAPACITY to dilute
         # often matters more than current count.
+        #
+        # PERFORMANCE: This step fetches up to N filings + makes one LLM call
+        # per filing — typical latency 20-60s on cache miss. To prevent the
+        # /analyze/npv endpoint from hanging the UI, we:
+        #   1. Cap max_filings_to_parse to 2 (down from 4) — most relevant
+        #      filings are S-3 + most-recent 424B5
+        #   2. Wrap the whole call in asyncio.wait_for with a 25s budget
+        #   3. On timeout/failure, return None — caller can fetch later via
+        #      /admin/sec/dilution-capacity?ticker=X for the full version
         dilution_capacity = None
         try:
+            import asyncio
             from services.sec_dilution import fetch_dilution_capacity
-            dilution_capacity = fetch_dilution_capacity(req.ticker, max_filings_to_parse=4)
+            try:
+                # Run blocking call in threadpool with hard timeout
+                loop = asyncio.get_event_loop()
+                dilution_capacity = await asyncio.wait_for(
+                    loop.run_in_executor(None, fetch_dilution_capacity, req.ticker, 2),
+                    timeout=25.0,
+                )
+            except asyncio.TimeoutError:
+                logger.info(f"dilution_capacity timeout for {req.ticker} (>25s) — returning null, fetch via /admin")
+                dilution_capacity = {"_status": "timeout_in_npv_endpoint",
+                                       "_message": "Use /admin/sec/dilution-capacity for full extraction"}
         except Exception as e:
             logger.info(f"dilution_capacity lookup failed (non-fatal): {e}")
 
