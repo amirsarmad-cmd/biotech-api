@@ -366,10 +366,19 @@ async def analyze_npv(req: NPVRequest):
                 options_implied_pct = (opt or {}).get("implied_move_pct")
             except Exception as e:
                 logger.info(f"options_implied lookup failed for {req.ticker}: {e}")
-            # Pull fundamental_impact from legacy NPV if available (drives scenario scaling)
+            # Fundamental impact = how big is the catalyst vs the company.
+            # Prefer rNPV / market_cap (most accurate), fall back to legacy.
             fund_impact = None
             try:
-                fund_impact = float((legacy_npv or {}).get("fundamental_impact_pct") or 0)
+                rnpv_m = float((rnpv or {}).get("rnpv_m") or 0)
+                if rnpv_m > 0 and market_cap_m and market_cap_m > 0:
+                    # rNPV is risk-adjusted asset value at this p_approval.
+                    # Express as % of current market cap. If rNPV is $11B and
+                    # mkt cap is $1.6B, fundamental_impact = 700% (huge re-rating
+                    # potential if positive).
+                    fund_impact = (rnpv_m / market_cap_m) * 100
+                else:
+                    fund_impact = float((legacy_npv or {}).get("fundamental_impact_pct") or 0)
             except Exception:
                 pass
             move_estimates = compute_move_estimates(

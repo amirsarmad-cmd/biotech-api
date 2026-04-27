@@ -114,8 +114,11 @@ def compute_move_estimates(
     p = max(0.0, min(1.0, float(p_approval) if p_approval is not None else 0.5))
     up, down = REF_MOVES.get(catalyst_type or "", (4, -4))
 
-    # 1. Expected-value
-    expected_value = p * up + (1 - p) * down
+    # 1a. Expected-value (CALIBRATED) — uses historical mean moves
+    #     This answers: "what does the AVERAGE Phase 3 stock do at this probability"
+    #     The +up and -down come from N=287 historical outcomes; doesn't adjust
+    #     for THIS stock's fundamental impact.
+    expected_value_calibrated = p * up + (1 - p) * down
 
     # 2. Options-implied (pass-through; symmetric)
     options_implied = options_implied_pct
@@ -127,37 +130,49 @@ def compute_move_estimates(
     #    Capped at sensible bounds (unrealistic to exceed 80% on single day).
     scenario_upside = up
     scenario_downside = down
+    fi_used = False
     if fundamental_impact_pct is not None and fundamental_impact_pct > 5:
         # Drug NPV is material — scenarios should reflect that
         # (40% factor empirical: typical realized move is 30-50% of fundamental impact)
         fi = float(fundamental_impact_pct)
         scenario_upside = min(80, max(up, fi * 0.4))
         scenario_downside = max(-80, min(down, -(fi * 0.3)))
+        fi_used = True
 
     # Apply sentiment amplifier (high short interest, etc) — caller-provided
     if sentiment_adj_factor != 1.0:
         scenario_upside *= sentiment_adj_factor
         scenario_downside *= sentiment_adj_factor
 
+    # 1b. Expected-value (STOCK-SPECIFIC) — uses scenario bounds
+    #     This answers: "given the rNPV-implied scenarios for THIS stock,
+    #     what's the probability-weighted expected outcome?"
+    #     For stocks where the catalyst dwarfs market cap (NTLA-style),
+    #     this matters far more than the calibrated baseline.
+    expected_value_scenario = p * scenario_upside + (1 - p) * scenario_downside
+
     # Interpretation: warn if expected_value is ≈0 but scenarios are wide
     warning = None
-    if abs(expected_value) < 1.5 and (abs(scenario_upside) > 10 or abs(scenario_downside) > 10):
+    if abs(expected_value_scenario) < 1.5 and (abs(scenario_upside) > 10 or abs(scenario_downside) > 10):
         warning = (
             "Expected-value move is near zero because the probability is balanced, "
-            "but the actual move will likely be in one direction. Use scenario_upside / "
-            "scenario_downside for risk sizing, not the expected-value number."
+            "but the actual move will likely be sharply in one direction. Use scenario "
+            "upside / downside for risk sizing, not the expected-value number."
         )
     elif options_implied is not None and abs(options_implied - max(abs(scenario_upside), abs(scenario_downside))) > 15:
         warning = (
-            f"Options-implied move ({options_implied:.1f}%) differs materially from "
-            f"calibrated scenario ({max(abs(scenario_upside), abs(scenario_downside)):.1f}%). "
-            f"Market may be pricing in event-specific information not in the reference table."
+            f"Options-implied move (\u00b1{options_implied:.1f}%) differs materially from "
+            f"the rNPV-derived scenario ({max(abs(scenario_upside), abs(scenario_downside)):.1f}%). "
+            f"Either options are mispricing tail risk, the market knows something not in our "
+            f"data, or our scenario is too aggressive. Compare to options-implied for sizing."
         )
 
     return {
         "catalyst_type": catalyst_type,
         "p_approval_used": p,
-        "expected_value_move_pct": round(expected_value, 2),
+        "expected_value_move_pct": round(expected_value_calibrated, 2),
+        "expected_value_scenario_pct": round(expected_value_scenario, 2),
+        "expected_value_used_fundamental_impact": fi_used,
         "options_implied_move_pct": round(options_implied, 2) if options_implied is not None else None,
         "scenario_upside_pct": round(scenario_upside, 2),
         "scenario_downside_pct": round(scenario_downside, 2),
@@ -168,10 +183,10 @@ def compute_move_estimates(
         },
         "interpretation": (
             f"On {catalyst_type or 'event'}: "
-            f"weighted avg = {expected_value:+.1f}% | "
-            f"if positive ≈ {scenario_upside:+.1f}% | "
-            f"if negative ≈ {scenario_downside:+.1f}%"
-            + (f" | options-implied ±{options_implied:.1f}%" if options_implied is not None else "")
+            f"weighted avg = {expected_value_scenario:+.1f}% | "
+            f"if positive \u2248 {scenario_upside:+.1f}% | "
+            f"if negative \u2248 {scenario_downside:+.1f}%"
+            + (f" | options-implied \u00b1{options_implied:.1f}%" if options_implied is not None else "")
         ),
         "warning": warning,
     }
