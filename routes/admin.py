@@ -1,7 +1,7 @@
 """
 /admin — universe refresh, DB stats, migration tools.
 """
-import logging, os
+import logging, os, json
 from datetime import datetime
 from typing import Optional
 from fastapi import APIRouter, HTTPException
@@ -1721,3 +1721,239 @@ async def orange_book_status(force_refresh: bool = False):
     except Exception as e:
         logger.exception("orange_book_status failed")
         raise HTTPException(500, f"orange_book_status error: {e}")
+
+
+# ────────────────────────────────────────────────────────────
+# Polygon — historical options + news
+# ────────────────────────────────────────────────────────────
+
+@router.get("/polygon/status")
+async def polygon_status():
+    """Diagnose Polygon API connectivity + plan tier coverage."""
+    try:
+        from services.polygon_data import diagnostic
+        return diagnostic()
+    except Exception as e:
+        logger.exception("polygon_status failed")
+        raise HTTPException(500, f"polygon_status error: {e}")
+
+
+@router.get("/polygon/options-chain")
+async def polygon_options_chain(ticker: str, as_of: str):
+    """Fetch historical options chain for a ticker on a specific date.
+    Used to verify the chain we'll use for backfill matches reality."""
+    try:
+        from services.polygon_data import fetch_historical_options_chain, compute_implied_move_from_chain
+        chain = fetch_historical_options_chain(ticker=ticker.upper(), as_of_date=as_of)
+        if not chain or chain.get("_status") == "not_available":
+            return {"status": "not_available", "ticker": ticker, "as_of": as_of,
+                    "_polygon_status": chain.get("_polygon_status") if chain else None}
+        move = compute_implied_move_from_chain(chain)
+        return {
+            "status": "ok",
+            "ticker": ticker.upper(),
+            "as_of": as_of,
+            "chain_size": chain.get("n_contracts"),
+            "underlying_price": chain.get("underlying_price"),
+            "implied_move": move,
+            "from_cache": chain.get("_from_cache", False),
+        }
+    except Exception as e:
+        logger.exception("polygon_options_chain failed")
+        raise HTTPException(500, f"options_chain error: {e}")
+
+
+class OptionsBackfillRequest(BaseModel):
+    max_outcomes: int = 50
+    skip_with_existing: bool = True  # don't re-fetch outcomes that already have options_implied_move_pct
+    target_dte_min: int = 7
+    target_dte_max: int = 60
+
+
+@router.post("/polygon/backfill-options-implied")
+async def polygon_backfill_options_implied(req: OptionsBackfillRequest):
+    """Backfill options_implied_move_pct on post_catalyst_outcomes using
+    Polygon historical chains (T-1 from catalyst date).
+
+    This replaces the current implementation which captures TODAY's chain
+    at backfill time — meaningless for events that happened months ago.
+    """
+    try:
+        from services.polygon_data import is_configured, backfill_historical_implied_move
+        from services.database import BiotechDatabase
+
+        if not is_configured():
+            raise HTTPException(400, "POLYGON_API_KEY not configured (check for trailing-space typo on Railway)")
+
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            # Pick outcomes ordered by recency; skip ones that already have data
+            # if requested.
+            where_clause = ""
+            if req.skip_with_existing:
+                where_clause = "AND (options_implied_move_pct IS NULL OR options_implied_move_pct = 0)"
+            cur.execute(f"""
+                SELECT id, ticker, catalyst_date, catalyst_type, outcome_classification
+                FROM post_catalyst_outcomes
+                WHERE catalyst_date IS NOT NULL
+                  {where_clause}
+                ORDER BY catalyst_date DESC
+                LIMIT %s
+            """, (req.max_outcomes,))
+            rows = cur.fetchall()
+
+        results = {"attempted": 0, "succeeded": 0, "no_chain": 0, "no_straddle": 0,
+                   "errors": [], "samples": []}
+        for row in rows:
+            results["attempted"] += 1
+            outcome_id, ticker, cat_date, cat_type, _ = row
+            try:
+                cat_str = cat_date.strftime("%Y-%m-%d") if hasattr(cat_date, "strftime") else str(cat_date)[:10]
+                bf = backfill_historical_implied_move(
+                    ticker=ticker, catalyst_date=cat_str,
+                    target_dte_min=req.target_dte_min, target_dte_max=req.target_dte_max,
+                )
+                if not bf:
+                    # Could be no chain available, or no straddle pricing
+                    results["no_chain"] += 1
+                    continue
+                imp = bf.get("implied_move_pct")
+                if imp is None:
+                    results["no_straddle"] += 1
+                    continue
+                # Update DB
+                with db.get_conn() as conn:
+                    cur = conn.cursor()
+                    cur.execute("""
+                        UPDATE post_catalyst_outcomes
+                        SET options_implied_move_pct = %s,
+                            options_implied_meta = %s::jsonb
+                        WHERE id = %s
+                    """, (imp, json.dumps({
+                        "method": "polygon_historical_chain",
+                        "as_of": bf.get("as_of_date"),
+                        "expiration": bf.get("expiration"),
+                        "atm_strike": bf.get("atm_strike"),
+                        "dte": bf.get("dte"),
+                        "underlying_price": bf.get("underlying_price"),
+                        "computed_at": __import__("datetime").datetime.utcnow().isoformat(),
+                    }), outcome_id))
+                    conn.commit()
+                results["succeeded"] += 1
+                if len(results["samples"]) < 5:
+                    results["samples"].append({
+                        "id": outcome_id, "ticker": ticker, "catalyst_date": cat_str,
+                        "implied_move_pct": imp, "expiration": bf.get("expiration"),
+                    })
+            except Exception as e:
+                if len(results["errors"]) < 10:
+                    results["errors"].append({"id": outcome_id, "ticker": ticker, "error": str(e)[:100]})
+        return results
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("polygon backfill failed")
+        raise HTTPException(500, f"backfill error: {e}")
+
+
+@router.get("/polygon/news")
+async def polygon_news(ticker: str, since: Optional[str] = None, limit: int = 20):
+    """Fetch Polygon news for a ticker. Optional `since=YYYY-MM-DD`."""
+    try:
+        from services.polygon_data import fetch_news
+        result = fetch_news(
+            ticker=ticker.upper(),
+            published_utc_gte=since,
+            limit=min(limit, 100),
+        )
+        if not result:
+            raise HTTPException(503, "polygon news fetch failed")
+        # Strip the full body in summary view
+        return {
+            "ticker": ticker.upper(),
+            "count": result.get("count"),
+            "from_cache": result.get("_from_cache", False),
+            "articles": [
+                {
+                    "title": a.get("title"),
+                    "publisher": (a.get("publisher") or {}).get("name"),
+                    "published_utc": a.get("published_utc"),
+                    "article_url": a.get("article_url"),
+                    "description": (a.get("description") or "")[:300],
+                    "insights": a.get("insights") or [],
+                    "tickers": a.get("tickers") or [],
+                }
+                for a in (result.get("articles") or [])[:limit]
+            ],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("polygon_news failed")
+        raise HTTPException(500, f"news error: {e}")
+
+
+class PolygonNewsIngestRequest(BaseModel):
+    ticker: str
+    since_days: int = 30
+    max_articles: int = 20
+
+
+@router.post("/polygon/news-ingest")
+async def polygon_news_ingest(req: PolygonNewsIngestRequest):
+    """Pull recent Polygon news for a ticker, push each article URL through
+    research_ingestor → research_corpus. This populates Layer 5 with
+    professionally-aggregated article bodies.
+
+    Cost: ~$0.001-0.005 per article (LLM extraction + embedding).
+    """
+    try:
+        from services.polygon_data import fetch_news, is_configured
+        from services.research_ingestor import ingest_url
+
+        if not is_configured():
+            raise HTTPException(400, "POLYGON_API_KEY not configured")
+
+        ticker = req.ticker.upper()
+        since = (datetime.utcnow() - __import__("datetime").timedelta(days=req.since_days)).strftime("%Y-%m-%dT00:00:00Z")
+        result = fetch_news(ticker=ticker, published_utc_gte=since,
+                            limit=min(req.max_articles, 100))
+        if not result or not result.get("articles"):
+            return {"ticker": ticker, "ingested": 0, "skipped": 0, "errors": [],
+                    "_note": "no articles returned by Polygon"}
+
+        ingested = 0
+        skipped = 0
+        errors = []
+        samples = []
+        for a in (result.get("articles") or [])[:req.max_articles]:
+            url = a.get("article_url")
+            if not url:
+                skipped += 1
+                continue
+            try:
+                r = ingest_url(url=url, ticker_hint=ticker)
+                if r.get("status") == "ok":
+                    ingested += 1
+                    if len(samples) < 5:
+                        samples.append({
+                            "id": r.get("id"),
+                            "title": (r.get("title") or "")[:80],
+                            "url_domain": r.get("url_domain"),
+                        })
+                else:
+                    skipped += 1
+                    if len(errors) < 5:
+                        errors.append({"url": url[:80], "error": r.get("error")})
+            except Exception as e:
+                if len(errors) < 5:
+                    errors.append({"url": url[:80], "error": str(e)[:100]})
+
+        return {"ticker": ticker, "ingested": ingested, "skipped": skipped,
+                "errors": errors, "samples": samples}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("polygon_news_ingest failed")
+        raise HTTPException(500, f"news_ingest error: {e}")

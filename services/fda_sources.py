@@ -491,6 +491,7 @@ def _download_and_parse_orange_book() -> Optional[Dict]:
     download_attempts = []
     # Try multiple candidate URLs — FDA changes them occasionally
     urls_to_try = [
+        "https://www.accessdata.fda.gov/cder/orange_book.zip",
         "https://www.fda.gov/media/76860/download?attachment",
         "https://www.fda.gov/media/76860/download",
     ]
