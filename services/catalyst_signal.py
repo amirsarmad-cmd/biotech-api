@@ -128,22 +128,12 @@ def classify_trade_signal(
     min_confidence: float = DEFAULT_MIN_CONFIDENCE,
     options_ratio_floor: float = DEFAULT_OPTIONS_RATIO_FLOOR,
 ) -> str:
-    """Return one of: 'LONG', 'SHORT', 'NO_TRADE_*'.
+    """V1 classifier — kept for backwards compatibility.
 
-    Inputs the classifier needs:
-      - probability: P(positive outcome / approval). The directional bet is
-        derived from how far this is from 0.5. The EV calculation
-        (probability_weighted average of scenarios) collapses high-conviction
-        bets into tiny numbers, which is why we don't use it.
-      - scenario_up_pct / scenario_down_pct: the model's positive vs negative
-        scenario magnitudes. Falls back to REF_SCENARIOS if not provided.
-      - confidence_score: data-quality floor. Distinct from probability.
-      - date_precision: catalyst-date precision. Fuzzy dates can't be timed.
-      - options_implied_move_pct: if the market implies ±30% but our model
-        says only +3%, we're paying too much for the move.
-
-    Order of checks: most-specific reason wins so the abstention label
-    is informative.
+    Returns one of: 'LONG', 'SHORT', 'NO_TRADE_*'. See module docstring
+    for full taxonomy. Direction is derived from probability bias only,
+    no priced-in detection. Use classify_trade_signal_v2 instead for the
+    sell-the-news-aware version.
     """
     # Hard abstention conditions first
     if catalyst_type and catalyst_type in NON_BINARY_CATALYST_TYPES:
@@ -193,6 +183,199 @@ def classify_trade_signal(
     return signal
 
 
+# ────────────────────────────────────────────────────────────
+# V2 classifier — priced-in aware
+# ────────────────────────────────────────────────────────────
+# After the user empirically observed that the V1 LONG signal had 31.7%
+# direction accuracy on 3D abnormal-vs-XBI (which means INVERSE accuracy
+# was ~68%), the V2 classifier splits the LONG bucket by priced-in score:
+#
+#   high P + low priced-in  → LONG_UNDERPRICED_POSITIVE
+#   high P + high priced-in → SHORT_SELL_THE_NEWS  (the systematic edge!)
+#   high P + mid priced-in  → NO_TRADE_PRICED_IN
+#   low P                   → SHORT_LOW_PROBABILITY
+#
+# The priced-in score is computed from runup_pre_event_30d_pct and
+# (optionally) options-implied move + IV percentile. Higher = stock has
+# rallied into the catalyst, more risk of sell-the-news.
+
+# Thresholds for priced-in classification
+PRICED_IN_HIGH_THRESHOLD = 0.65   # composite ≥ this → CROWDED, expect sell-the-news
+PRICED_IN_LOW_THRESHOLD  = 0.45   # composite ≤ this → CLEAN, real long edge
+
+
+def compute_priced_in_score(
+    *,
+    runup_30d_pct: Optional[float] = None,
+    options_implied_move_pct: Optional[float] = None,
+    iv_euphoria_pct: Optional[float] = None,
+) -> Optional[float]:
+    """Composite 0..1 score of how priced-in a catalyst is.
+
+    Higher = more priced in (stock has run, options are pricing big moves,
+    IV is elevated). Returns None if no inputs are available.
+
+    Components (each contributes a 0..1 sub-score):
+      runup_30d:    0% = neutral (0.5 axis), +30% = max priced-in (1.0),
+                    -20% = max washed-out (0.0). Scaled linearly between.
+      options:      Above 25% implied move = priced-in. Below 8% = clean.
+      iv_euphoria:  IV percentile / 100. Higher = more priced.
+
+    The composite is the simple mean of available sub-scores.
+    """
+    sub_scores = []
+
+    if runup_30d_pct is not None:
+        # Map runup to 0..1: -20% → 0.0, 0% → 0.5, +30% → 1.0
+        r = float(runup_30d_pct)
+        if r >= 30: s = 1.0
+        elif r <= -20: s = 0.0
+        elif r >= 0: s = 0.5 + (r / 30.0) * 0.5
+        else: s = 0.5 + (r / 20.0) * 0.5  # negative → below 0.5
+        sub_scores.append(max(0.0, min(1.0, s)))
+
+    if options_implied_move_pct is not None:
+        # Options: 8% → 0.0, 25% → 1.0
+        m = float(options_implied_move_pct)
+        if m >= 25: s = 1.0
+        elif m <= 8: s = 0.0
+        else: s = (m - 8) / 17.0
+        sub_scores.append(s)
+
+    if iv_euphoria_pct is not None:
+        sub_scores.append(max(0.0, min(1.0, float(iv_euphoria_pct) / 100.0)))
+
+    if not sub_scores:
+        return None
+    return sum(sub_scores) / len(sub_scores)
+
+
+def classify_trade_signal_v2(
+    *,
+    probability: Optional[float],
+    runup_30d_pct: Optional[float] = None,
+    catalyst_type: Optional[str] = None,
+    confidence_score: Optional[float] = None,
+    date_precision: Optional[str] = None,
+    options_implied_move_pct: Optional[float] = None,
+    iv_euphoria_pct: Optional[float] = None,
+    scenario_up_pct: Optional[float] = None,
+    scenario_down_pct: Optional[float] = None,
+    min_scenario_pct: float = DEFAULT_MIN_SCENARIO_PCT,
+    prob_bias_threshold: float = DEFAULT_PROB_BIAS_THRESHOLD,
+    min_confidence: float = DEFAULT_MIN_CONFIDENCE,
+    options_ratio_floor: float = DEFAULT_OPTIONS_RATIO_FLOOR,
+) -> Tuple[str, Optional[float]]:
+    """Priced-in-aware classifier. Returns (signal, priced_in_score).
+
+    Decision tree:
+      catalyst not binary → NO_TRADE_NON_BINARY
+      bad date precision → NO_TRADE_BAD_DATE
+      confidence too low → NO_TRADE_LOW_CONFIDENCE
+      probability ambiguous (0.4-0.6) → NO_TRADE_AMBIGUOUS_PROB
+      scenario edge too small → NO_TRADE_SMALL_EDGE
+      options too expensive → NO_TRADE_OPTIONS_TOO_EXPENSIVE
+
+      For LONG-direction bias (probability > 0.5+threshold):
+        priced_in score >= 0.65 → SHORT_SELL_THE_NEWS  (the inverse signal)
+        priced_in score <= 0.45 → LONG_UNDERPRICED_POSITIVE
+        else (mid)              → NO_TRADE_PRICED_IN
+        priced_in unknown       → LONG (fallback to V1 behavior)
+
+      For SHORT-direction bias (probability < 0.5-threshold):
+        always → SHORT_LOW_PROBABILITY (priced-in adjustment doesn't apply
+        because if the market thinks approval is unlikely, more pessimism
+        priced in is irrelevant — the move is still down)
+    """
+    # Compute priced-in score upfront (returned even on abstention)
+    priced_in = compute_priced_in_score(
+        runup_30d_pct=runup_30d_pct,
+        options_implied_move_pct=options_implied_move_pct,
+        iv_euphoria_pct=iv_euphoria_pct,
+    )
+
+    # Hard abstention conditions first (same as V1)
+    if catalyst_type and catalyst_type in NON_BINARY_CATALYST_TYPES:
+        return ("NO_TRADE_NON_BINARY", priced_in)
+
+    if date_precision and date_precision not in ("exact", "day"):
+        return ("NO_TRADE_BAD_DATE", priced_in)
+
+    if confidence_score is not None and confidence_score < min_confidence:
+        return ("NO_TRADE_LOW_CONFIDENCE", priced_in)
+
+    if probability is None:
+        return ("NO_TRADE_LOW_CONFIDENCE", priced_in)
+
+    p = float(probability)
+    bias = p - 0.5
+    if abs(bias) < prob_bias_threshold:
+        return ("NO_TRADE_AMBIGUOUS_PROB", priced_in)
+
+    # Pick the directional scenario based on probability bias
+    up_pct, down_pct = scenario_up_pct, scenario_down_pct
+    if up_pct is None or down_pct is None:
+        ref_up, ref_down = get_scenario_magnitudes(catalyst_type)
+        if up_pct is None: up_pct = ref_up
+        if down_pct is None: down_pct = ref_down
+
+    if bias > 0:
+        edge = float(up_pct)
+    else:
+        edge = abs(float(down_pct))
+
+    if edge < min_scenario_pct:
+        return ("NO_TRADE_SMALL_EDGE", priced_in)
+
+    if options_implied_move_pct is not None and options_implied_move_pct > 0:
+        ratio = edge / float(options_implied_move_pct)
+        if ratio < options_ratio_floor:
+            return ("NO_TRADE_OPTIONS_TOO_EXPENSIVE", priced_in)
+
+    # ── The key V2 logic: priced-in adjustment for LONG-direction bets ──
+    if bias > 0:
+        # Model thinks event will be positive. Now check setup.
+        if priced_in is None:
+            # No priced-in data → fall back to plain LONG
+            return ("LONG", priced_in)
+        if priced_in >= PRICED_IN_HIGH_THRESHOLD:
+            # Crowded long. The event being good is already in the price.
+            # Go SHORT against the news.
+            return ("SHORT_SELL_THE_NEWS", priced_in)
+        if priced_in <= PRICED_IN_LOW_THRESHOLD:
+            # Clean setup, real long edge.
+            return ("LONG_UNDERPRICED_POSITIVE", priced_in)
+        # Middle zone — ambiguous. Skip.
+        return ("NO_TRADE_PRICED_IN", priced_in)
+    else:
+        # Probability says event will fail. Priced-in adjustment doesn't
+        # change the SHORT bet — if a stock has run AND the model thinks
+        # the catalyst is bad, that's still a SHORT, just a more emphatic one.
+        return ("SHORT_LOW_PROBABILITY", priced_in)
+
+
+def is_tradeable_v2(signal: str) -> bool:
+    """V2 tradeable signals."""
+    return signal in {
+        "LONG_UNDERPRICED_POSITIVE",
+        "SHORT_SELL_THE_NEWS",
+        "SHORT_LOW_PROBABILITY",
+        # V1 names also count as tradeable when v2 falls back
+        "LONG",
+        "SHORT",
+    }
+
+
+def predicted_direction_v2(signal: str) -> Optional[int]:
+    """Map a V2 signal to a directional prediction (+1 LONG, -1 SHORT, None abstain).
+    Used by the backtest to compute direction_correct against actual abnormal returns."""
+    if signal in {"LONG_UNDERPRICED_POSITIVE", "LONG"}:
+        return 1
+    if signal in {"SHORT_SELL_THE_NEWS", "SHORT_LOW_PROBABILITY", "SHORT"}:
+        return -1
+    return None
+
+
 def predicted_direction_from_probability(probability: Optional[float],
                                           bias_threshold: float = DEFAULT_PROB_BIAS_THRESHOLD) -> Optional[int]:
     """Return +1 (model bets up), -1 (model bets down), or None (ambiguous).
@@ -212,11 +395,15 @@ def is_tradeable(signal: str) -> bool:
 def signal_metadata() -> Dict[str, str]:
     """Human-readable descriptions for FE rendering."""
     return {
+        "LONG_UNDERPRICED_POSITIVE":     "Tradeable long — high probability AND not priced in (clean setup)",
         "LONG":                          "Tradeable long — high probability of positive outcome",
-        "SHORT":                         "Tradeable short — high probability of negative outcome",
+        "SHORT_SELL_THE_NEWS":           "Tradeable short — high probability BUT crowded/priced-in setup. Sell-the-news bet.",
+        "SHORT_LOW_PROBABILITY":         "Tradeable short — low probability of positive outcome",
+        "SHORT":                         "Tradeable short — low probability of positive outcome",
         "NO_TRADE_AMBIGUOUS_PROB":       "Skip — probability ≈ 50/50, no directional edge",
-        "NO_TRADE_SMALL_EDGE":           "Skip — scenario magnitude too small (< 3%)",
-        "NO_TRADE_LOW_CONFIDENCE":       "Skip — data confidence too low (< 0.55)",
+        "NO_TRADE_PRICED_IN":            "Skip — high probability but priced-in setup, ambiguous reaction",
+        "NO_TRADE_SMALL_EDGE":           f"Skip — scenario magnitude too small (< {DEFAULT_MIN_SCENARIO_PCT:.0f}%)",
+        "NO_TRADE_LOW_CONFIDENCE":       f"Skip — data confidence too low (< {DEFAULT_MIN_CONFIDENCE:.2f})",
         "NO_TRADE_BAD_DATE":             "Skip — catalyst date too imprecise to time entry",
         "NO_TRADE_OPTIONS_TOO_EXPENSIVE":"Skip — options imply more move than model expects (paying too much)",
         "NO_TRADE_NON_BINARY":           "Skip — earnings/submissions/partnerships aren't directional",

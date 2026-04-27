@@ -3499,3 +3499,384 @@ async def post_catalyst_aggregate_v2():
     except Exception as e:
         logger.exception("aggregate_v2 failed")
         raise HTTPException(500, f"aggregate_v2 error: {e}")
+
+
+# ────────────────────────────────────────────────────────────
+# V2 priced-in classifier (migration 013)
+# ────────────────────────────────────────────────────────────
+# After user observed tradeable accuracy = 31.7% (inverse 68.3%):
+# 'old loose signal was anti-alpha. Build classifier around priced-in
+# score, not just probability.'
+
+@router.post("/post-catalyst/apply-migration-013")
+async def apply_migration_013():
+    """One-shot for migration 013 — priced-in features. Idempotent.
+    Run if Dockerfile alembic startup didn't pick up 013."""
+    try:
+        from services.database import BiotechDatabase
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                ALTER TABLE post_catalyst_outcomes
+                ADD COLUMN IF NOT EXISTS price_30d_before_event NUMERIC,
+                ADD COLUMN IF NOT EXISTS runup_pre_event_30d_pct NUMERIC,
+                ADD COLUMN IF NOT EXISTS priced_in_score NUMERIC,
+                ADD COLUMN IF NOT EXISTS signal_v2 TEXT,
+                ADD COLUMN IF NOT EXISTS direction_correct_v2 BOOLEAN
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_pco_signal_v2
+                ON post_catalyst_outcomes(signal_v2)
+                WHERE signal_v2 IS NOT NULL
+            """)
+            cur.execute("""
+                UPDATE alembic_version_biotech
+                SET version_num = '013_priced_in_features'
+                WHERE version_num = '012_abstention_layer'
+            """)
+            stamped = cur.rowcount
+            cur.execute("SELECT version_num FROM alembic_version_biotech")
+            new_v = cur.fetchone()[0]
+            conn.commit()
+        return {"success": True, "new_alembic_version": new_v, "stamped_rows": stamped}
+    except Exception as e:
+        logger.exception("apply_migration_013 failed")
+        raise HTTPException(500, f"apply_migration_013 error: {e}")
+
+
+@router.post("/post-catalyst/backfill-runup-and-classify-v2")
+async def backfill_runup_and_classify_v2(max_rows: int = 100,
+                                          only_compute_signals: bool = False):
+    """Two-phase backfill for V2 priced-in classifier:
+
+    Phase A: Re-fetch price windows for rows missing runup_pre_event_30d_pct.
+             Computes runup from earliest pre-window close to pre_event_price.
+             Persists price_30d_before_event + runup_pre_event_30d_pct.
+
+    Phase B: For ALL rows with predicted_prob, classify via V2 logic.
+             Stores signal_v2, priced_in_score, direction_correct_v2.
+
+    Pass only_compute_signals=True to skip phase A. Useful for re-classifying
+    after threshold tuning without re-fetching prices.
+
+    Returns: {phase_a_processed, phase_a_succeeded, phase_b_classified,
+              tradeable_v2, signal_v2_distribution}
+    """
+    try:
+        from services.database import BiotechDatabase
+        from services.post_catalyst_tracker import _fetch_price_window
+        from services.catalyst_signal import (
+            classify_trade_signal_v2, is_tradeable_v2,
+            predicted_direction_v2,
+        )
+        db = BiotechDatabase()
+        results = {
+            "phase_a_processed": 0,
+            "phase_a_succeeded": 0,
+            "phase_a_skipped_no_window": 0,
+            "phase_b_classified": 0,
+            "tradeable_v2": 0,
+            "signal_v2_distribution": {},
+            "errors": [],
+        }
+
+        # ── Phase A: backfill runup_30d ──────────────────────────────
+        if not only_compute_signals:
+            with db.get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute("""
+                    SELECT id, ticker, catalyst_date, pre_event_price
+                    FROM post_catalyst_outcomes
+                    WHERE runup_pre_event_30d_pct IS NULL
+                      AND catalyst_date IS NOT NULL
+                      AND pre_event_price IS NOT NULL
+                    ORDER BY catalyst_date DESC
+                    LIMIT %s
+                """, (max_rows,))
+                rows = cur.fetchall()
+
+            for outcome_id, ticker, cat_date, pre_event_price in rows:
+                results["phase_a_processed"] += 1
+                try:
+                    cat_str = cat_date.strftime("%Y-%m-%d") if hasattr(cat_date, "strftime") else str(cat_date)[:10]
+                    pw = _fetch_price_window(ticker, cat_str)
+                    if not pw or not pw.get("_data_present"):
+                        results["phase_a_skipped_no_window"] += 1
+                        continue
+                    p30b = pw.get("price_30d_before_event")
+                    pre = float(pre_event_price)
+                    runup = ((pre - float(p30b)) / float(p30b) * 100.0) if (p30b and pre) else None
+                    with db.get_conn() as conn:
+                        cur = conn.cursor()
+                        cur.execute("""
+                            UPDATE post_catalyst_outcomes
+                            SET price_30d_before_event = %s,
+                                runup_pre_event_30d_pct = %s
+                            WHERE id = %s
+                        """, (p30b, runup, outcome_id))
+                        conn.commit()
+                    results["phase_a_succeeded"] += 1
+                except Exception as e:
+                    if len(results["errors"]) < 10:
+                        results["errors"].append({"id": outcome_id, "ticker": ticker, "phase": "A", "error": str(e)[:100]})
+
+        # ── Phase B: classify with V2 logic ──────────────────────────
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT pco.id, pco.ticker, pco.catalyst_type,
+                       pco.predicted_prob, pco.runup_pre_event_30d_pct,
+                       pco.abnormal_move_pct_3d,
+                       cu.date_precision
+                FROM post_catalyst_outcomes pco
+                LEFT JOIN catalyst_universe cu
+                  ON cu.ticker = pco.ticker
+                 AND cu.catalyst_type = pco.catalyst_type
+                 AND cu.catalyst_date::text = pco.catalyst_date::text
+                 AND cu.status = 'active'
+            """)
+            rows = cur.fetchall()
+
+        sig_dist: Dict[str, int] = {}
+        tradeable_n = 0
+        for outcome_id, ticker, cat_type, pred_prob, runup, abnormal_3d, dprec in rows:
+            try:
+                signal, priced_in = classify_trade_signal_v2(
+                    probability=float(pred_prob) if pred_prob is not None else None,
+                    runup_30d_pct=float(runup) if runup is not None else None,
+                    catalyst_type=cat_type,
+                    confidence_score=float(pred_prob) if pred_prob is not None else None,
+                    date_precision=dprec,
+                )
+                tradeable_flag = is_tradeable_v2(signal)
+                # Direction correctness on 3D abnormal target
+                pred_dir = predicted_direction_v2(signal)
+                dir_correct_v2 = None
+                if abnormal_3d is not None and pred_dir is not None and tradeable_flag:
+                    ab = float(abnormal_3d)
+                    if abs(ab) >= 3.0:  # ±3% deadband on actuals
+                        actual_dir = 1 if ab > 0 else -1
+                        dir_correct_v2 = (pred_dir == actual_dir)
+                with db.get_conn() as conn:
+                    cur = conn.cursor()
+                    cur.execute("""
+                        UPDATE post_catalyst_outcomes
+                        SET signal_v2 = %s,
+                            priced_in_score = %s,
+                            direction_correct_v2 = %s
+                        WHERE id = %s
+                    """, (signal, priced_in, dir_correct_v2, outcome_id))
+                    conn.commit()
+                results["phase_b_classified"] += 1
+                sig_dist[signal] = sig_dist.get(signal, 0) + 1
+                if tradeable_flag:
+                    tradeable_n += 1
+            except Exception as e:
+                if len(results["errors"]) < 10:
+                    results["errors"].append({"id": outcome_id, "ticker": ticker, "phase": "B", "error": str(e)[:100]})
+
+        results["signal_v2_distribution"] = sig_dist
+        results["tradeable_v2"] = tradeable_n
+        return results
+    except Exception as e:
+        logger.exception("backfill_runup_and_classify_v2 failed")
+        raise HTTPException(500, f"backfill_runup_and_classify_v2 error: {e}")
+
+
+@router.get("/post-catalyst/aggregate-v3")
+async def post_catalyst_aggregate_v3():
+    """Three-tier scoreboard updated for V2 (priced-in aware) signals.
+
+    all_events:        same as v2 — noise floor
+    tradeable_v1:      V1 LONG/SHORT classification (probability bias only)
+    tradeable_v2:      V2 LONG_UNDERPRICED_POSITIVE / SHORT_SELL_THE_NEWS /
+                       SHORT_LOW_PROBABILITY (priced-in aware)
+    sell_the_news:     subset that the V2 classifier specifically flagged
+                       as "high P + crowded setup, fade the news"
+    long_underpriced:  subset flagged as "high P + clean setup, real long"
+
+    The V2 numbers are the real test of the user's hypothesis: the
+    SHORT_SELL_THE_NEWS subset should hit ≥65% direction accuracy on
+    the 3D abnormal-vs-XBI window if the inverse-of-31.7% finding holds.
+    """
+    try:
+        from services.database import BiotechDatabase
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            # All events (raw 30D)
+            cur.execute("""
+                SELECT COUNT(*),
+                       COUNT(*) FILTER (WHERE direction_correct),
+                       AVG(error_abs_pct)
+                FROM post_catalyst_outcomes
+                WHERE actual_move_pct_30d IS NOT NULL
+                  AND predicted_move_pct IS NOT NULL
+            """)
+            r = cur.fetchone()
+            total_all = r[0] or 0
+            hits_all = r[1] or 0
+            avg_err_30d = float(r[2]) if r[2] is not None else None
+
+            # V1 tradeable (legacy LONG/SHORT)
+            cur.execute("""
+                SELECT COUNT(*),
+                       COUNT(*) FILTER (WHERE direction_correct_3d),
+                       AVG(error_abs_abnormal_3d_pct)
+                FROM post_catalyst_outcomes
+                WHERE tradeable = TRUE
+            """)
+            r = cur.fetchone()
+            v1_total = r[0] or 0
+            v1_hits = r[1] or 0
+            v1_err = float(r[2]) if r[2] is not None else None
+
+            # V2 tradeable
+            cur.execute("""
+                SELECT COUNT(*),
+                       COUNT(*) FILTER (WHERE direction_correct_v2),
+                       AVG(error_abs_abnormal_3d_pct)
+                FROM post_catalyst_outcomes
+                WHERE signal_v2 IN ('LONG_UNDERPRICED_POSITIVE',
+                                    'SHORT_SELL_THE_NEWS',
+                                    'SHORT_LOW_PROBABILITY',
+                                    'LONG', 'SHORT')
+            """)
+            r = cur.fetchone()
+            v2_total = r[0] or 0
+            v2_hits = r[1] or 0
+            v2_err = float(r[2]) if r[2] is not None else None
+
+            # Per-bucket V2 breakdown
+            cur.execute("""
+                SELECT signal_v2,
+                       COUNT(*),
+                       COUNT(*) FILTER (WHERE direction_correct_v2 = TRUE),
+                       AVG(priced_in_score),
+                       AVG(error_abs_abnormal_3d_pct)
+                FROM post_catalyst_outcomes
+                WHERE signal_v2 IS NOT NULL
+                GROUP BY signal_v2
+                ORDER BY signal_v2
+            """)
+            buckets = []
+            for row in cur.fetchall():
+                sig, n, hits, avg_pi, avg_err = row
+                acc = round(100.0 * hits / n, 1) if n > 0 else None
+                buckets.append({
+                    "signal": sig,
+                    "count": n,
+                    "hits": hits,
+                    "direction_accuracy_pct": acc,
+                    "avg_priced_in_score": float(avg_pi) if avg_pi is not None else None,
+                    "avg_abs_error_pct": float(avg_err) if avg_err is not None else None,
+                })
+
+        return {
+            "all_events": {
+                "count": total_all,
+                "direction_hits": hits_all,
+                "direction_accuracy_pct": (
+                    round(100.0 * hits_all / total_all, 1) if total_all > 0 else None
+                ),
+                "avg_abs_error_pct": round(avg_err_30d, 1) if avg_err_30d is not None else None,
+                "_target": "raw 30D move (noisy — sector + macro contaminated)",
+            },
+            "tradeable_v1": {
+                "count": v1_total,
+                "direction_hits": v1_hits,
+                "direction_accuracy_pct": (
+                    round(100.0 * v1_hits / v1_total, 1) if v1_total > 0 else None
+                ),
+                "coverage_pct": (
+                    round(100.0 * v1_total / total_all, 1) if total_all > 0 else None
+                ),
+                "avg_abs_error_pct": round(v1_err, 1) if v1_err is not None else None,
+                "_target": "V1: probability-only classifier (was 31.7%, inverse 68.3%)",
+            },
+            "tradeable_v2": {
+                "count": v2_total,
+                "direction_hits": v2_hits,
+                "direction_accuracy_pct": (
+                    round(100.0 * v2_hits / v2_total, 1) if v2_total > 0 else None
+                ),
+                "coverage_pct": (
+                    round(100.0 * v2_total / total_all, 1) if total_all > 0 else None
+                ),
+                "avg_abs_error_pct": round(v2_err, 1) if v2_err is not None else None,
+                "_target": "V2: priced-in-aware classifier (sell-the-news split out)",
+            },
+            "v2_buckets": buckets,
+            "interpretation": {
+                "v2_thesis": "V1 was anti-alpha because high-conf catalysts get faded after the event. V2 splits high-prob LONGs by priced-in score: clean setup → LONG, crowded → SHORT_SELL_THE_NEWS.",
+                "actionable_target": "tradeable_v2 ≥ 60-65% direction accuracy with coverage 25-40%",
+            },
+        }
+    except Exception as e:
+        logger.exception("aggregate_v3 failed")
+        raise HTTPException(500, f"aggregate_v3 error: {e}")
+
+
+@router.get("/post-catalyst/runup-buckets")
+async def runup_buckets():
+    """Diagnostic per the user's request: bucket V1 LONG signals by
+    runup_30d_pct and report direction accuracy in each bucket. Validates
+    the 'inverse hypothesis' empirically.
+
+    Buckets:
+      runup ≥ +20%    Stock has run, expect priced-in / sell-the-news
+      runup +5..+20%  Mild runup
+      runup -5..+5%   Flat
+      runup ≤ -5%     Washed out, expect real long edge
+    """
+    try:
+        from services.database import BiotechDatabase
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT
+                    CASE
+                        WHEN runup_pre_event_30d_pct IS NULL THEN 'unknown'
+                        WHEN runup_pre_event_30d_pct >= 20 THEN '4_strong_runup_>=20'
+                        WHEN runup_pre_event_30d_pct >= 5  THEN '3_mild_runup_5_to_20'
+                        WHEN runup_pre_event_30d_pct >= -5 THEN '2_flat_-5_to_5'
+                        ELSE                                    '1_washed_out_<=-5'
+                    END AS bucket,
+                    COUNT(*) AS n,
+                    COUNT(*) FILTER (WHERE direction_correct_3d = TRUE) AS hits_v1,
+                    AVG(abnormal_move_pct_3d) AS avg_abnormal_3d,
+                    AVG(runup_pre_event_30d_pct) AS avg_runup
+                FROM post_catalyst_outcomes
+                WHERE tradeable = TRUE
+                  AND trade_signal IN ('LONG', 'SHORT')
+                  AND abnormal_move_pct_3d IS NOT NULL
+                GROUP BY bucket
+                ORDER BY bucket
+            """)
+            rows = cur.fetchall()
+        buckets = []
+        for r in rows:
+            bucket, n, hits, avg_ab, avg_ru = r
+            acc = round(100.0 * hits / n, 1) if n > 0 else None
+            inv = round(100.0 - acc, 1) if acc is not None else None
+            buckets.append({
+                "bucket": bucket,
+                "count": n,
+                "v1_hits": hits,
+                "v1_direction_accuracy_pct": acc,
+                "inverse_accuracy_pct": inv,
+                "avg_abnormal_3d_pct": round(float(avg_ab), 1) if avg_ab is not None else None,
+                "avg_runup_pct": round(float(avg_ru), 1) if avg_ru is not None else None,
+            })
+        return {
+            "method": "Tradeable V1 signals (LONG/SHORT) bucketed by pre-event 30d runup. Direction scored against 3D abnormal-vs-XBI.",
+            "buckets": buckets,
+            "interpretation": {
+                "expected": "If user's hypothesis holds: high-runup buckets show inverse accuracy ≥ 65% (i.e., V1 LONG signals are wrong, fade them). Low-runup / washed-out buckets show normal V1 accuracy (V1 LONG is right, hold it).",
+            },
+        }
+    except Exception as e:
+        logger.exception("runup_buckets failed")
+        raise HTTPException(500, f"runup_buckets error: {e}")

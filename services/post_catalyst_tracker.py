@@ -485,9 +485,15 @@ def _fetch_price_window_polygon(ticker: str, catalyst_date_str: str) -> Optional
             ml = (day0["low"] - pre_event_price) / pre_event_price * 100.0
             max_intraday_pct = max(abs(mh), abs(ml)) * (1 if abs(mh) > abs(ml) else -1)
 
+        # Pre-event runup baseline (earliest close in the 30d pre-window)
+        price_30d_before = None
+        if pre_dates:
+            price_30d_before = rows_by_date[pre_dates[0]]["close"]
+
         return {
             "pre_event_date": pre_event_d.isoformat() if pre_event_d else None,
             "pre_event_price": pre_event_price,
+            "price_30d_before_event": price_30d_before,
             "day0_price": day0_price,
             "day1_price": _close(day1_d),
             "day3_price": _close(day3_d),
@@ -607,9 +613,18 @@ def _fetch_price_window_yfinance(ticker: str, catalyst_date_str: str) -> Optiona
             move_low = (day0["low"] - pre_event_price) / pre_event_price * 100.0
             max_intraday_pct = max(abs(move_high), abs(move_low)) * (1 if abs(move_high) > abs(move_low) else -1)
 
+        # Pre-event runup: earliest close in the 30-day pre-event window
+        # vs the pre_event_price. Used by signal classifier as priced-in
+        # detector — high runup before a binary catalyst means the move is
+        # likely already in the stock (sell-the-news risk).
+        price_30d_before = None
+        if pre_dates:
+            price_30d_before = rows_by_date[pre_dates[0]]["close"]
+
         return {
             "pre_event_date": pre_event_d.isoformat() if pre_event_d else None,
             "pre_event_price": pre_event_price,
+            "price_30d_before_event": price_30d_before,
             "day0_price": day0_price,
             "day1_price": day1_price,
             "day3_price": day3_price,
