@@ -2325,6 +2325,70 @@ async def sec_capital_structure(ticker: str):
         raise HTTPException(500, f"sec_capital_structure error: {e}")
 
 
+@router.get("/post-catalyst/inspect-stubs")
+async def inspect_unfilled_stubs(limit: int = 30):
+    """List the post_catalyst_outcomes rows that have no actual_move_pct
+    populated. Helps explain why the retry-with-polygon endpoint reports
+    0 succeeded — usually these are old dates beyond yfinance/Polygon
+    history, or delisted tickers.
+    """
+    try:
+        from services.database import BiotechDatabase
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT id, ticker, catalyst_type, catalyst_date,
+                       outcome_label, actual_move_pct_1d
+                FROM post_catalyst_outcomes
+                WHERE actual_move_pct_1d IS NULL
+                  AND catalyst_date IS NOT NULL
+                ORDER BY catalyst_date DESC
+                LIMIT %s
+            """, (limit,))
+            rows = cur.fetchall()
+            cur.execute(
+                "SELECT COUNT(*) FROM post_catalyst_outcomes WHERE actual_move_pct_1d IS NULL"
+            )
+            total_null = cur.fetchone()[0]
+            # Histogram of catalyst_date age
+            cur.execute("""
+                SELECT
+                  CASE
+                    WHEN catalyst_date >= CURRENT_DATE - INTERVAL '90 days' THEN '0-90d'
+                    WHEN catalyst_date >= CURRENT_DATE - INTERVAL '1 year' THEN '90d-1y'
+                    WHEN catalyst_date >= CURRENT_DATE - INTERVAL '3 years' THEN '1-3y'
+                    WHEN catalyst_date >= CURRENT_DATE - INTERVAL '10 years' THEN '3-10y'
+                    ELSE '10y+'
+                  END AS age_bucket,
+                  COUNT(*)
+                FROM post_catalyst_outcomes
+                WHERE actual_move_pct_1d IS NULL
+                  AND catalyst_date IS NOT NULL
+                GROUP BY age_bucket
+                ORDER BY age_bucket
+            """)
+            by_age = [{"bucket": r[0], "n": r[1]} for r in cur.fetchall()]
+
+        return {
+            "total_null_actual_move_1d": total_null,
+            "by_catalyst_date_age": by_age,
+            "sample": [
+                {
+                    "id": r[0],
+                    "ticker": r[1],
+                    "catalyst_type": r[2],
+                    "catalyst_date": r[3].strftime("%Y-%m-%d") if hasattr(r[3], "strftime") else str(r[3])[:10],
+                    "outcome_label": r[4],
+                }
+                for r in rows
+            ],
+        }
+    except Exception as e:
+        logger.exception("inspect_stubs failed")
+        raise HTTPException(500, f"inspect_stubs error: {e}")
+
+
 @router.get("/post-catalyst/sector-coverage")
 async def post_catalyst_sector_coverage():
     """Distribution of sector_basket values across post_catalyst_outcomes.
