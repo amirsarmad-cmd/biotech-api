@@ -3054,3 +3054,130 @@ async def apply_migration_011():
     except Exception as e:
         logger.exception("apply_migration_011 failed")
         raise HTTPException(500, f"apply_migration_011 error: {e}")
+
+
+@router.post("/catalysts/{ticker}/refetch-now")
+async def refetch_ticker_catalysts(ticker: str):
+    """On-demand re-seed for a single ticker. Bypasses the scheduled
+    seeder and triggers the LLM pipeline (Gemini → OpenAI → Anthropic+
+    web_search) immediately.
+
+    Honors is_manual_override — manual rows are NEVER touched. The
+    seeder upsert's WHERE clause skips them.
+
+    Returns: {ticker, attempted, catalysts_found, source, persisted: {...}}
+
+    Use case: user sees a stale-data warning ('5 days ago · Gemini') on
+    the freshness badge and wants to refresh without editing manually.
+    """
+    try:
+        ticker = ticker.upper().strip()
+        from services.universe_seeder import (
+            extract_catalysts_for_ticker,
+            write_catalysts_to_db,
+        )
+        from services.database import BiotechDatabase
+        # Look up company name
+        db = BiotechDatabase()
+        company_name = ticker
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT company_name FROM catalyst_universe
+                WHERE ticker = %s AND company_name IS NOT NULL
+                LIMIT 1
+            """, (ticker,))
+            row = cur.fetchone()
+            if row and row[0]:
+                company_name = row[0]
+        # Extract — this writes its own ingestion-log entry via the wrapper
+        catalysts, meta = extract_catalysts_for_ticker(ticker, company_name)
+        # Persist — write_catalysts_to_db already respects is_manual_override
+        persisted = {"added": 0, "updated": 0, "skipped": 0, "errors": []}
+        if catalysts:
+            with db.get_conn() as conn:
+                persisted = write_catalysts_to_db(catalysts, conn)
+                conn.commit()
+        return {
+            "ticker": ticker,
+            "company_name": company_name,
+            "catalysts_found": len(catalysts),
+            "source": meta.get("source"),
+            "cost_usd": meta.get("cost_usd"),
+            "error": meta.get("error"),
+            "persisted": persisted,
+        }
+    except Exception as e:
+        logger.exception("refetch_ticker_catalysts failed")
+        raise HTTPException(500, f"refetch error: {e}")
+
+
+@router.get("/db/alembic-preflight")
+async def alembic_preflight():
+    """Check alembic migrations for issues that could cause silent rollback.
+
+    Most common pitfall: alembic_version_biotech.version_num is varchar(32).
+    A revision ID >32 chars makes the post-migration version stamp fail,
+    rolling back the entire migration. The Dockerfile's '|| echo WARN'
+    swallows the error so the deploy looks healthy until you query the
+    missing table. This endpoint surfaces those overflows before they bite.
+
+    Run after adding any new migration file. Returns:
+      current_version, all_revisions, max_id_length, overflows (≥32 chars)
+    """
+    try:
+        import os
+        from services.database import BiotechDatabase
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT version_num FROM alembic_version_biotech LIMIT 1")
+            row = cur.fetchone()
+            current_version = row[0] if row else None
+            # The varchar(32) limit
+            cur.execute("""
+                SELECT character_maximum_length FROM information_schema.columns
+                WHERE table_name = 'alembic_version_biotech' AND column_name = 'version_num'
+            """)
+            limit_row = cur.fetchone()
+            version_num_max = limit_row[0] if limit_row else None
+
+        # Scan all migration files
+        migrations_dir = os.path.join(os.path.dirname(__file__), "..", "alembic", "versions")
+        revisions = []
+        if os.path.isdir(migrations_dir):
+            for fname in sorted(os.listdir(migrations_dir)):
+                if not fname.endswith(".py"):
+                    continue
+                path = os.path.join(migrations_dir, fname)
+                try:
+                    with open(path) as f:
+                        text = f.read()
+                    # Parse revision = '...' line
+                    import re
+                    m = re.search(r"^revision\s*=\s*['\"]([^'\"]+)['\"]", text, re.M)
+                    if m:
+                        rev_id = m.group(1)
+                        revisions.append({
+                            "file": fname,
+                            "revision": rev_id,
+                            "length": len(rev_id),
+                            "exceeds_limit": (
+                                version_num_max is not None
+                                and len(rev_id) > version_num_max
+                            ),
+                        })
+                except Exception:
+                    pass
+        overflows = [r for r in revisions if r.get("exceeds_limit")]
+        return {
+            "current_version": current_version,
+            "version_num_max_chars": version_num_max,
+            "all_revisions": revisions,
+            "max_id_length_seen": max((r["length"] for r in revisions), default=0),
+            "overflows": overflows,
+            "healthy": len(overflows) == 0,
+        }
+    except Exception as e:
+        logger.exception("alembic_preflight failed")
+        raise HTTPException(500, f"alembic_preflight error: {e}")
