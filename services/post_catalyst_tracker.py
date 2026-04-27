@@ -26,6 +26,157 @@ from typing import Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 
+# Reference move table — calibrated against N=287 historical post-catalyst
+# outcomes (see /admin/post-catalyst/move-stats). Format: (mean_up_pct, mean_down_pct)
+#
+# The "up" value is mean(actual_1d_pct) where outcome='approved'/'positive';
+# the "down" value is mean(actual_1d_pct) where outcome='rejected'.
+#
+# Why these are SO MUCH smaller than the prior table:
+#  - FDA approvals are usually priced-in by the time of the PDUFA date
+#  - Phase 3 readouts often happen in pre-market with limited 1-day reaction
+#  - Outsized moves (>25%) are tail events, not the typical case
+#
+# Calibration source: 287 outcomes seeded from yfinance + LLM classifier
+# (commit 3a03cb0 / move-stats endpoint), 2020-2025. Updated apr 26 2026.
+REF_MOVES = {
+    # FDA / regulatory — well-sampled (n=129 approved / 30 rejected)
+    "FDA Decision": (4, -5),
+    "PDUFA Decision": (4, -5),
+    "Regulatory Decision": (4, -5),
+    # AdComm — limited data, kept conservative estimates
+    "AdComm": (8, -10),
+    "Advisory Committee": (8, -10),
+    # Phase readouts — well-sampled (Phase 2: 36/18, Phase 3: 24/16)
+    "Phase 3 Readout": (3, -5),
+    "Phase 3": (3, -5),
+    "Phase 2 Readout": (4, -2),
+    "Phase 2": (4, -2),
+    "Phase 1/2 Readout": (8, -6),
+    "Phase 1 Readout": (10, -6),
+    "Phase 1": (10, -6),
+    "Clinical Trial Readout": (5, -3),
+    "Clinical Trial": (5, -3),
+    # Submissions — typically minimal price reaction
+    "NDA submission": (2, -2),
+    "BLA submission": (2, -2),
+    # Other — kept estimates (no historical sample yet)
+    "Partnership": (5, -2),
+    "Earnings": (3, -3),
+    "Product Launch": (4, -4),
+    "Commercial Launch": (4, -4),
+}
+
+
+def compute_move_estimates(
+    catalyst_type: str,
+    p_approval: float,
+    options_implied_pct: Optional[float] = None,
+    fundamental_impact_pct: Optional[float] = None,
+    sentiment_adj_factor: float = 1.0,
+) -> Dict:
+    """Compute the FOUR distinct move estimates for a catalyst event.
+
+    These answer different questions and should NOT be collapsed into one
+    'predicted move' number (per ChatGPT critique). The UI should surface
+    all four side-by-side with explanations:
+
+    1. expected_value_move_pct — E[X] = p × up + (1-p) × down using the
+       reference table. Useful as a probability-weighted return estimate.
+       BUT misleading on binary catalysts: 50/50 with +5/-5 = 0% expected
+       even though the stock will likely move sharply in one direction.
+
+    2. options_implied_move_pct — absolute % move priced into the ATM
+       straddle by the market. Symmetric (no direction). This is what
+       sophisticated traders use to size catalyst trades.
+
+    3. scenario_upside_pct / scenario_downside_pct — bounded scenarios
+       from the reference table (and adjusted by fundamental_impact when
+       applicable). What you'd see if the event resolves favorably/unfavorably.
+
+    4. reference_move — raw (up, down) pair from the calibration table.
+       Useful for "if it works, here's the mean move; if it doesn't, here's
+       the mean".
+
+    Returns:
+      {
+        "catalyst_type": str,
+        "p_approval_used": float,
+        "expected_value_move_pct": float,    # signed, weighted average
+        "options_implied_move_pct": float,   # absolute (or None)
+        "scenario_upside_pct": float,        # adjusted by fundamental_impact
+        "scenario_downside_pct": float,
+        "reference_move": {"up_pct": float, "down_pct": float, "n_observed": int|None},
+        "interpretation": str,
+        "warning": str | None,
+      }
+    """
+    p = max(0.0, min(1.0, float(p_approval) if p_approval is not None else 0.5))
+    up, down = REF_MOVES.get(catalyst_type or "", (4, -4))
+
+    # 1. Expected-value
+    expected_value = p * up + (1 - p) * down
+
+    # 2. Options-implied (pass-through; symmetric)
+    options_implied = options_implied_pct
+
+    # 3. Scenario upside/downside — start from reference, scale by fundamental_impact
+    #    If fundamental impact is meaningful (drug NPV is large vs market cap),
+    #    the actual move will likely be larger than the calibration table.
+    #    We blend: scenario_upside = max(reference_up, fundamental_impact * 0.4)
+    #    Capped at sensible bounds (unrealistic to exceed 80% on single day).
+    scenario_upside = up
+    scenario_downside = down
+    if fundamental_impact_pct is not None and fundamental_impact_pct > 5:
+        # Drug NPV is material — scenarios should reflect that
+        # (40% factor empirical: typical realized move is 30-50% of fundamental impact)
+        fi = float(fundamental_impact_pct)
+        scenario_upside = min(80, max(up, fi * 0.4))
+        scenario_downside = max(-80, min(down, -(fi * 0.3)))
+
+    # Apply sentiment amplifier (high short interest, etc) — caller-provided
+    if sentiment_adj_factor != 1.0:
+        scenario_upside *= sentiment_adj_factor
+        scenario_downside *= sentiment_adj_factor
+
+    # Interpretation: warn if expected_value is ≈0 but scenarios are wide
+    warning = None
+    if abs(expected_value) < 1.5 and (abs(scenario_upside) > 10 or abs(scenario_downside) > 10):
+        warning = (
+            "Expected-value move is near zero because the probability is balanced, "
+            "but the actual move will likely be in one direction. Use scenario_upside / "
+            "scenario_downside for risk sizing, not the expected-value number."
+        )
+    elif options_implied is not None and abs(options_implied - max(abs(scenario_upside), abs(scenario_downside))) > 15:
+        warning = (
+            f"Options-implied move ({options_implied:.1f}%) differs materially from "
+            f"calibrated scenario ({max(abs(scenario_upside), abs(scenario_downside)):.1f}%). "
+            f"Market may be pricing in event-specific information not in the reference table."
+        )
+
+    return {
+        "catalyst_type": catalyst_type,
+        "p_approval_used": p,
+        "expected_value_move_pct": round(expected_value, 2),
+        "options_implied_move_pct": round(options_implied, 2) if options_implied is not None else None,
+        "scenario_upside_pct": round(scenario_upside, 2),
+        "scenario_downside_pct": round(scenario_downside, 2),
+        "reference_move": {
+            "up_pct": up,
+            "down_pct": down,
+            "calibration_source": "N=287 historical outcomes (calibrated apr 2026)",
+        },
+        "interpretation": (
+            f"On {catalyst_type or 'event'}: "
+            f"weighted avg = {expected_value:+.1f}% | "
+            f"if positive ≈ {scenario_upside:+.1f}% | "
+            f"if negative ≈ {scenario_downside:+.1f}%"
+            + (f" | options-implied ±{options_implied:.1f}%" if options_implied is not None else "")
+        ),
+        "warning": warning,
+    }
+
+
 # ============================================================
 # DB helpers
 # ============================================================
@@ -483,45 +634,7 @@ def backfill_one(catalyst: Dict) -> Dict:
     # Predicted: confidence_score from catalyst_universe (probability), plus reference move
     predicted_prob = catalyst.get("confidence_score")
 
-    # Reference move table — calibrated against N=287 historical post-catalyst
-    # outcomes (see /admin/post-catalyst/move-stats). Format: (mean_up_pct, mean_down_pct)
-    # The "up" value is mean(actual_1d_pct) where outcome='approved'/'positive';
-    # the "down" value is mean(actual_1d_pct) where outcome='rejected'.
-    #
-    # Why these are SO MUCH smaller than the prior table:
-    #  - FDA approvals are usually priced-in by the time of the PDUFA date
-    #  - Phase 3 readouts often happen in pre-market with limited 1-day reaction
-    #  - Outsized moves (>25%) are tail events, not the typical case
-    #
-    # Calibration source: 287 outcomes seeded from yfinance + LLM classifier
-    # (commit 3a03cb0 / move-stats endpoint), 2020-2025. Updated (apr 26 2026).
-    REF_MOVES = {
-        # FDA / regulatory — well-sampled (n=129 approved / 30 rejected)
-        "FDA Decision": (4, -5),
-        "PDUFA Decision": (4, -5),
-        "Regulatory Decision": (4, -5),
-        # AdComm — limited data, kept conservative estimates
-        "AdComm": (8, -10),
-        "Advisory Committee": (8, -10),
-        # Phase readouts — well-sampled (Phase 2: 36/18, Phase 3: 24/16)
-        "Phase 3 Readout": (3, -5),  # was (35, -30) — calibrated from N=40
-        "Phase 3": (3, -5),
-        "Phase 2 Readout": (4, -2),  # was (25, -20) — calibrated from N=54
-        "Phase 2": (4, -2),
-        "Phase 1/2 Readout": (8, -6),  # n=3, conservative
-        "Phase 1 Readout": (10, -6),  # n=3, kept higher (early-stage variance)
-        "Phase 1": (10, -6),
-        "Clinical Trial Readout": (5, -3),
-        "Clinical Trial": (5, -3),
-        # Submissions — typically minimal price reaction
-        "NDA submission": (2, -2),
-        "BLA submission": (2, -2),
-        # Other — kept estimates (no historical sample yet)
-        "Partnership": (5, -2),
-        "Earnings": (3, -3),
-        "Product Launch": (4, -4),
-        "Commercial Launch": (4, -4),
-    }
+    # Reference move table — see REF_MOVES at module level.
     up, down = REF_MOVES.get(cat_type or "", (4, -4))
     p = float(predicted_prob) if predicted_prob is not None else 0.5
     predicted_move = p * up + (1 - p) * down

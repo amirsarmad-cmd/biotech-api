@@ -220,19 +220,29 @@ async def analyze_npv(req: NPVRequest):
         # Resolve P(approval) — separate from P(commercial success).
         #   1. explicit req.p_approval (preferred)
         #   2. req.p_commercial_legacy (deprecated — emit warning)
-        #   3. catalyst_universe.confidence_score / probability
-        #   4. default 0.5
+        #   3. catalyst_universe.p_positive_outcome (preferred over legacy probability)
+        #   4. catalyst_universe.probability (legacy)
+        #   5. default 0.5
         p_approval = None
+        p_approval_source = None
         if req.p_approval is not None:
             p_approval = float(req.p_approval)
+            p_approval_source = "user_override"
         elif req.p_commercial_legacy is not None:
             logger.warning(
                 f"NPVRequest using deprecated p_commercial_legacy={req.p_commercial_legacy} as p_approval. "
                 f"Update caller to use p_approval explicitly. ticker={req.ticker}"
             )
             p_approval = float(req.p_commercial_legacy)
+            p_approval_source = "legacy_alias"
+        elif primary.get("p_positive_outcome") is not None:
+            # Prefer the split-probability field over legacy 'probability'.
+            # alembic 004 backfilled this from confidence_score so it should be present.
+            p_approval = float(primary["p_positive_outcome"])
+            p_approval_source = "catalyst_p_positive_outcome"
         else:
             p_approval = float(primary.get("probability") or 0.5)
+            p_approval_source = "catalyst_probability_legacy"
         p_approval = max(0.0, min(1.0, p_approval))
 
         # Resolve P(commercial success | approval) — separate from p_approval.
@@ -249,6 +259,34 @@ async def analyze_npv(req: NPVRequest):
         # uses the user-overridden value (instead of the LLM estimate).
         if isinstance(econ_v2, dict):
             econ_v2["commercial_success_prob"] = p_commercial_resolved
+
+            # CRITICAL: compute_rnpv_full reads econ_v2.p_event_occurs and
+            # econ_v2.p_positive_outcome when present, falling back to
+            # combined p_approval × p_commercial only when both are missing.
+            # When the user supplies an explicit p_approval, we MUST push it
+            # into econ_v2.p_positive_outcome — otherwise the rNPV math would
+            # silently use the LLM's estimate instead of the user override.
+            if req.p_approval is not None:
+                econ_v2["p_positive_outcome"] = p_approval
+                # Don't override p_event_occurs unless the LLM didn't supply one;
+                # event timing certainty is a separate axis from approval likelihood.
+                if econ_v2.get("p_event_occurs") is None:
+                    # Default to 1.0 (event will happen on schedule) if LLM didn't
+                    # provide one — this preserves backward compatibility where
+                    # a single user p_approval was treated as the full haircut.
+                    econ_v2["p_event_occurs"] = 1.0
+                logger.info(
+                    f"NPV {req.ticker}: pushed user p_approval={p_approval:.3f} into "
+                    f"econ_v2.p_positive_outcome (was {econ_v2.get('p_positive_outcome')})"
+                )
+
+            # Push catalyst-table split probabilities into econ_v2 if LLM
+            # didn't already populate them. This way historical events with
+            # backfilled p_event/p_positive can flow through the rNPV math.
+            if econ_v2.get("p_event_occurs") is None and primary.get("p_event_occurs") is not None:
+                econ_v2["p_event_occurs"] = float(primary["p_event_occurs"])
+            if econ_v2.get("p_positive_outcome") is None and primary.get("p_positive_outcome") is not None and req.p_approval is None:
+                econ_v2["p_positive_outcome"] = float(primary["p_positive_outcome"])
 
         legacy_npv = compute_npv_estimate(
             ticker=req.ticker, current_price=current_price,
@@ -293,6 +331,35 @@ async def analyze_npv(req: NPVRequest):
             weights=weights_override or None,
         )
         
+        # ---- Step 4.5: Move estimates (4 distinct types per ChatGPT critique) ----
+        # Don't collapse expected-value, options-implied, scenario, and reference
+        # into one number — they answer different questions.
+        try:
+            from services.post_catalyst_tracker import compute_move_estimates
+            from services.options_implied import get_implied_move_for_catalyst
+            options_implied_pct = None
+            try:
+                opt = get_implied_move_for_catalyst(req.ticker, catalyst_date)
+                options_implied_pct = (opt or {}).get("implied_move_pct")
+            except Exception as e:
+                logger.info(f"options_implied lookup failed for {req.ticker}: {e}")
+            # Pull fundamental_impact from legacy NPV if available (drives scenario scaling)
+            fund_impact = None
+            try:
+                fund_impact = float((legacy_npv or {}).get("fundamental_impact_pct") or 0)
+            except Exception:
+                pass
+            move_estimates = compute_move_estimates(
+                catalyst_type=req.catalyst_type,
+                p_approval=p_approval,
+                options_implied_pct=options_implied_pct,
+                fundamental_impact_pct=fund_impact,
+                sentiment_adj_factor=1.0,
+            )
+        except Exception as e:
+            logger.warning(f"compute_move_estimates failed (non-fatal): {e}")
+            move_estimates = None
+
         # ---- Step 5: persist to cache ----
         result_payload = {
             "ticker": req.ticker,
@@ -302,6 +369,18 @@ async def analyze_npv(req: NPVRequest):
             "economics_v2": econ_v2,
             "rnpv": rnpv,
             "from_cache": False,
+            # Probability resolution — surface what was actually used so UI
+            # can show users which value drove the rNPV calculation.
+            "probability_resolution": {
+                "p_approval_used": p_approval,
+                "p_approval_source": p_approval_source,
+                "p_commercial_used": p_commercial_resolved,
+                "p_event_occurs_used": (econ_v2 or {}).get("p_event_occurs"),
+                "p_positive_outcome_used": (econ_v2 or {}).get("p_positive_outcome"),
+                "rnpv_method": (rnpv or {}).get("assumptions_used", {}).get("rnpv_method"),
+            },
+            # 4 distinct move types — UI should show all separately
+            "move_estimates": move_estimates,
         }
         try:
             write_npv_cached(req.ticker, None, params_hash_val, result_payload, ttl_days=1)

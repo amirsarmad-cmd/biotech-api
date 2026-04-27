@@ -509,20 +509,32 @@ def get_drug_economics_v2_from_cache(ticker: str, drug_name: str) -> Optional[Di
 
 def _compute_confidence_score(provenance: Dict) -> float:
     """Roll up per-field provenance into a single confidence score 0-1.
-    
+
     Weighting:
       high   = 1.0
       medium = 0.6
       low    = 0.2
-      missing/null field = 0.0
-    
+      missing/null field = 0.0  (CHANGED — was 'skip' which inflated scores)
+
+    Critical fields are the ones that materially drive rNPV math. ALL of
+    them are counted in the denominator regardless of whether the LLM
+    populated them — a missing patent_expiry_date or population should
+    drag confidence down, not be silently excluded.
+
+    Why this changed:
+      Previously, missing fields were skipped entirely, which meant an LLM
+      that returned only 3 fields with 'high' confidence would get a 1.0
+      score even though it omitted 6 critical inputs. That made the score
+      look better than reality. Retail users would see 100% confidence on
+      analyses missing the fundamentals.
+
     Returns the average across critical fields. Used as a single 'how much
     should you trust this analysis' indicator.
     """
     if not provenance or not isinstance(provenance, dict):
-        return 0.5  # neutral default — unknown
-    
-    # Fields that materially drive the rNPV math
+        return 0.0  # nothing to score on — minimum confidence
+
+    # Fields that materially drive the rNPV math. ALL counted in denominator.
     critical = [
         "addressable_population_us", "addressable_population_global",
         "annual_cost_us_net_usd", "annual_cost_exus_net_usd",
@@ -531,15 +543,22 @@ def _compute_confidence_score(provenance: Dict) -> float:
     ]
     SCORE = {"high": 1.0, "medium": 0.6, "low": 0.2}
     total = 0.0
-    n = 0
+    missing_fields = []
     for f in critical:
         entry = provenance.get(f)
         if not entry or not isinstance(entry, dict):
-            continue  # skip entirely missing — not an automatic fail
+            # MISSING field counts as 0 — penalize incomplete LLM responses
+            missing_fields.append(f)
+            continue
         conf = entry.get("confidence", "low")
         total += SCORE.get(conf.lower() if isinstance(conf, str) else "low", 0.2)
-        n += 1
-    return round(total / max(n, 1), 3) if n > 0 else 0.5
+    # Denominator is always len(critical) — missing fields drag score down
+    score = total / len(critical)
+    # Log diagnostic info to help users understand low scores
+    if missing_fields and len(missing_fields) >= 3:
+        logger.info(f"confidence_score: {score:.3f}, "
+                    f"{len(missing_fields)}/{len(critical)} critical fields missing: {missing_fields[:5]}")
+    return round(score, 3)
 
 
 def write_drug_economics_v2_to_cache(ticker: str, drug_name: str, econ_v2: Dict, ttl_days: int = 7) -> bool:
