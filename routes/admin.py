@@ -1957,3 +1957,75 @@ async def polygon_news_ingest(req: PolygonNewsIngestRequest):
     except Exception as e:
         logger.exception("polygon_news_ingest failed")
         raise HTTPException(500, f"news_ingest error: {e}")
+
+
+@router.get("/orange-book/discover-url")
+async def orange_book_discover_url():
+    """Discover the current Orange Book download URL by scraping FDA's
+    data-files page (works from inside Railway, not sandbox).
+
+    This solves the problem that the historical /media/76860/download URL
+    has been returning 404 — FDA periodically renames bundle endpoints
+    when they release new versions.
+
+    Returns: list of all candidate ZIP/download URLs found on the page,
+             with sizes if reachable.
+    """
+    import re, urllib.request
+    page_url = "https://www.fda.gov/drugs/drug-approvals-and-databases/orange-book-data-files"
+    try:
+        req = urllib.request.Request(page_url, headers={
+            "User-Agent": "Mozilla/5.0 (compatible; biotech-screener/1.0)",
+            "Accept": "*/*",
+        })
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        return {"status": "page_fetch_failed", "error": str(e)[:200], "page_url": page_url}
+
+    # Find candidate URLs
+    candidates = set()
+    for m in re.finditer(r'href="([^"]+)"', html):
+        href = m.group(1)
+        if any(k in href.lower() for k in ["orange", "download", ".zip"]):
+            if href.startswith("/"):
+                href = "https://www.fda.gov" + href
+            if href.startswith("http"):
+                candidates.add(href[:300])
+
+    # Probe each — HEAD request to get size + status
+    probes = []
+    for url in sorted(candidates)[:20]:
+        try:
+            req = urllib.request.Request(url, method="HEAD", headers={
+                "User-Agent": "Mozilla/5.0 (compatible; biotech-screener/1.0)",
+            })
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                probes.append({
+                    "url": url,
+                    "status": resp.status,
+                    "content_length": resp.headers.get("Content-Length"),
+                    "content_type": resp.headers.get("Content-Type"),
+                    "last_modified": resp.headers.get("Last-Modified"),
+                })
+        except Exception as e:
+            probes.append({"url": url, "status": "err", "error": str(e)[:100]})
+
+    # Highlight the most likely OB ZIP (largest content-length, .zip in URL)
+    likely = None
+    for p in probes:
+        if (p.get("status") == 200 and
+            (p.get("content_length") and int(p.get("content_length")) > 1_000_000) and
+            (".zip" in p.get("url", "").lower() or
+             (p.get("content_type") or "").startswith("application/zip"))):
+            if likely is None or int(p.get("content_length", 0)) > int(likely.get("content_length", 0)):
+                likely = p
+
+    return {
+        "status": "ok",
+        "page_url": page_url,
+        "page_size": len(html),
+        "n_candidates": len(candidates),
+        "probes": probes,
+        "likely_orange_book_url": likely,
+    }
