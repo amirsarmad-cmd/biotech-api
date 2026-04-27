@@ -190,7 +190,30 @@ async def analyze_npv(req: NPVRequest):
             description=description, market_cap_m=market_cap_m,
             force_refresh=req.force_refresh,
         )
-        
+
+        # ---- Step 1.5: Enforce source precedence (ChatGPT pass-3 critique #3) ─
+        # FDA / SEC / ClinicalTrials / Orange Book facts MUST override LLM
+        # inference on the same field. Without this, the prompt receives
+        # verified_facts but the LLM's structured output can still 'win' —
+        # patent_expiry_date='2030-05-15' from LLM guess vs Orange Book
+        # actual = '2026-08-21' is a serious gap. This step rewrites
+        # specific fields with verified-source values + records audit.
+        precedence_audit = None
+        try:
+            # Pre-fetch SEC capital structure so precedence can use shares + runway.
+            # Best-effort — failures here don't break NPV computation.
+            try:
+                from services.sec_financials import fetch_capital_structure
+                cap_pre = fetch_capital_structure(req.ticker)
+                if cap_pre and not cap_pre.get("_error"):
+                    econ_v2["_sec_capital_structure"] = cap_pre
+            except Exception:
+                pass
+            from services.source_precedence import enforce_source_precedence
+            econ_v2, precedence_audit = enforce_source_precedence(econ_v2, ticker=req.ticker)
+        except Exception as e:
+            logger.info(f"source precedence enforcement failed (non-fatal): {e}")
+
         # ---- Step 2: legacy NPV (kept for back-compat / sanity check) ----
         # Build legacy economics from V2 if possible, else call legacy LLM
         if econ_v2.get("peak_sales_usd_b"):
@@ -380,6 +403,18 @@ async def analyze_npv(req: NPVRequest):
         except Exception as e:
             logger.info(f"equity_value computation failed (non-fatal): {e}")
 
+        # ---- Step 4.7: Narrative dilution capacity (ATM / shelf / warrants) ----
+        # ChatGPT pass-3 critique #1: SEC XBRL gives current cash/debt/shares,
+        # but ATM facilities + shelf registrations + warrants live in narrative
+        # filings (S-3, 424B5, 8-K). For micro-caps, the CAPACITY to dilute
+        # often matters more than current count.
+        dilution_capacity = None
+        try:
+            from services.sec_dilution import fetch_dilution_capacity
+            dilution_capacity = fetch_dilution_capacity(req.ticker, max_filings_to_parse=4)
+        except Exception as e:
+            logger.info(f"dilution_capacity lookup failed (non-fatal): {e}")
+
         # ---- Step 5: persist to cache ----
         result_payload = {
             "ticker": req.ticker,
@@ -404,6 +439,10 @@ async def analyze_npv(req: NPVRequest):
             # Capital-structure-aware equity value — replaces naive rNPV/market_cap
             "equity_value": equity_value,
             "capital_structure": cap_structure,
+            # Narrative dilution: ATM, shelf, warrants from S-3/424B5/8-K
+            "dilution_capacity": dilution_capacity,
+            # Source precedence audit — what verified facts overrode LLM inference
+            "source_precedence_audit": precedence_audit,
         }
         try:
             write_npv_cached(req.ticker, None, params_hash_val, result_payload, ttl_days=1)

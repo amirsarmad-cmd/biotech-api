@@ -2411,3 +2411,29 @@ async def move_stats_abnormal():
     except Exception as e:
         logger.exception("move_stats_abnormal failed")
         raise HTTPException(500, f"move_stats_abnormal error: {e}")
+
+
+@router.get("/sec/dilution-capacity")
+async def sec_dilution_capacity(ticker: str, max_filings: int = 4):
+    """Spot-check ATM/shelf/warrant extraction from SEC narrative filings.
+
+    Per ChatGPT pass-3 critique #1: SEC XBRL extraction gives cash/debt/shares
+    but not the dilution CAPACITY hidden in S-3, 424B5, 8-K narrative.
+    This endpoint runs services/sec_dilution.py and returns structured facts:
+    ATM facilities, shelf registrations, outstanding warrants, convertibles,
+    recent issuances.
+
+    Latency: ~10-20s (fetches up to N filings + LLM-extracts each).
+    Result cached 12h in Redis.
+    """
+    try:
+        from services.sec_dilution import fetch_dilution_capacity
+        result = fetch_dilution_capacity(ticker.upper(), max_filings_to_parse=max_filings)
+        if not result:
+            raise HTTPException(404, "no SEC dilution data")
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("sec_dilution_capacity failed")
+        raise HTTPException(500, f"sec_dilution_capacity error: {e}")
