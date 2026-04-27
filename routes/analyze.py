@@ -163,7 +163,7 @@ async def analyze_npv(req: NPVRequest):
         # new fields. Old cached entries will then be ignored (they lack the
         # new fields) and the next call writes a fresh response.
         cache_payload = {
-            "_schema_version": "v4_confidence_breakdown",  # bumped 2026-04-27
+            "_schema_version": "v5_confidence_breakdown_realigned",  # bumped 2026-04-27 (v4 had broken field mapping)
             "ticker": req.ticker, "catalyst_type": req.catalyst_type,
             "catalyst_date": catalyst_date, "drug_name": drug_name,
             "discount_rate": req.discount_rate, "tax_rate": req.tax_rate,
