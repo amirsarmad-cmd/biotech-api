@@ -477,6 +477,21 @@ async def analyze_npv(req: NPVRequest):
             # Source precedence audit — what verified facts overrode LLM inference
             "source_precedence_audit": precedence_audit,
         }
+
+        # Recompute confidence_breakdown with the FINAL enriched provenance.
+        # source_precedence adds sec_edgar entries (shares_outstanding_m,
+        # cash_runway_months) AFTER estimate_drug_economics_v2 returned.
+        # Without this recompute, the dilution category shows 0/5 populated
+        # even though those fields exist with high confidence.
+        try:
+            from services.npv_model import _compute_confidence_breakdown
+            final_prov = (econ_v2 or {}).get("provenance") or {}
+            if final_prov:
+                if "economics_v2" in result_payload and isinstance(result_payload["economics_v2"], dict):
+                    result_payload["economics_v2"]["confidence_breakdown"] = _compute_confidence_breakdown(final_prov)
+        except Exception as e:
+            logger.info(f"confidence_breakdown recompute failed (non-fatal): {e}")
+
         try:
             write_npv_cached(req.ticker, None, params_hash_val, result_payload, ttl_days=1)
         except Exception as e:

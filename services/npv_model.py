@@ -574,21 +574,26 @@ def _compute_confidence_score(provenance: Dict) -> float:
 # "For NTLA, confidence may be high for trial status and cash, medium for
 #  commercial penetration, and low for net pricing. A single blended score
 #  hides that."
+#
+# IMPORTANT: only fields that actually appear in econ_v2.provenance count.
+# String/categorical fields like indication/modality don't get provenance
+# entries (only numeric fields do per prompt rules), so they're not here.
+# SEC-derived fields (shares_outstanding_m, cash_runway_months) are added
+# AFTER econ_v2 by source_precedence — the analyze.py route recomputes the
+# breakdown post-enrichment so they show up.
 CONFIDENCE_CATEGORIES: Dict[str, list] = {
     "clinical": [
-        # Phase 3 enrollment, trial status, mechanism — comes from CT.gov + LLM
-        "phase3_total_enrollment", "trial_status", "indication",
-        "first_in_class", "modality",
+        # Outcome probabilities for the catalyst itself (clinical-trial nature)
+        "p_event_occurs", "p_positive_outcome",
     ],
     "regulatory": [
-        # FDA approval status, patent expiry, label — comes from OpenFDA + Orange Book
-        "approval_status", "patent_expiry_date", "loe_dropoff_pct",
-        "launch_year", "peak_sales_year",
+        # Patent expiry, launch timing, LOE drop-off — sourced from
+        # Orange Book + LLM analysis of approval timelines
+        "patent_expiry_date", "launch_year", "peak_sales_year", "loe_dropoff_pct",
     ],
     "market": [
-        # Addressable population, competitive landscape — LLM/research
+        # Addressable population — for indication-specific patient pool
         "addressable_population_us", "addressable_population_global",
-        "competitive_intensity", "competitors",
     ],
     "pricing": [
         # Net realized pricing — usually LLM inference unless drug is approved
@@ -597,14 +602,13 @@ CONFIDENCE_CATEGORIES: Dict[str, list] = {
         "standard_of_care_cost_usd", "revenue_split_us_pct",
     ],
     "penetration": [
-        # Market share at peak, time-to-peak
+        # Market share at peak, time-to-peak, commercial success, COGS
         "penetration_mid_pct", "penetration_min_pct", "penetration_max_pct",
-        "time_to_peak_years", "commercial_success_prob",
+        "time_to_peak_years", "commercial_success_prob", "cogs_pct_estimate",
     ],
     "dilution": [
-        # Capital structure — comes from SEC EDGAR XBRL
-        "shares_outstanding_m", "cash_runway_months", "cash_usd",
-        "debt_usd", "burn_rate_monthly_usd",
+        # Capital structure — added by source_precedence post-econ_v2
+        "shares_outstanding_m", "cash_runway_months",
     ],
 }
 
