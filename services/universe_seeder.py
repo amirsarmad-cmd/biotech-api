@@ -911,7 +911,57 @@ def extract_catalysts_for_ticker(ticker: str, company_name: str) -> Tuple[List[D
       1. LLM_ENABLED=false → mock data, $0
       2. Try gemini-2.5-flash with Google Search grounding (cheap, real facts)
       3. Fallback to gpt-4o (no search but stronger reasoning)
+
+    Every invocation writes a row to catalyst_ingestion_log with the
+    final source/status/error. Lets admin diagnose silent parse failures
+    via /admin/catalysts/{ticker}/ingestion-log.
     """
+    import time as _time
+    _t0 = _time.time()
+    catalysts, meta = _extract_catalysts_inner(ticker, company_name)
+    duration_ms = int((_time.time() - _t0) * 1000)
+    _log_ingestion_attempt(ticker, meta, len(catalysts), duration_ms)
+    return catalysts, meta
+
+
+def _log_ingestion_attempt(ticker: str, meta: Dict, n_found: int, duration_ms: int) -> None:
+    """Append a row to catalyst_ingestion_log. Best-effort; never raises."""
+    try:
+        from services.database import BiotechDatabase
+        # Map meta into log columns
+        source = (meta.get("source") or "unknown").replace("llm_", "").split("_")[0]
+        # Status: 'success' if catalysts found, 'no_data' if all tiers empty,
+        # 'error' if exception, 'rate_limited' if budget/circuit-breaker hit
+        if n_found > 0:
+            status = "success"
+        elif meta.get("error", "").lower().find("budget") != -1 or "circuit_open" in (meta.get("error") or ""):
+            status = "rate_limited"
+        elif meta.get("error"):
+            status = "error"
+        else:
+            status = "no_data"
+        err = meta.get("error") or ""
+        error_class = err.split(":")[0][:80] if err else None
+        error_message = err[:200] if err else None
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO catalyst_ingestion_log
+                  (ticker, source, status, catalysts_found,
+                   error_class, error_message, duration_ms)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """, (ticker, source, status, n_found,
+                  error_class, error_message, duration_ms))
+            conn.commit()
+    except Exception as e:
+        # Don't let logging failures break the seeder
+        logger.info(f"_log_ingestion_attempt failed for {ticker}: {e}")
+
+
+def _extract_catalysts_inner(ticker: str, company_name: str) -> Tuple[List[Dict], Dict]:
+    """Inner extractor (the original logic). Wrapped by extract_catalysts_for_ticker
+    which handles ingestion logging."""
     meta = {"source": None, "cost_usd": 0.0, "error": None}
 
     if not LLM_ENABLED:
@@ -1779,6 +1829,10 @@ def write_catalysts_to_db(catalysts: List[Dict], conn) -> Dict:
                 # The unique INDEX is partial — only enforced when canonical
                 # drug name is non-null AND status='active'. NULL drug rows
                 # (company-level catalysts) can have multiple entries.
+                #
+                # NEW: rows where is_manual_override=TRUE are NEVER overwritten.
+                # The user manually edited those, so the seeder must respect
+                # them. The DO UPDATE WHERE clause filters them out.
                 cur.execute("""
                     INSERT INTO catalyst_universe
                         (ticker, company_name, catalyst_type, catalyst_date, date_precision,
@@ -1796,6 +1850,8 @@ def write_catalysts_to_db(catalysts: List[Dict], conn) -> Dict:
                         confidence_score = EXCLUDED.confidence_score,
                         source = EXCLUDED.source,
                         last_updated = NOW()
+                    WHERE catalyst_universe.is_manual_override = FALSE
+                       OR catalyst_universe.is_manual_override IS NULL
                     RETURNING (xmax = 0) AS inserted
                 """, (
                     c["ticker"], c.get("company_name"), c["catalyst_type"],
@@ -1805,11 +1861,16 @@ def write_catalysts_to_db(catalysts: List[Dict], conn) -> Dict:
                     c.get("source", "unknown"), c.get("source_url"),
                     c.get("confidence_score"),
                 ))
-                inserted = cur.fetchone()[0]
-                if inserted:
-                    stats["added"] += 1
+                row = cur.fetchone()
+                if row is None:
+                    # The row exists and is_manual_override=TRUE → respected
+                    stats["skipped_manual"] = stats.get("skipped_manual", 0) + 1
                 else:
-                    stats["updated"] += 1
+                    inserted = row[0]
+                    if inserted:
+                        stats["added"] += 1
+                    else:
+                        stats["updated"] += 1
             except Exception as e:
                 stats["errors"].append(f"{c.get('ticker')}/{c.get('catalyst_type')}: {e}")
         conn.commit()

@@ -357,7 +357,7 @@ async def get_stock_detail(ticker: str, with_npv: bool = Query(True)):
                 SELECT id, ticker, company_name, catalyst_type, catalyst_date,
                        date_precision, description, drug_name, canonical_drug_name,
                        indication, phase, source, source_url, confidence_score,
-                       verified, status, last_updated
+                       verified, status, last_updated, is_manual_override
                 FROM catalyst_universe
                 WHERE ticker = %s AND status = 'active'
                 ORDER BY catalyst_date ASC NULLS LAST
@@ -379,6 +379,13 @@ async def get_stock_detail(ticker: str, with_npv: bool = Query(True)):
                     "indication": v2_row.get("indication"),
                     "phase": v2_row.get("phase"),
                     "source": v2_row.get("source") or "v2",
+                    # ── NEW: ingestion health fields surfaced for the FE ──
+                    # last_updated answers "when was this catalyst data last refreshed"
+                    # is_manual_override flags admin-edited rows that take precedence
+                    "_last_updated": v2_row.get("last_updated"),
+                    "_is_manual_override": bool(v2_row.get("is_manual_override")),
+                    "_source_url": v2_row.get("source_url"),
+                    "_catalyst_id": v2_row.get("id"),
                     # market_cap is filled below from legacy if available
                 })
     except Exception as e:
@@ -616,6 +623,38 @@ async def get_stock_detail(ticker: str, with_npv: bool = Query(True)):
             "materiality_rationale": m["rationale"],
         })
 
+    # Build catalyst data-health snapshot for transparency. After user
+    # critique that 'system silently fails to parse and falls back to
+    # placeholders, leaving users unable to trade', surface for every
+    # primary catalyst:
+    #   source        — Gemini, OpenAI, Anthropic, ClinicalTrials, manual
+    #   last_updated  — ISO timestamp of last refresh
+    #   freshness_hours — hours since last_updated (rounded)
+    #   is_manual_override — flag for admin-edited catalysts
+    #   catalyst_id   — for the FE's edit/override action
+    catalyst_data_health = None
+    try:
+        from datetime import datetime as _dt, timezone as _tz
+        last_upd = primary.get("_last_updated")
+        if last_upd:
+            # last_upd may be datetime or string; normalize
+            if hasattr(last_upd, "isoformat"):
+                last_iso = last_upd.isoformat()
+                hrs = (_dt.now(_tz.utc) - last_upd).total_seconds() / 3600.0
+            else:
+                last_iso = str(last_upd)
+                hrs = None
+            catalyst_data_health = {
+                "source": primary.get("source") or "unknown",
+                "source_url": primary.get("_source_url"),
+                "last_updated": last_iso,
+                "freshness_hours": round(hrs, 1) if hrs is not None else None,
+                "is_manual_override": bool(primary.get("_is_manual_override")),
+                "catalyst_id": primary.get("_catalyst_id"),
+            }
+    except Exception as e:
+        logger.info(f"catalyst_data_health build for {ticker}: {e}")
+
     return _to_jsonable({
         "ticker": ticker,
         "company_name": company_name,
@@ -631,6 +670,11 @@ async def get_stock_detail(ticker: str, with_npv: bool = Query(True)):
             "indication": primary.get("indication"),
             "phase": primary.get("phase"),
             "materiality": primary_materiality,
+            "source": primary.get("source"),
+            # Data-provenance object — UI shows 'Gemini · 3h ago' or
+            # 'Manual override · 1d ago'. Critical for trust given how often
+            # the LLM-seeded catalysts go stale or wrong.
+            "data_health": catalyst_data_health,
         },
         "npv_catalyst": (
             {**npv_catalyst_summary, "materiality": npv_materiality}

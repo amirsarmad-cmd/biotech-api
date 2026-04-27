@@ -2688,3 +2688,234 @@ async def sec_dilution_capacity(ticker: str, max_filings: int = 4):
     except Exception as e:
         logger.exception("sec_dilution_capacity failed")
         raise HTTPException(500, f"sec_dilution_capacity error: {e}")
+
+
+# ────────────────────────────────────────────────────────────
+# Manual catalyst override + ingestion health
+# ────────────────────────────────────────────────────────────
+# Per user proposal: "Build a simple admin form allowing manual catalyst
+# entry (drug name, phase, date, estimated PoS, indication) that overrides
+# auto-parsed data. Display parse health status on detail page."
+
+class ManualCatalystPayload(BaseModel):
+    ticker: str
+    catalyst_type: str        # 'FDA Decision' | 'Phase 3 Readout' | etc.
+    catalyst_date: str        # YYYY-MM-DD
+    drug_name: Optional[str] = None
+    indication: Optional[str] = None
+    phase: Optional[str] = None
+    description: Optional[str] = None
+    probability: Optional[float] = None    # P(approval). Stored as confidence_score.
+    source_url: Optional[str] = None       # if user has a press release / clinicaltrials link
+
+
+@router.post("/catalysts/manual")
+async def add_manual_catalyst(payload: ManualCatalystPayload):
+    """Insert a manual catalyst override. The is_manual_override flag
+    keeps the seeder from overwriting it on next refresh.
+
+    Returns the inserted row ID.
+    """
+    try:
+        from services.database import BiotechDatabase
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO catalyst_universe (
+                    ticker, company_name, catalyst_type, catalyst_date,
+                    description, drug_name, indication, phase,
+                    source, source_url, confidence_score, verified, status,
+                    is_manual_override, last_updated, created_at
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s,
+                    'manual', %s, %s, TRUE, 'active',
+                    TRUE, NOW(), NOW()
+                )
+                ON CONFLICT (ticker, catalyst_type, catalyst_date, drug_name)
+                DO UPDATE SET
+                    description = EXCLUDED.description,
+                    indication = EXCLUDED.indication,
+                    phase = EXCLUDED.phase,
+                    source_url = EXCLUDED.source_url,
+                    confidence_score = EXCLUDED.confidence_score,
+                    is_manual_override = TRUE,
+                    source = 'manual',
+                    verified = TRUE,
+                    status = 'active',
+                    last_updated = NOW()
+                RETURNING id
+            """, (
+                payload.ticker.upper().strip(),
+                None,  # company_name will be filled by trigger or next seeder run
+                payload.catalyst_type,
+                payload.catalyst_date,
+                payload.description,
+                payload.drug_name,
+                payload.indication,
+                payload.phase,
+                payload.source_url,
+                payload.probability,
+            ))
+            new_id = cur.fetchone()[0]
+            # Log the manual addition into the ingestion log
+            cur.execute("""
+                INSERT INTO catalyst_ingestion_log
+                  (ticker, source, status, catalysts_found)
+                VALUES (%s, 'manual', 'success', 1)
+            """, (payload.ticker.upper().strip(),))
+            conn.commit()
+        return {"id": new_id, "ticker": payload.ticker.upper().strip(),
+                "is_manual_override": True}
+    except Exception as e:
+        logger.exception("add_manual_catalyst failed")
+        raise HTTPException(500, f"add_manual_catalyst error: {e}")
+
+
+@router.patch("/catalysts/{catalyst_id}")
+async def edit_catalyst(catalyst_id: int, payload: ManualCatalystPayload):
+    """Edit any catalyst row. Marks as is_manual_override=TRUE so the
+    seeder won't revert the change."""
+    try:
+        from services.database import BiotechDatabase
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE catalyst_universe
+                SET catalyst_type = %s,
+                    catalyst_date = %s,
+                    description = COALESCE(%s, description),
+                    drug_name = COALESCE(%s, drug_name),
+                    indication = COALESCE(%s, indication),
+                    phase = COALESCE(%s, phase),
+                    confidence_score = COALESCE(%s, confidence_score),
+                    source_url = COALESCE(%s, source_url),
+                    is_manual_override = TRUE,
+                    last_updated = NOW()
+                WHERE id = %s
+                RETURNING id, ticker, catalyst_type, catalyst_date
+            """, (
+                payload.catalyst_type, payload.catalyst_date,
+                payload.description, payload.drug_name,
+                payload.indication, payload.phase,
+                payload.probability, payload.source_url,
+                catalyst_id,
+            ))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, f"catalyst id {catalyst_id} not found")
+            conn.commit()
+        return {"id": row[0], "ticker": row[1],
+                "catalyst_type": row[2],
+                "catalyst_date": str(row[3])[:10] if row[3] else None,
+                "is_manual_override": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("edit_catalyst failed")
+        raise HTTPException(500, f"edit_catalyst error: {e}")
+
+
+@router.delete("/catalysts/{catalyst_id}")
+async def soft_delete_catalyst(catalyst_id: int):
+    """Soft-delete by setting status='invalid'. Preserves audit trail."""
+    try:
+        from services.database import BiotechDatabase
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE catalyst_universe
+                SET status = 'invalid',
+                    last_updated = NOW()
+                WHERE id = %s
+                RETURNING id, ticker
+            """, (catalyst_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, f"catalyst id {catalyst_id} not found")
+            conn.commit()
+        return {"id": row[0], "ticker": row[1], "status": "invalid"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("delete_catalyst failed")
+        raise HTTPException(500, f"delete_catalyst error: {e}")
+
+
+@router.get("/catalysts/{ticker}/ingestion-log")
+async def catalyst_ingestion_log(ticker: str, limit: int = 20):
+    """Show the last N ingestion attempts for a ticker. Lets the user
+    see WHY parsing failed (if it did) and diagnose stale/missing data.
+    """
+    try:
+        from services.database import BiotechDatabase
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT attempt_at, source, status, catalysts_found,
+                       error_class, error_message, duration_ms
+                FROM catalyst_ingestion_log
+                WHERE ticker = %s
+                ORDER BY attempt_at DESC
+                LIMIT %s
+            """, (ticker.upper().strip(), limit))
+            rows = cur.fetchall()
+        return {
+            "ticker": ticker.upper().strip(),
+            "attempts": [
+                {
+                    "attempt_at": str(r[0])[:19] if r[0] else None,
+                    "source": r[1],
+                    "status": r[2],
+                    "catalysts_found": r[3],
+                    "error_class": r[4],
+                    "error_message": r[5],
+                    "duration_ms": r[6],
+                }
+                for r in rows
+            ],
+        }
+    except Exception as e:
+        logger.exception("ingestion_log failed")
+        raise HTTPException(500, f"ingestion_log error: {e}")
+
+
+@router.get("/catalysts/ingestion-health")
+async def catalyst_ingestion_health(hours: int = 24):
+    """System-wide ingestion health over the last N hours. Returns
+    success/failure breakdown by source so admin can spot a degraded
+    parser before it impacts users.
+    """
+    try:
+        from services.database import BiotechDatabase
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT source, status, COUNT(*) AS n
+                FROM catalyst_ingestion_log
+                WHERE attempt_at > NOW() - INTERVAL '%s hours'
+                GROUP BY 1, 2
+                ORDER BY 1, 2
+            """, (hours,))
+            rows = cur.fetchall()
+            cur.execute("""
+                SELECT COUNT(DISTINCT ticker)
+                FROM catalyst_ingestion_log
+                WHERE attempt_at > NOW() - INTERVAL '%s hours'
+            """, (hours,))
+            tickers_touched = cur.fetchone()[0]
+        return {
+            "window_hours": hours,
+            "tickers_touched": tickers_touched,
+            "by_source_status": [
+                {"source": r[0], "status": r[1], "count": r[2]}
+                for r in rows
+            ],
+        }
+    except Exception as e:
+        logger.exception("ingestion_health failed")
+        raise HTTPException(500, f"ingestion_health error: {e}")
