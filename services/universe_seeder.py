@@ -48,6 +48,13 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 _daily_spend = 0.0
 _daily_spend_date = None
 
+# Gemini circuit breaker — if N consecutive 503s, skip Gemini for COOLDOWN_SEC.
+# Prevents wasting time on retry storms when Gemini capacity is throttled.
+_gemini_consecutive_503 = 0
+_gemini_circuit_open_until = 0.0
+GEMINI_503_THRESHOLD = 3       # after 3 consecutive 503s, open circuit
+GEMINI_COOLDOWN_SEC = 120      # skip Gemini for 2 minutes
+
 
 # ────────────────────────────────────────────────────────────
 # Universe candidate sources
@@ -906,22 +913,34 @@ def extract_catalysts_for_ticker(ticker: str, company_name: str) -> Tuple[List[D
     # Try primary: Gemini with grounding
     gemini_returned_empty = False
     if LLM_PROVIDER == "gemini" and GOOGLE_API_KEY:
-        try:
-            catalysts = _call_gemini_extract(ticker, company_name)
-            _record_spend(COST_PER_GEMINI_CALL_USD)
-            meta["source"] = "llm_gemini"
-            meta["cost_usd"] = COST_PER_GEMINI_CALL_USD
-            if catalysts:
-                return catalysts, meta
-            # Gemini returned empty list (silent JSON parse failure or content filter).
-            # Fall through to OpenAI fallback rather than accept zero results.
-            gemini_returned_empty = True
-            meta["error"] = "gemini_returned_empty"
-            logger.info(f"Gemini returned 0 catalysts for {ticker}, trying OpenAI fallback")
-        except Exception as e:
-            logger.warning(f"Gemini extract failed for {ticker}, trying OpenAI: {e}")
-            meta["error"] = f"gemini_failed: {type(e).__name__}"
-            # fall through to OpenAI
+        # Circuit breaker: if Gemini has had 3+ consecutive 503s, skip it
+        # entirely until the cooldown elapses. Prevents wasting 3-6s per call
+        # on retry storms when Google's capacity is throttled.
+        # The breaker counter is updated from inside _call_gemini_extract
+        # (where 503 errors are detected); we just check the gate here.
+        import time as _t
+        if _gemini_circuit_open_until > _t.time():
+            remaining = int(_gemini_circuit_open_until - _t.time())
+            logger.info(f"[gemini] circuit open ({remaining}s remaining), skipping to OpenAI for {ticker}")
+            meta["error"] = f"gemini_circuit_open_{remaining}s"
+            gemini_returned_empty = True  # signal that Gemini wasn't tried
+        else:
+            try:
+                catalysts = _call_gemini_extract(ticker, company_name)
+                _record_spend(COST_PER_GEMINI_CALL_USD)
+                meta["source"] = "llm_gemini"
+                meta["cost_usd"] = COST_PER_GEMINI_CALL_USD
+                if catalysts:
+                    return catalysts, meta
+                # Gemini returned empty list (silent JSON parse failure, content
+                # filter, or 503 swallowed inside the extract function).
+                gemini_returned_empty = True
+                meta["error"] = "gemini_returned_empty"
+                logger.info(f"Gemini returned 0 catalysts for {ticker}, trying OpenAI fallback")
+            except Exception as e:
+                logger.warning(f"Gemini extract failed for {ticker}, trying OpenAI: {e}")
+                meta["error"] = f"gemini_failed: {type(e).__name__}"
+                # fall through to OpenAI
 
     # Fallback: OpenAI gpt-4o
     if not OPENAI_API_KEY:
@@ -1008,11 +1027,15 @@ Return ONLY a JSON object: {{"catalysts": [...]}}. If no high-confidence catalys
 
 
 def _call_openai_extract(ticker: str, company_name: str) -> List[Dict]:
-    """Call OpenAI to extract upcoming catalysts. Returns parsed list of dicts."""
-    prompt = _build_extraction_prompt(ticker, company_name)
-    _ = """OLD_INLINE_PROMPT_REPLACED
+    """Call OpenAI to extract upcoming catalysts. Returns parsed list of dicts.
 
-"""
+    Records usage to llm_usage table so we can see fallback activity in the
+    /admin/llm/usage/recent view (previously OpenAI calls were invisible to
+    the dashboard, so when Gemini failed we couldn't tell whether OpenAI
+    was actually saving us).
+    """
+    import time as _t
+    prompt = _build_extraction_prompt(ticker, company_name)
 
     body = {
         "model": LLM_MODEL_OPENAI,
@@ -1024,12 +1047,50 @@ def _call_openai_extract(ticker: str, company_name: str) -> List[Dict]:
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json",
     }
-    r = requests.post("https://api.openai.com/v1/chat/completions", json=body, headers=headers, timeout=45)
-    r.raise_for_status()
-    text = r.json()["choices"][0]["message"]["content"]
-    
+
+    t0 = _t.time()
+    status = "success"
+    err_msg = None
+    tokens_in = 0
+    tokens_out = 0
+    text = ""
+    try:
+        r = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            json=body, headers=headers, timeout=45,
+        )
+        r.raise_for_status()
+        resp = r.json()
+        text = resp["choices"][0]["message"]["content"]
+        usage = resp.get("usage") or {}
+        tokens_in = int(usage.get("prompt_tokens") or 0)
+        tokens_out = int(usage.get("completion_tokens") or 0)
+    except Exception as e:
+        status = "error"
+        err_msg = str(e)[:300]
+        logger.warning(f"[openai] {ticker} call failed: {err_msg}")
+    finally:
+        try:
+            from services.llm_usage import record_usage
+            record_usage(
+                provider="openai", model=LLM_MODEL_OPENAI,
+                feature="universe_seeder", ticker=ticker,
+                tokens_input=tokens_in, tokens_output=tokens_out,
+                duration_ms=int((_t.time() - t0) * 1000),
+                status=status, error_message=err_msg,
+            )
+        except Exception:
+            pass
+
+    if status == "error" or not text:
+        return []
+
     # Parse JSON — model may return {"catalysts": [...]} or [...]
-    parsed = json.loads(text)
+    try:
+        parsed = json.loads(text)
+    except Exception as e:
+        logger.warning(f"[openai] {ticker} JSON parse failed: {e}")
+        return []
     if isinstance(parsed, dict):
         for k in ("catalysts", "results", "data", "items"):
             if k in parsed and isinstance(parsed[k], list):
@@ -1255,14 +1316,19 @@ def _try_extract_balanced(text: str, open_ch: str, close_ch: str) -> str:
 
 
 def _call_gemini_extract(ticker: str, company_name: str) -> List[Dict]:
-    """Call Gemini 2.5 Flash with Google Search grounding for real-time biotech facts."""
+    """Call Gemini 2.5 Flash with Google Search grounding for real-time biotech facts.
+
+    Retries once on transient 503 UNAVAILABLE (Gemini is prone to these during
+    high-demand periods). After two consecutive 503s we give up and let the
+    caller fall through to OpenAI.
+    """
     from google import genai
     from google.genai import types
     import time as _t
-    
+
     client = genai.Client(api_key=GOOGLE_API_KEY)
     prompt = _build_extraction_prompt(ticker, company_name)
-    
+
     config = types.GenerateContentConfig(
         max_output_tokens=8000,         # generous so JSON isn't truncated mid-output
         temperature=0.1,                # low for factual extraction
@@ -1270,52 +1336,82 @@ def _call_gemini_extract(ticker: str, company_name: str) -> List[Dict]:
     if GEMINI_GROUNDING:
         # Enable Google Search as a tool — model decides when to use it
         config.tools = [types.Tool(google_search=types.GoogleSearch())]
-    
+
     t0 = _t.time()
     status = "success"
     err_msg = None
     tokens_in = 0
     tokens_out = 0
     text = ""
-    try:
-        response = client.models.generate_content(
-            model=LLM_MODEL_GEMINI,
-            contents=prompt,
-            config=config,
-        )
-        text = response.text or ""
-        usage = getattr(response, "usage_metadata", None)
-        if usage:
-            tokens_in = getattr(usage, "prompt_token_count", 0) or 0
-            tokens_out = getattr(usage, "candidates_token_count", 0) or 0
-    except Exception as e:
-        status = "error"
-        err_msg = str(e)[:300]
-        logger.warning(f"[gemini] {ticker} call failed: {err_msg}")
-    finally:
+    response = None
+
+    # Attempt 1, then retry once on 503 UNAVAILABLE after 3s sleep
+    saw_503 = False
+    for attempt in (1, 2):
         try:
-            from services.llm_usage import record_usage
-            record_usage(
-                provider="google", model=LLM_MODEL_GEMINI,
-                feature="universe_seeder", ticker=ticker,
-                tokens_input=tokens_in, tokens_output=tokens_out,
-                duration_ms=int((_t.time() - t0) * 1000),
-                status=status, error_message=err_msg,
+            response = client.models.generate_content(
+                model=LLM_MODEL_GEMINI,
+                contents=prompt,
+                config=config,
             )
-        except Exception:
-            pass
-    
+            text = response.text or ""
+            usage = getattr(response, "usage_metadata", None)
+            if usage:
+                tokens_in = getattr(usage, "prompt_token_count", 0) or 0
+                tokens_out = getattr(usage, "candidates_token_count", 0) or 0
+            err_msg = None
+            status = "success"
+            saw_503 = False
+            break  # success — done
+        except Exception as e:
+            status = "error"
+            err_msg = str(e)[:300]
+            if "503" in err_msg and "UNAVAILABLE" in err_msg:
+                saw_503 = True
+            # Retry once on 503 UNAVAILABLE (capacity throttling)
+            if attempt == 1 and saw_503:
+                logger.info(f"[gemini] {ticker} hit 503 UNAVAILABLE, retrying in 3s")
+                _t.sleep(3.0)
+                continue
+            logger.warning(f"[gemini] {ticker} call failed (attempt {attempt}): {err_msg}")
+            break
+
+    # Update circuit-breaker state based on what we just saw
+    global _gemini_consecutive_503, _gemini_circuit_open_until
+    if status == "success":
+        _gemini_consecutive_503 = 0
+    elif saw_503:
+        _gemini_consecutive_503 += 1
+        if _gemini_consecutive_503 >= GEMINI_503_THRESHOLD:
+            _gemini_circuit_open_until = _t.time() + GEMINI_COOLDOWN_SEC
+            logger.warning(
+                f"[gemini] circuit OPEN — {_gemini_consecutive_503} consecutive 503s, "
+                f"skipping Gemini for {GEMINI_COOLDOWN_SEC}s"
+            )
+
+    try:
+        from services.llm_usage import record_usage
+        record_usage(
+            provider="google", model=LLM_MODEL_GEMINI,
+            feature="universe_seeder", ticker=ticker,
+            tokens_input=tokens_in, tokens_output=tokens_out,
+            duration_ms=int((_t.time() - t0) * 1000),
+            status=status, error_message=err_msg,
+        )
+    except Exception:
+        pass
+
     if status == "error":
         return []
     text = text.strip()
-    
+
     # Gemini sometimes returns duplicated outputs concatenated. Find the FIRST complete JSON object.
     text = _extract_first_json_object(text)
-    
+
     if not text:
         logger.warning(f"[gemini] {ticker} returned empty/unparseable text")
         return []
-    
+
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError as e:
