@@ -2460,10 +2460,10 @@ async def retry_stub_rows_with_polygon(max_rows: int = 50):
                 FROM post_catalyst_outcomes
                 WHERE actual_move_pct_1d IS NULL
                   AND catalyst_date IS NOT NULL
-                  AND (last_error IS NULL OR last_error NOT LIKE 'no_data:%')
+                  AND (last_error IS NULL OR last_error NOT LIKE %s)
                 ORDER BY catalyst_date DESC
                 LIMIT %s
-            """, (max_rows,))
+            """, ('no_data:%', max_rows,))
             rows = cur.fetchall()
 
         results = {"attempted": 0, "succeeded": 0, "still_failed": 0, "by_source": {"yfinance": 0, "polygon": 0}, "errors": []}
