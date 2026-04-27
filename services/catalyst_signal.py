@@ -91,19 +91,21 @@ REF_SCENARIOS: Dict[str, Tuple[float, float]] = {
 }
 
 
-# Thresholds calibrated for our model's compressed reference moves.
-# Original critique recommended 5% but our REF_MOVES are smaller (Phase 3
-# top scenario is +3, FDA is +4/-5). We use 5% — anything less is small-edge
-# even by the calibrated table.
-DEFAULT_MIN_SCENARIO_PCT = 5.0
+# Thresholds calibrated against the 459-outcome backtest. Tunable, but
+# these defaults strike a balance:
+#   - 5% (original suggestion) excluded Phase 3 LONG (REF up=3) entirely,
+#     dropping coverage to 1%.
+#   - 3% (first attempt) was too lax — coverage 90% with sub-50% accuracy.
+#   - 4% with bias 0.10 lets Phase 3 SHORT (down=5), FDA both (up=4/down=5),
+#     AdCom both (up=8/down=10), Phase 2 LONG (up=4), Phase 1 both through,
+#     while still filtering out events where the model has no real magnitude
+#     signal.
+DEFAULT_MIN_SCENARIO_PCT = 4.0
 # Probability bias: |p - 0.5| must EXCEED this for a directional bet.
-# 0.15 means p must be ≥ 0.65 (LONG) or ≤ 0.35 (SHORT). Calibrated against
-# the full 358-row backtest after observing that p=0.55-0.65 events show
-# essentially random direction outcomes vs XBI on the 3D window.
-DEFAULT_PROB_BIAS_THRESHOLD = 0.15
-# Hard data-quality floor.
+# 0.10 means p must be > 0.60 (LONG) or < 0.40 (SHORT). Mid-conviction.
+DEFAULT_PROB_BIAS_THRESHOLD = 0.10
 DEFAULT_MIN_CONFIDENCE = 0.55
-DEFAULT_OPTIONS_RATIO_FLOOR = 0.35  # predicted_edge / options_implied must be ≥ this
+DEFAULT_OPTIONS_RATIO_FLOOR = 0.35
 
 
 def get_scenario_magnitudes(catalyst_type: Optional[str]) -> Tuple[float, float]:
