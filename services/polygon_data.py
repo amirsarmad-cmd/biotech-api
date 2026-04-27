@@ -434,14 +434,22 @@ def fetch_news(ticker: str, published_utc_gte: Optional[str] = None,
 def diagnostic() -> Dict:
     """Probe Polygon connectivity + plan tier. Used by /admin/polygon/status."""
     key = _get_api_key()
+    # Also surface what's actually in os.environ — Railway might be dropping
+    # variable names with whitespace because POSIX env names can't have spaces.
+    env_polygon_keys = sorted([k for k in os.environ.keys() if "POLYGON" in k.upper()])
     if not key:
         return {
             "status": "no_api_key",
             "checked_env_vars": ["POLYGON_API_KEY", "POLYGON_API_KEY ", "POLYGON_KEY"],
-            "_note": "Polygon API key not configured. Set POLYGON_API_KEY (no trailing space) on Railway.",
+            "actual_env_vars_with_polygon": env_polygon_keys,
+            "_note": ("Polygon API key not visible to the process. "
+                      "POSIX requires env var names be alphanumeric+underscore — "
+                      "if the Railway variable name has whitespace, the OS strips it. "
+                      "Rename to plain POLYGON_API_KEY (no trailing space) on Railway."),
         }
     # Tickers reference endpoint is on every plan
-    out = {"status": "ok", "key_present": True, "key_prefix": key[:6] + "...", "checks": {}}
+    out = {"status": "ok", "key_present": True, "key_prefix": key[:6] + "...",
+           "actual_env_vars_with_polygon": env_polygon_keys, "checks": {}}
     # Check 1: Reference data
     ref = _http_get(f"{POLYGON_BASE}/v3/reference/tickers", params={"ticker": "AAPL", "limit": 1})
     out["checks"]["reference_tickers"] = {
