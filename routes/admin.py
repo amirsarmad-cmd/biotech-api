@@ -3719,24 +3719,30 @@ async def post_catalyst_aggregate_v3():
             hits_all = r[1] or 0
             avg_err_30d = float(r[2]) if r[2] is not None else None
 
-            # V1 tradeable (legacy LONG/SHORT)
+            # V1 tradeable (legacy LONG/SHORT) — denominator excludes deadband
+            # rows where |abnormal_3d| < 3% (direction_correct_3d IS NULL).
             cur.execute("""
-                SELECT COUNT(*),
-                       COUNT(*) FILTER (WHERE direction_correct_3d),
-                       AVG(error_abs_abnormal_3d_pct)
+                SELECT
+                    COUNT(*) FILTER (WHERE direction_correct_3d IS NOT NULL) AS judged,
+                    COUNT(*) FILTER (WHERE direction_correct_3d) AS hits,
+                    AVG(error_abs_abnormal_3d_pct) AS avg_err,
+                    COUNT(*) AS total_in_bucket
                 FROM post_catalyst_outcomes
                 WHERE tradeable = TRUE
             """)
             r = cur.fetchone()
-            v1_total = r[0] or 0
+            v1_judged = r[0] or 0
+            v1_total = r[3] or 0
             v1_hits = r[1] or 0
             v1_err = float(r[2]) if r[2] is not None else None
 
             # V2 tradeable
             cur.execute("""
-                SELECT COUNT(*),
-                       COUNT(*) FILTER (WHERE direction_correct_v2),
-                       AVG(error_abs_abnormal_3d_pct)
+                SELECT
+                    COUNT(*) FILTER (WHERE direction_correct_v2 IS NOT NULL) AS judged,
+                    COUNT(*) FILTER (WHERE direction_correct_v2) AS hits,
+                    AVG(error_abs_abnormal_3d_pct) AS avg_err,
+                    COUNT(*) AS total_in_bucket
                 FROM post_catalyst_outcomes
                 WHERE signal_v2 IN ('LONG_UNDERPRICED_POSITIVE',
                                     'SHORT_SELL_THE_NEWS',
@@ -3744,15 +3750,17 @@ async def post_catalyst_aggregate_v3():
                                     'LONG', 'SHORT')
             """)
             r = cur.fetchone()
-            v2_total = r[0] or 0
+            v2_judged = r[0] or 0
+            v2_total = r[3] or 0
             v2_hits = r[1] or 0
             v2_err = float(r[2]) if r[2] is not None else None
 
-            # Per-bucket V2 breakdown
+            # Per-bucket V2 breakdown — same fix
             cur.execute("""
                 SELECT signal_v2,
-                       COUNT(*),
-                       COUNT(*) FILTER (WHERE direction_correct_v2 = TRUE),
+                       COUNT(*) AS total,
+                       COUNT(*) FILTER (WHERE direction_correct_v2 IS NOT NULL) AS judged,
+                       COUNT(*) FILTER (WHERE direction_correct_v2 = TRUE) AS hits,
                        AVG(priced_in_score),
                        AVG(error_abs_abnormal_3d_pct)
                 FROM post_catalyst_outcomes
@@ -3762,12 +3770,14 @@ async def post_catalyst_aggregate_v3():
             """)
             buckets = []
             for row in cur.fetchall():
-                sig, n, hits, avg_pi, avg_err = row
-                acc = round(100.0 * hits / n, 1) if n > 0 else None
+                sig, total, judged, hits, avg_pi, avg_err = row
+                acc = round(100.0 * hits / judged, 1) if judged > 0 else None
                 buckets.append({
                     "signal": sig,
-                    "count": n,
+                    "count": total,
+                    "judged": judged,
                     "hits": hits,
+                    "deadband_excluded": total - judged,
                     "direction_accuracy_pct": acc,
                     "avg_priced_in_score": float(avg_pi) if avg_pi is not None else None,
                     "avg_abs_error_pct": float(avg_err) if avg_err is not None else None,
@@ -3785,21 +3795,25 @@ async def post_catalyst_aggregate_v3():
             },
             "tradeable_v1": {
                 "count": v1_total,
+                "judged": v1_judged,
+                "deadband_excluded": v1_total - v1_judged,
                 "direction_hits": v1_hits,
                 "direction_accuracy_pct": (
-                    round(100.0 * v1_hits / v1_total, 1) if v1_total > 0 else None
+                    round(100.0 * v1_hits / v1_judged, 1) if v1_judged > 0 else None
                 ),
                 "coverage_pct": (
                     round(100.0 * v1_total / total_all, 1) if total_all > 0 else None
                 ),
                 "avg_abs_error_pct": round(v1_err, 1) if v1_err is not None else None,
-                "_target": "V1: probability-only classifier (was 31.7%, inverse 68.3%)",
+                "_target": "V1: probability-only classifier",
             },
             "tradeable_v2": {
                 "count": v2_total,
+                "judged": v2_judged,
+                "deadband_excluded": v2_total - v2_judged,
                 "direction_hits": v2_hits,
                 "direction_accuracy_pct": (
-                    round(100.0 * v2_hits / v2_total, 1) if v2_total > 0 else None
+                    round(100.0 * v2_hits / v2_judged, 1) if v2_judged > 0 else None
                 ),
                 "coverage_pct": (
                     round(100.0 * v2_total / total_all, 1) if total_all > 0 else None
@@ -3810,6 +3824,7 @@ async def post_catalyst_aggregate_v3():
             "v2_buckets": buckets,
             "interpretation": {
                 "v2_thesis": "V1 was anti-alpha because high-conf catalysts get faded after the event. V2 splits high-prob LONGs by priced-in score: clean setup → LONG, crowded → SHORT_SELL_THE_NEWS.",
+                "denominator_note": "Direction accuracy excludes deadband rows (|abnormal_3d| < 3%) where there is no clear actual direction to score against. 'judged' is the denominator.",
                 "actionable_target": "tradeable_v2 ≥ 60-65% direction accuracy with coverage 25-40%",
             },
         }
