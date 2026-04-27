@@ -474,7 +474,7 @@ def get_drug_economics_v2_from_cache(ticker: str, drug_name: str) -> Optional[Di
                         return None
                 except Exception:
                     pass
-            return {
+            result = {
                 "ticker": ticker,
                 "canonical_drug_name": canon,
                 "addressable_population_us": int(row[0]) if row[0] else None,
@@ -502,6 +502,14 @@ def get_drug_economics_v2_from_cache(ticker: str, drug_name: str) -> Optional[Di
                 "confidence_score": float(row[23]) if row[23] is not None else None,
                 "_from_cache": True,
             }
+            # Compute confidence_breakdown on read — not stored in DB so it's
+            # always derived from current provenance + current category mapping.
+            # This means changes to CONFIDENCE_CATEGORIES take effect immediately
+            # without needing to invalidate the per-drug economics cache.
+            prov = result.get("provenance")
+            if prov:
+                result["confidence_breakdown"] = _compute_confidence_breakdown(prov)
+            return result
     except Exception as e:
         logger.warning(f"get_drug_economics_v2_from_cache failed: {e}")
         return None
@@ -559,6 +567,91 @@ def _compute_confidence_score(provenance: Dict) -> float:
         logger.info(f"confidence_score: {score:.3f}, "
                     f"{len(missing_fields)}/{len(critical)} critical fields missing: {missing_fields[:5]}")
     return round(score, 3)
+
+
+# Field → category mapping. Used to break the single confidence_score down
+# into 6 categories per ChatGPT pass-4 critique #6:
+# "For NTLA, confidence may be high for trial status and cash, medium for
+#  commercial penetration, and low for net pricing. A single blended score
+#  hides that."
+CONFIDENCE_CATEGORIES: Dict[str, list] = {
+    "clinical": [
+        # Phase 3 enrollment, trial status, mechanism — comes from CT.gov + LLM
+        "phase3_total_enrollment", "trial_status", "indication",
+        "first_in_class", "modality",
+    ],
+    "regulatory": [
+        # FDA approval status, patent expiry, label — comes from OpenFDA + Orange Book
+        "approval_status", "patent_expiry_date", "loe_dropoff_pct",
+        "launch_year", "peak_sales_year",
+    ],
+    "market": [
+        # Addressable population, competitive landscape — LLM/research
+        "addressable_population_us", "addressable_population_global",
+        "competitive_intensity", "competitors",
+    ],
+    "pricing": [
+        # Net realized pricing — usually LLM inference unless drug is approved
+        "annual_cost_us_net_usd", "annual_cost_exus_net_usd",
+        "annual_cost_min_usd", "annual_cost_max_usd",
+        "standard_of_care_cost_usd", "revenue_split_us_pct",
+    ],
+    "penetration": [
+        # Market share at peak, time-to-peak
+        "penetration_mid_pct", "penetration_min_pct", "penetration_max_pct",
+        "time_to_peak_years", "commercial_success_prob",
+    ],
+    "dilution": [
+        # Capital structure — comes from SEC EDGAR XBRL
+        "shares_outstanding_m", "cash_runway_months", "cash_usd",
+        "debt_usd", "burn_rate_monthly_usd",
+    ],
+}
+
+
+def _compute_confidence_breakdown(provenance: Dict) -> Dict[str, Dict]:
+    """Per-category confidence breakdown.
+
+    Returns:
+      {
+        "clinical":     {"score": 0.85, "n_fields": 5, "n_populated": 4},
+        "regulatory":   {"score": 0.20, "n_fields": 5, "n_populated": 1},
+        "market":       {"score": 0.60, "n_fields": 4, "n_populated": 3},
+        "pricing":      {"score": 0.30, "n_fields": 6, "n_populated": 2},
+        "penetration":  {"score": 0.50, "n_fields": 5, "n_populated": 3},
+        "dilution":     {"score": 0.90, "n_fields": 5, "n_populated": 5},
+      }
+
+    Why per-category matters:
+      For NTLA, clinical confidence is HIGH (Phase 3 enrolment, mechanism
+      well-known) but pricing confidence is LOW (drug not approved, no
+      market price). A single rolled-up score hides this — users seeing
+      "confidence = 65%" don't know which inputs to question. Per-category
+      lets retail users target their skepticism at the weak spots.
+    """
+    if not provenance or not isinstance(provenance, dict):
+        return {cat: {"score": 0.0, "n_fields": len(fields), "n_populated": 0}
+                for cat, fields in CONFIDENCE_CATEGORIES.items()}
+
+    SCORE = {"high": 1.0, "medium": 0.6, "low": 0.2}
+    out: Dict[str, Dict] = {}
+    for cat, fields in CONFIDENCE_CATEGORIES.items():
+        total = 0.0
+        n_populated = 0
+        for f in fields:
+            entry = provenance.get(f)
+            if not entry or not isinstance(entry, dict):
+                continue  # missing — counted in denominator but contributes 0
+            n_populated += 1
+            conf = entry.get("confidence", "low")
+            total += SCORE.get(conf.lower() if isinstance(conf, str) else "low", 0.2)
+        score = total / len(fields) if fields else 0.0
+        out[cat] = {
+            "score": round(score, 3),
+            "n_fields": len(fields),
+            "n_populated": n_populated,
+        }
+    return out
 
 
 def write_drug_economics_v2_to_cache(ticker: str, drug_name: str, econ_v2: Dict, ttl_days: int = 7) -> bool:
@@ -790,6 +883,7 @@ Return ONLY the JSON object."""
         prov = result.get("provenance") or {}
         if prov:
             result["confidence_score"] = _compute_confidence_score(prov)
+            result["confidence_breakdown"] = _compute_confidence_breakdown(prov)
         result["error"] = None
         return result
 
