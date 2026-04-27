@@ -159,7 +159,11 @@ async def analyze_npv(req: NPVRequest):
             drug_name = m.group(1) if m else f"{req.ticker}_{req.catalyst_type}"
         
         # ---- Cache key based on inputs ----
+        # IMPORTANT: bump _schema_version whenever the response shape adds
+        # new fields. Old cached entries will then be ignored (they lack the
+        # new fields) and the next call writes a fresh response.
         cache_payload = {
+            "_schema_version": "v3_dual_ev_fund_impact",  # bumped 2026-04-27
             "ticker": req.ticker, "catalyst_type": req.catalyst_type,
             "catalyst_date": catalyst_date, "drug_name": drug_name,
             "discount_rate": req.discount_rate, "tax_rate": req.tax_rate,
