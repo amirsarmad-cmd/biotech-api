@@ -171,31 +171,47 @@ def fetch_historical_options_chain(ticker: str, as_of_date: str,
         underlying_price = float(bar.get("c") or bar.get("close") or 0) or None
 
     # ─── Step 2: List contracts active on as_of_date ─────────────────
-    # Polygon's reference endpoint with expired=true returns ALL contracts
-    # that ever existed, sorted ascending by expiration. Without an explicit
-    # expiration_date.gte filter, we'd get options from 2010 first (useless).
-    # Always require expiration >= as_of_date so we only get contracts that
-    # were still trading.
-    params = {
+    # Polygon's reference endpoint behavior:
+    #   - as_of returns contracts active on that date
+    #   - expired=true returns contracts that have since expired
+    #   - expired=false returns contracts still active TODAY (not as_of)
+    # For historical backfill we need BOTH — contracts active on as_of that
+    # have since expired AND contracts active on as_of that are still alive.
+    # We can't combine in one call, so we merge two queries.
+    base_params = {
         "underlying_ticker": ticker,
         "as_of": as_of_date,
-        "expired": "true",  # include contracts that have since expired
         "limit": 1000,
         "order": "asc",
         "sort": "expiration_date",
-        # CRITICAL: only contracts not yet expired as-of as_of_date
-        "expiration_date.gte": expiration_after or as_of_date,
+        # Restrict expiration to a window after as_of to avoid pulling
+        # already-expired LEAPs from years past
+        "expiration_date.gte": as_of_date,
     }
+    if expiration_after:
+        base_params["expiration_date.gte"] = expiration_after
     if expiration_before:
-        params["expiration_date.lte"] = expiration_before
+        base_params["expiration_date.lte"] = expiration_before
 
-    contracts_data = _http_get(f"{POLYGON_BASE}/v3/reference/options/contracts", params=params)
-    if not contracts_data:
-        return None
-    if contracts_data.get("_status") in (403, 404):
-        return {"_status": "not_available", "_polygon_status": contracts_data.get("_status")}
+    raw_contracts = []
+    for expired_flag in ("true", "false"):
+        params = dict(base_params, expired=expired_flag)
+        page_data = _http_get(f"{POLYGON_BASE}/v3/reference/options/contracts", params=params)
+        if page_data and page_data.get("results"):
+            raw_contracts.extend(page_data["results"])
+        if page_data and page_data.get("_status") in (403, 404):
+            return {"_status": "not_available", "_polygon_status": page_data.get("_status")}
 
-    raw_contracts = contracts_data.get("results") or []
+    # Deduplicate by contract ticker
+    seen = set()
+    deduped = []
+    for c in raw_contracts:
+        key = c.get("ticker")
+        if key and key not in seen:
+            seen.add(key)
+            deduped.append(c)
+    raw_contracts = deduped
+
     if not raw_contracts:
         return {
             "ticker": ticker, "as_of_date": as_of_date,
