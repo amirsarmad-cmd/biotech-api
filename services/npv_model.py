@@ -1316,6 +1316,9 @@ def _params_hash(payload: Dict) -> str:
     """Stable hash of NPV inputs for cache key."""
     # Pick stable fields, ignore order
     keys_of_interest = sorted([
+        # Schema version: bump in routes/analyze.py whenever response shape
+        # changes, so old cache entries are invalidated cleanly.
+        "_schema_version",
         "ticker", "catalyst_type", "catalyst_date", "drug_name",
         "discount_rate", "tax_rate", "cogs_pct", "p_approval", "p_commercial",
         "annual_cost_min_usd", "annual_cost_max_usd",
