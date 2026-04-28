@@ -161,7 +161,11 @@ def _call_llm_json(prompt: str, max_tokens: int = 2500, temperature: float = 0.3
     try:
         if os.getenv("GOOGLE_API_KEY"):
             from google import genai as google_genai
-            client = google_genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
+            from google.genai import types as _gtypes
+            client = google_genai.Client(
+                api_key=os.getenv("GOOGLE_API_KEY"),
+                http_options=_gtypes.HttpOptions(timeout=50000),  # 50s, matches OAI/Anthropic
+            )
             t0 = _t.time()
             resp = client.models.generate_content(
                 model="gemini-2.5-flash",

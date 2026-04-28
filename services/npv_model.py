@@ -967,7 +967,10 @@ Be factual. If you can't find a number, omit it rather than guess."""
     
     t0 = _t.time()
     try:
-        client = google_genai.Client(api_key=google_key)
+        client = google_genai.Client(
+            api_key=google_key,
+            http_options=types.HttpOptions(timeout=50000),  # 50s
+        )
         config = types.GenerateContentConfig(
             max_output_tokens=1500,
             temperature=0.1,

@@ -111,7 +111,10 @@ def label_catalyst_outcome(
         indication=indication or "(unspecified)",
     )
 
-    client = genai.Client(api_key=GOOGLE_API_KEY)
+    client = genai.Client(
+        api_key=GOOGLE_API_KEY,
+        http_options=genai_types.HttpOptions(timeout=50000),  # 50s
+    )
     config = genai_types.GenerateContentConfig(
         max_output_tokens=2000,
         temperature=0.1,

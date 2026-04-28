@@ -142,12 +142,24 @@ def _call_gemini(prompt, feature="ai_pipeline", ticker=None):
     t0 = _t.time()
     last_err = None
     last_model = None
-    for model in ["gemini-2.5-flash", "gemini-2.5-pro"]:
+    # NOTE: gemini-2.5-pro fallback dropped — pro is slower than flash and would
+    # blow past run_parallel_only()'s 70s OVERALL_TIMEOUT before any benefit.
+    # If flash fails after one 503 retry, fail fast and let Claude+GPT carry the analysis.
+    # Per cost policy: NO Anthropic fallback here.
+    for model in ["gemini-2.5-flash"]:
         last_model = model
         for attempt in range(2):
             try:
                 from google import genai as google_genai
-                client = google_genai.Client(api_key=os.getenv("GOOGLE_API_KEY",""))
+                from google.genai import types as _gtypes
+                # 50s SDK timeout (matches Anthropic/OpenAI client timeouts).
+                # Without this, requests can hang indefinitely on socket stall
+                # (see python-genai issue #1893), causing as_completed(timeout=70)
+                # to externally cancel the future and never record the failure.
+                client = google_genai.Client(
+                    api_key=os.getenv("GOOGLE_API_KEY",""),
+                    http_options=_gtypes.HttpOptions(timeout=50000),  # ms
+                )
                 r = client.models.generate_content(model=model, contents=prompt)
                 try:
                     from services.llm_usage import record_usage

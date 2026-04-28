@@ -75,7 +75,10 @@ def _try_google(prompt: str, max_tokens: int, temperature: float) -> Tuple[Optio
     try:
         from google import genai
         from google.genai import types
-        client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY", ""))
+        client = genai.Client(
+            api_key=os.getenv("GOOGLE_API_KEY", ""),
+            http_options=types.HttpOptions(timeout=50000),  # 50s
+        )
         resp = client.models.generate_content(
             model=model,
             contents=prompt,

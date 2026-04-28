@@ -1541,7 +1541,10 @@ def _call_gemini_extract(ticker: str, company_name: str) -> List[Dict]:
     from google.genai import types
     import time as _t
 
-    client = genai.Client(api_key=GOOGLE_API_KEY)
+    client = genai.Client(
+        api_key=GOOGLE_API_KEY,
+        http_options=types.HttpOptions(timeout=50000),  # 50s — prevents indefinite socket stalls
+    )
     prompt = _build_extraction_prompt(ticker, company_name)
 
     config = types.GenerateContentConfig(
