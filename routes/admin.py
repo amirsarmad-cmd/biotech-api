@@ -4348,3 +4348,671 @@ async def precision_coverage_curve():
     except Exception as e:
         logger.exception("precision_coverage_curve failed")
         raise HTTPException(500, f"precision_coverage_curve error: {e}")
+
+
+# ────────────────────────────────────────────────────────────
+# Forward prediction snapshots (item 1)
+# ────────────────────────────────────────────────────────────
+
+@router.post("/post-catalyst/apply-migration-015")
+async def apply_migration_015():
+    """One-shot for migration 015 — prediction_snapshots table. Idempotent."""
+    try:
+        from services.database import BiotechDatabase
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS prediction_snapshots (
+                    id BIGSERIAL PRIMARY KEY,
+                    ticker TEXT NOT NULL,
+                    catalyst_id INTEGER,
+                    catalyst_date DATE,
+                    catalyst_type TEXT,
+                    catalyst_outcome_id BIGINT,
+                    prediction_time TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+                    signal_version TEXT NOT NULL DEFAULT 'v2',
+                    feature_version TEXT NOT NULL DEFAULT 'v1',
+                    model_version TEXT,
+                    signal TEXT NOT NULL,
+                    predicted_prob NUMERIC,
+                    priced_in_score NUMERIC,
+                    predicted_direction INTEGER,
+                    full_features_json JSONB,
+                    evaluated_at TIMESTAMP WITH TIME ZONE,
+                    actual_abnormal_3d_pct NUMERIC,
+                    actual_dir_3d_vs_xbi INTEGER,
+                    direction_correct BOOLEAN,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+                )
+            """)
+            for stmt in [
+                "CREATE INDEX IF NOT EXISTS idx_pred_snap_prediction_time ON prediction_snapshots(prediction_time DESC)",
+                "CREATE INDEX IF NOT EXISTS idx_pred_snap_outcome_id ON prediction_snapshots(catalyst_outcome_id) WHERE catalyst_outcome_id IS NOT NULL",
+                "CREATE INDEX IF NOT EXISTS idx_pred_snap_signal_version_signal ON prediction_snapshots(signal_version, signal)",
+                "CREATE INDEX IF NOT EXISTS idx_pred_snap_pending ON prediction_snapshots(catalyst_date) WHERE evaluated_at IS NULL",
+                "CREATE INDEX IF NOT EXISTS idx_pred_snap_ticker_date ON prediction_snapshots(ticker, catalyst_date DESC)",
+            ]:
+                cur.execute(stmt)
+            cur.execute("""
+                UPDATE alembic_version_biotech
+                SET version_num = '015_snapshot_table'
+                WHERE version_num = '014_sector_runup'
+            """)
+            stamped = cur.rowcount
+            cur.execute("SELECT version_num FROM alembic_version_biotech")
+            new_v = cur.fetchone()[0]
+            conn.commit()
+        return {"success": True, "new_alembic_version": new_v, "stamped_rows": stamped}
+    except Exception as e:
+        logger.exception("apply_migration_015 failed")
+        raise HTTPException(500, f"apply_migration_015 error: {e}")
+
+
+@router.post("/post-catalyst/snapshot-current-classifications")
+async def snapshot_current_classifications(only_new: bool = True):
+    """One-shot: write a snapshot for every classified row in
+    post_catalyst_outcomes. Captures the current V2 state as a baseline
+    so we can diff future snapshots against it.
+
+    NOTE: These snapshots are flagged with feature_version='v1_runup_vs_xbi'
+    and model_version='v2_thresh_0.60_0.80_sector_adj' (current). These are
+    NOT true OOS predictions — they were classified after outcomes were
+    known. The OOS aggregate endpoint should filter by prediction_time >
+    a cutoff date if pure OOS evaluation is desired.
+
+    only_new: skip outcomes that already have a snapshot for the current
+    feature_version + model_version (idempotent).
+    """
+    try:
+        from services.database import BiotechDatabase
+        from services.prediction_snapshots import (
+            write_snapshot, ACTIVE_MODEL_VERSION, ACTIVE_FEATURE_VERSION,
+        )
+        from services.catalyst_signal import predicted_direction_v2
+        db = BiotechDatabase()
+
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(f"""
+                SELECT pco.id, pco.ticker, pco.catalyst_type, pco.catalyst_date,
+                       pco.signal_v2, pco.predicted_prob, pco.priced_in_score,
+                       pco.runup_pre_event_30d_pct,
+                       pco.runup_pre_event_30d_vs_xbi_pct,
+                       pco.sector_runup_30d_pct,
+                       pco.options_implied_move_pct,
+                       pco.abnormal_move_pct_3d,
+                       cu.id, cu.date_precision
+                FROM post_catalyst_outcomes pco
+                LEFT JOIN catalyst_universe cu
+                  ON cu.ticker = pco.ticker
+                 AND cu.catalyst_type = pco.catalyst_type
+                 AND cu.catalyst_date::text = pco.catalyst_date::text
+                 AND cu.status = 'active'
+                WHERE pco.signal_v2 IS NOT NULL
+                {"AND NOT EXISTS (SELECT 1 FROM prediction_snapshots ps WHERE ps.catalyst_outcome_id = pco.id AND ps.feature_version = %s AND ps.model_version = %s)" if only_new else ""}
+            """, (ACTIVE_FEATURE_VERSION, ACTIVE_MODEL_VERSION) if only_new else None)
+            rows = cur.fetchall()
+
+        results = {"scanned": 0, "written": 0, "errors": 0,
+                   "active_model_version": ACTIVE_MODEL_VERSION,
+                   "active_feature_version": ACTIVE_FEATURE_VERSION}
+
+        for row in rows:
+            (pco_id, ticker, cat_type, cat_date, signal, pred_prob,
+             priced_in, runup_raw, runup_vs_xbi, sector_runup,
+             opt_implied, abnormal_3d, cu_id, dprec) = row
+            results["scanned"] += 1
+            try:
+                # Build features snapshot
+                features = {
+                    "predicted_prob": float(pred_prob) if pred_prob is not None else None,
+                    "runup_30d_pct": float(runup_raw) if runup_raw is not None else None,
+                    "runup_30d_vs_xbi_pct": float(runup_vs_xbi) if runup_vs_xbi is not None else None,
+                    "sector_runup_30d_pct": float(sector_runup) if sector_runup is not None else None,
+                    "options_implied_move_pct": float(opt_implied) if opt_implied is not None else None,
+                    "date_precision": dprec,
+                    "catalyst_type": cat_type,
+                }
+                pred_dir = predicted_direction_v2(signal)
+                snap_id = write_snapshot(
+                    db=db,
+                    ticker=ticker,
+                    catalyst_id=cu_id,
+                    catalyst_date=cat_date.isoformat() if hasattr(cat_date, "isoformat") else str(cat_date)[:10] if cat_date else None,
+                    catalyst_type=cat_type,
+                    catalyst_outcome_id=pco_id,
+                    signal=signal,
+                    predicted_prob=float(pred_prob) if pred_prob is not None else None,
+                    priced_in_score=float(priced_in) if priced_in is not None else None,
+                    predicted_direction=pred_dir,
+                    full_features=features,
+                )
+                if snap_id:
+                    results["written"] += 1
+                    # Immediately evaluate if outcome is known
+                    if abnormal_3d is not None:
+                        from services.prediction_snapshots import evaluate_snapshot
+                        evaluate_snapshot(
+                            db=db, snapshot_id=snap_id,
+                            actual_abnormal_3d_pct=float(abnormal_3d),
+                        )
+                else:
+                    results["errors"] += 1
+            except Exception as e:
+                results["errors"] += 1
+                logger.exception(f"snapshot write failed for {ticker}: {e}")
+
+        return results
+    except Exception as e:
+        logger.exception("snapshot_current_classifications failed")
+        raise HTTPException(500, f"snapshot_current_classifications error: {e}")
+
+
+@router.post("/post-catalyst/evaluate-pending-snapshots")
+async def evaluate_pending_snapshots_endpoint(max_rows: int = 500):
+    """For snapshots whose catalyst_outcome_id has abnormal_move_pct_3d
+    populated, fill in evaluation fields. Designed to be called from the
+    nightly cron."""
+    try:
+        from services.database import BiotechDatabase
+        from services.prediction_snapshots import evaluate_pending_snapshots
+        db = BiotechDatabase()
+        return evaluate_pending_snapshots(db=db, max_rows=max_rows)
+    except Exception as e:
+        logger.exception("evaluate_pending_snapshots failed")
+        raise HTTPException(500, f"evaluate_pending_snapshots error: {e}")
+
+
+@router.get("/post-catalyst/oos-aggregate")
+async def oos_aggregate(
+    signal_version: str = "v2",
+    pure_oos_only: bool = False,
+):
+    """OOS aggregate: prediction snapshots vs actual outcomes.
+
+    pure_oos_only=True filters to snapshots whose prediction_time is >=
+    the cutoff date (the date OOS data collection started). Anything
+    snapshotted before that is in-sample and excluded.
+
+    For now there's no cutoff — the table is fresh. As snapshots accumulate
+    over weeks, this filter becomes meaningful.
+    """
+    try:
+        from services.database import BiotechDatabase
+        from services.prediction_snapshots import aggregate_oos
+        db = BiotechDatabase()
+        out = aggregate_oos(db=db, signal_version=signal_version)
+        # Add Wilson CIs to top-level + buckets using the existing helper
+        if out.get("judged", 0) >= 5:
+            out["ci_95_pct"] = _wilson_ci_pct(out["hits"], out["judged"])
+        for b in out.get("buckets", []):
+            if b.get("judged", 0) >= 5:
+                b["ci_95_pct"] = _wilson_ci_pct(b["hits"], b["judged"])
+            else:
+                b["ci_95_pct"] = None
+        return out
+    except Exception as e:
+        logger.exception("oos_aggregate failed")
+        raise HTTPException(500, f"oos_aggregate error: {e}")
+
+
+# ────────────────────────────────────────────────────────────
+# Per-catalyst-type accuracy breakdown (item 2)
+# ────────────────────────────────────────────────────────────
+
+@router.get("/post-catalyst/aggregate-by-catalyst-type")
+async def aggregate_by_catalyst_type():
+    """Per-catalyst-type V2 accuracy. With 459 rows we can probably
+    distinguish FDA Decision (~80) from Phase 3 (~40) from AdCom (~15).
+    Even at small samples it tells us *where* V2 actually works.
+
+    Returns rows for each catalyst_type with V1 + V2 accuracy + CIs.
+    Production-ready flag per type same as aggregate-v3 (n_judged ≥ 30
+    AND CI lower > 55%).
+    """
+    try:
+        from services.database import BiotechDatabase
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT
+                    catalyst_type,
+                    COUNT(*) AS total,
+                    -- V1 metrics
+                    COUNT(*) FILTER (WHERE tradeable = TRUE) AS v1_tradeable,
+                    COUNT(*) FILTER (WHERE tradeable = TRUE AND direction_correct_3d IS NOT NULL) AS v1_judged,
+                    COUNT(*) FILTER (WHERE tradeable = TRUE AND direction_correct_3d = TRUE) AS v1_hits,
+                    -- V2 metrics
+                    COUNT(*) FILTER (
+                        WHERE signal_v2 IN ('LONG_UNDERPRICED_POSITIVE',
+                                            'SHORT_SELL_THE_NEWS',
+                                            'SHORT_LOW_PROBABILITY',
+                                            'LONG', 'SHORT')
+                    ) AS v2_tradeable,
+                    COUNT(*) FILTER (
+                        WHERE signal_v2 IN ('LONG_UNDERPRICED_POSITIVE',
+                                            'SHORT_SELL_THE_NEWS',
+                                            'SHORT_LOW_PROBABILITY',
+                                            'LONG', 'SHORT')
+                          AND direction_correct_v2 IS NOT NULL
+                    ) AS v2_judged,
+                    COUNT(*) FILTER (
+                        WHERE signal_v2 IN ('LONG_UNDERPRICED_POSITIVE',
+                                            'SHORT_SELL_THE_NEWS',
+                                            'SHORT_LOW_PROBABILITY',
+                                            'LONG', 'SHORT')
+                          AND direction_correct_v2 = TRUE
+                    ) AS v2_hits
+                FROM post_catalyst_outcomes
+                WHERE catalyst_type IS NOT NULL
+                GROUP BY catalyst_type
+                ORDER BY total DESC
+            """)
+            rows = cur.fetchall()
+
+        types = []
+        for r in rows:
+            (cat_type, total, v1_trade, v1_judged, v1_hits,
+             v2_trade, v2_judged, v2_hits) = r
+
+            v1_acc = round(100.0 * v1_hits / v1_judged, 1) if v1_judged > 0 else None
+            v2_acc = round(100.0 * v2_hits / v2_judged, 1) if v2_judged > 0 else None
+            v1_ci = _wilson_ci_pct(v1_hits, v1_judged) if v1_judged >= 5 else None
+            v2_ci = _wilson_ci_pct(v2_hits, v2_judged) if v2_judged >= 5 else None
+
+            v2_production_ready = (
+                (v2_judged or 0) >= 30
+                and v2_ci is not None
+                and v2_ci.get("lower_pct") is not None
+                and v2_ci["lower_pct"] > 55.0
+            )
+
+            types.append({
+                "catalyst_type": cat_type,
+                "total_events": total,
+                "v1": {
+                    "tradeable": v1_trade,
+                    "judged": v1_judged,
+                    "hits": v1_hits,
+                    "accuracy_pct": v1_acc,
+                    "ci_95_pct": v1_ci,
+                },
+                "v2": {
+                    "tradeable": v2_trade,
+                    "judged": v2_judged,
+                    "hits": v2_hits,
+                    "accuracy_pct": v2_acc,
+                    "ci_95_pct": v2_ci,
+                    "production_ready": v2_production_ready,
+                },
+                "v2_lift_pp": (
+                    round(v2_acc - v1_acc, 1)
+                    if (v1_acc is not None and v2_acc is not None) else None
+                ),
+            })
+
+        return {
+            "types": types,
+            "interpretation": {
+                "use_case": "Identifies which catalyst types V2 actually works on. With small samples per type (15-80), CIs are wider than aggregate. A type with v2_production_ready=true is a real candidate for live trading; types without it are research-only regardless of point accuracy.",
+                "production_gate": "n_judged ≥ 30 AND CI lower > 55%",
+            },
+        }
+    except Exception as e:
+        logger.exception("aggregate_by_catalyst_type failed")
+        raise HTTPException(500, f"aggregate_by_catalyst_type error: {e}")
+
+
+# ────────────────────────────────────────────────────────────
+# V2 reclassify + snapshot evaluation scheduler (item 4)
+# ────────────────────────────────────────────────────────────
+# Runs nightly to:
+#   1. Re-classify outcomes whose abnormal_3d data has landed since last run
+#      (only_compute_signals=true; no price re-fetch needed)
+#   2. Evaluate any pending snapshots whose outcomes are now scored
+#   3. Write fresh snapshots for newly classified rows (idempotent)
+# Enabled via env var V2_RECLASSIFY_SCHEDULER_ENABLED=1.
+
+_v2_reclassify_scheduler_state: dict = {
+    "started": False,
+    "last_run_at": None,
+    "last_result": None,
+    "runs_total": 0,
+}
+
+
+def _start_v2_reclassify_scheduler_once() -> None:
+    """Start a background asyncio task that runs V2 reclassify + snapshot
+    evaluation on a schedule. Idempotent — multiple calls are no-ops.
+    Only runs if env var V2_RECLASSIFY_SCHEDULER_ENABLED=1."""
+    if _v2_reclassify_scheduler_state.get("started"):
+        return
+    if os.getenv("V2_RECLASSIFY_SCHEDULER_ENABLED", "0") != "1":
+        return
+    _v2_reclassify_scheduler_state["started"] = True
+
+    import asyncio
+    interval_hours = float(os.getenv("V2_RECLASSIFY_SCHEDULER_HOURS", "24"))
+
+    async def _loop():
+        await asyncio.sleep(120)  # Wait 2min on startup
+        from datetime import datetime as _dt
+        from services.database import BiotechDatabase
+        from services.prediction_snapshots import (
+            evaluate_pending_snapshots,
+        )
+        while True:
+            try:
+                logger.info("[v2-reclassify-scheduler] running")
+                results: dict = {}
+                db = BiotechDatabase()
+
+                # Step 1: Re-classify all rows with V2 (only_compute_signals,
+                # no price fetches). This is fast (~10s for 459 rows) and
+                # picks up any new outcomes that landed.
+                from services.catalyst_signal import (
+                    classify_trade_signal_v2, is_tradeable_v2,
+                    predicted_direction_v2,
+                )
+                with db.get_conn() as conn:
+                    cur = conn.cursor()
+                    cur.execute("""
+                        SELECT pco.id, pco.predicted_prob, pco.catalyst_type,
+                               pco.runup_pre_event_30d_pct,
+                               pco.runup_pre_event_30d_vs_xbi_pct,
+                               pco.abnormal_move_pct_3d,
+                               cu.date_precision
+                        FROM post_catalyst_outcomes pco
+                        LEFT JOIN catalyst_universe cu
+                          ON cu.ticker = pco.ticker
+                         AND cu.catalyst_type = pco.catalyst_type
+                         AND cu.catalyst_date::text = pco.catalyst_date::text
+                         AND cu.status = 'active'
+                    """)
+                    rows = cur.fetchall()
+
+                reclass_count = 0
+                for r in rows:
+                    pco_id, pred_prob, cat_type, runup_raw, runup_vs_xbi, abnormal_3d, dprec = r
+                    try:
+                        signal, priced_in = classify_trade_signal_v2(
+                            probability=float(pred_prob) if pred_prob is not None else None,
+                            runup_30d_pct=float(runup_raw) if runup_raw is not None else None,
+                            runup_30d_vs_xbi_pct=float(runup_vs_xbi) if runup_vs_xbi is not None else None,
+                            catalyst_type=cat_type,
+                            confidence_score=float(pred_prob) if pred_prob is not None else None,
+                            date_precision=dprec,
+                        )
+                        pred_dir = predicted_direction_v2(signal)
+                        dir_correct_v2 = None
+                        if abnormal_3d is not None and pred_dir is not None and is_tradeable_v2(signal):
+                            ab = float(abnormal_3d)
+                            if abs(ab) >= 3.0:
+                                actual_dir = 1 if ab > 0 else -1
+                                dir_correct_v2 = (pred_dir == actual_dir)
+                        with db.get_conn() as conn:
+                            cur = conn.cursor()
+                            cur.execute("""
+                                UPDATE post_catalyst_outcomes
+                                SET signal_v2 = %s,
+                                    priced_in_score = %s,
+                                    direction_correct_v2 = %s
+                                WHERE id = %s
+                            """, (signal, priced_in, dir_correct_v2, pco_id))
+                            conn.commit()
+                        reclass_count += 1
+                    except Exception:
+                        pass
+                results["reclassified"] = reclass_count
+
+                # Step 2: Evaluate pending snapshots whose outcomes are now scored
+                eval_results = evaluate_pending_snapshots(db=db, max_rows=500)
+                results["snapshot_evaluation"] = eval_results
+
+                _v2_reclassify_scheduler_state["last_run_at"] = _dt.utcnow().isoformat()
+                _v2_reclassify_scheduler_state["last_result"] = results
+                _v2_reclassify_scheduler_state["runs_total"] += 1
+                logger.info(f"[v2-reclassify-scheduler] done: {results}")
+            except Exception as e:
+                logger.warning(f"[v2-reclassify-scheduler] error: {e}")
+                _v2_reclassify_scheduler_state["last_result"] = {"error": str(e)[:200]}
+            await asyncio.sleep(interval_hours * 3600)
+
+    try:
+        loop = asyncio.get_event_loop()
+        loop.create_task(_loop())
+        logger.info(f"[v2-reclassify-scheduler] STARTED interval={interval_hours}h")
+    except Exception as e:
+        logger.warning(f"[v2-reclassify-scheduler] failed to start: {e}")
+        _v2_reclassify_scheduler_state["started"] = False
+
+
+@router.get("/post-catalyst/v2-reclassify-scheduler-status")
+async def v2_reclassify_scheduler_status():
+    """Status of the V2 reclassify + snapshot eval scheduler.
+    Set env var V2_RECLASSIFY_SCHEDULER_ENABLED=1 to enable.
+    Tunable via V2_RECLASSIFY_SCHEDULER_HOURS (default 24)."""
+    return {
+        "enabled": os.getenv("V2_RECLASSIFY_SCHEDULER_ENABLED", "0") == "1",
+        "interval_hours": float(os.getenv("V2_RECLASSIFY_SCHEDULER_HOURS", "24")),
+        **_v2_reclassify_scheduler_state,
+    }
+
+
+@router.post("/post-catalyst/v2-reclassify-trigger-now")
+async def v2_reclassify_trigger_now():
+    """Manually trigger one round of V2 reclassify + snapshot evaluation."""
+    try:
+        from services.database import BiotechDatabase
+        from services.prediction_snapshots import evaluate_pending_snapshots
+        from services.catalyst_signal import (
+            classify_trade_signal_v2, is_tradeable_v2,
+            predicted_direction_v2,
+        )
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT pco.id, pco.predicted_prob, pco.catalyst_type,
+                       pco.runup_pre_event_30d_pct,
+                       pco.runup_pre_event_30d_vs_xbi_pct,
+                       pco.abnormal_move_pct_3d,
+                       cu.date_precision
+                FROM post_catalyst_outcomes pco
+                LEFT JOIN catalyst_universe cu
+                  ON cu.ticker = pco.ticker
+                 AND cu.catalyst_type = pco.catalyst_type
+                 AND cu.catalyst_date::text = pco.catalyst_date::text
+                 AND cu.status = 'active'
+            """)
+            rows = cur.fetchall()
+
+        reclass_count = 0
+        for r in rows:
+            pco_id, pred_prob, cat_type, runup_raw, runup_vs_xbi, abnormal_3d, dprec = r
+            try:
+                signal, priced_in = classify_trade_signal_v2(
+                    probability=float(pred_prob) if pred_prob is not None else None,
+                    runup_30d_pct=float(runup_raw) if runup_raw is not None else None,
+                    runup_30d_vs_xbi_pct=float(runup_vs_xbi) if runup_vs_xbi is not None else None,
+                    catalyst_type=cat_type,
+                    confidence_score=float(pred_prob) if pred_prob is not None else None,
+                    date_precision=dprec,
+                )
+                pred_dir = predicted_direction_v2(signal)
+                dir_correct_v2 = None
+                if abnormal_3d is not None and pred_dir is not None and is_tradeable_v2(signal):
+                    ab = float(abnormal_3d)
+                    if abs(ab) >= 3.0:
+                        actual_dir = 1 if ab > 0 else -1
+                        dir_correct_v2 = (pred_dir == actual_dir)
+                with db.get_conn() as conn:
+                    cur = conn.cursor()
+                    cur.execute("""
+                        UPDATE post_catalyst_outcomes
+                        SET signal_v2 = %s,
+                            priced_in_score = %s,
+                            direction_correct_v2 = %s
+                        WHERE id = %s
+                    """, (signal, priced_in, dir_correct_v2, pco_id))
+                    conn.commit()
+                reclass_count += 1
+            except Exception:
+                pass
+
+        eval_results = evaluate_pending_snapshots(db=db, max_rows=500)
+        return {
+            "reclassified": reclass_count,
+            "snapshot_evaluation": eval_results,
+        }
+    except Exception as e:
+        logger.exception("v2_reclassify_trigger_now failed")
+        raise HTTPException(500, f"v2_reclassify_trigger_now error: {e}")
+
+
+# ────────────────────────────────────────────────────────────
+# Outcome labeler (item 3)
+# ────────────────────────────────────────────────────────────
+
+@router.post("/post-catalyst/apply-migration-016")
+async def apply_migration_016():
+    """One-shot for migration 016 — outcome label columns."""
+    try:
+        from services.database import BiotechDatabase
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                ALTER TABLE post_catalyst_outcomes
+                ADD COLUMN IF NOT EXISTS outcome_labeled_json JSONB,
+                ADD COLUMN IF NOT EXISTS outcome_label_class TEXT,
+                ADD COLUMN IF NOT EXISTS outcome_label_confidence NUMERIC,
+                ADD COLUMN IF NOT EXISTS outcome_labeled_at TIMESTAMP WITH TIME ZONE
+            """)
+            for stmt in [
+                "CREATE INDEX IF NOT EXISTS idx_pco_outcome_label_class ON post_catalyst_outcomes(outcome_label_class) WHERE outcome_label_class IS NOT NULL",
+                "CREATE INDEX IF NOT EXISTS idx_pco_outcome_labeled_pending ON post_catalyst_outcomes(catalyst_date) WHERE outcome_labeled_at IS NULL AND catalyst_date IS NOT NULL",
+            ]:
+                cur.execute(stmt)
+            cur.execute("""
+                UPDATE alembic_version_biotech
+                SET version_num = '016_outcome_labels'
+                WHERE version_num = '015_snapshot_table'
+            """)
+            stamped = cur.rowcount
+            cur.execute("SELECT version_num FROM alembic_version_biotech")
+            new_v = cur.fetchone()[0]
+            conn.commit()
+        return {"success": True, "new_alembic_version": new_v, "stamped_rows": stamped}
+    except Exception as e:
+        logger.exception("apply_migration_016 failed")
+        raise HTTPException(500, f"apply_migration_016 error: {e}")
+
+
+@router.post("/post-catalyst/label-outcomes-batch")
+async def label_outcomes_batch(max_rows: int = 20, only_new: bool = True):
+    """Label catalyst outcomes via Gemini-grounded press release search.
+    Cost: ~$0.0003 per row. Default batch is 20 rows = ~$0.006.
+
+    only_new=True (default): skip rows that already have outcome_labeled_at
+    set. To re-label, pass only_new=false.
+    """
+    try:
+        from services.database import BiotechDatabase
+        from services.outcome_labeler import label_outcome_for_db_row
+        db = BiotechDatabase()
+
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            where = "WHERE catalyst_date IS NOT NULL"
+            if only_new:
+                where += " AND outcome_labeled_at IS NULL"
+            cur.execute(f"""
+                SELECT id FROM post_catalyst_outcomes
+                {where}
+                ORDER BY catalyst_date DESC
+                LIMIT %s
+            """, (max_rows,))
+            ids = [r[0] for r in cur.fetchall()]
+
+        results = {
+            "scanned": 0,
+            "labeled": 0,
+            "errors": 0,
+            "estimated_cost_usd": round(len(ids) * 0.0003, 4),
+            "class_distribution": {},
+            "sample_outputs": [],
+        }
+        for outcome_id in ids:
+            results["scanned"] += 1
+            try:
+                labeled = label_outcome_for_db_row(db=db, outcome_id=outcome_id)
+                if labeled:
+                    results["labeled"] += 1
+                    cls = labeled.get("outcome_class", "UNKNOWN")
+                    results["class_distribution"][cls] = results["class_distribution"].get(cls, 0) + 1
+                    if len(results["sample_outputs"]) < 3:
+                        results["sample_outputs"].append({
+                            "outcome_id": outcome_id,
+                            "class": cls,
+                            "confidence": labeled.get("confidence"),
+                            "evidence": (labeled.get("evidence") or "")[:120],
+                            "source": labeled.get("primary_source_url"),
+                        })
+                else:
+                    results["errors"] += 1
+            except Exception as e:
+                results["errors"] += 1
+                logger.exception(f"label batch row {outcome_id}: {e}")
+        return results
+    except Exception as e:
+        logger.exception("label_outcomes_batch failed")
+        raise HTTPException(500, f"label_outcomes_batch error: {e}")
+
+
+@router.get("/post-catalyst/outcome-label-stats")
+async def outcome_label_stats():
+    """Coverage + class distribution of labeled outcomes."""
+    try:
+        from services.database import BiotechDatabase
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT
+                    COUNT(*) AS total,
+                    COUNT(*) FILTER (WHERE outcome_labeled_at IS NOT NULL) AS labeled,
+                    COUNT(*) FILTER (WHERE outcome_label_class = 'APPROVED') AS approved,
+                    COUNT(*) FILTER (WHERE outcome_label_class = 'REJECTED') AS rejected,
+                    COUNT(*) FILTER (WHERE outcome_label_class = 'MET_ENDPOINT') AS met_endpoint,
+                    COUNT(*) FILTER (WHERE outcome_label_class = 'MISSED_ENDPOINT') AS missed_endpoint,
+                    COUNT(*) FILTER (WHERE outcome_label_class = 'DELAYED') AS delayed,
+                    COUNT(*) FILTER (WHERE outcome_label_class = 'WITHDRAWN') AS withdrawn,
+                    COUNT(*) FILTER (WHERE outcome_label_class = 'MIXED') AS mixed,
+                    COUNT(*) FILTER (WHERE outcome_label_class = 'UNKNOWN') AS unknown,
+                    AVG(outcome_label_confidence) FILTER (WHERE outcome_labeled_at IS NOT NULL) AS avg_conf,
+                    AVG(outcome_label_confidence) FILTER (WHERE outcome_label_class != 'UNKNOWN') AS avg_conf_known
+                FROM post_catalyst_outcomes
+            """)
+            r = cur.fetchone()
+        total = r[0] or 0
+        labeled = r[1] or 0
+        return {
+            "total_outcomes": total,
+            "labeled_outcomes": labeled,
+            "labeled_pct": round(100.0 * labeled / total, 1) if total > 0 else 0,
+            "class_distribution": {
+                "APPROVED": r[2] or 0, "REJECTED": r[3] or 0,
+                "MET_ENDPOINT": r[4] or 0, "MISSED_ENDPOINT": r[5] or 0,
+                "DELAYED": r[6] or 0, "WITHDRAWN": r[7] or 0,
+                "MIXED": r[8] or 0, "UNKNOWN": r[9] or 0,
+            },
+            "avg_confidence": round(float(r[10]), 2) if r[10] is not None else None,
+            "avg_confidence_known": round(float(r[11]), 2) if r[11] is not None else None,
+            "estimated_full_backfill_cost_usd": round((total - labeled) * 0.0003, 4),
+        }
+    except Exception as e:
+        logger.exception("outcome_label_stats failed")
+        raise HTTPException(500, f"outcome_label_stats error: {e}")

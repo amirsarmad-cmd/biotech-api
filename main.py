@@ -120,6 +120,12 @@ async def lifespan(app: FastAPI):
         _start_seeder_scheduler_once()
     except Exception as e:
         logger.warning(f"seeder scheduler start failed: {e}")
+    # Start V2 reclassify + snapshot eval scheduler (no-op if env var not set)
+    try:
+        from routes.admin import _start_v2_reclassify_scheduler_once
+        _start_v2_reclassify_scheduler_once()
+    except Exception as e:
+        logger.warning(f"v2 reclassify scheduler start failed: {e}")
     # Start news_count refresher (no-op if env var not set)
     try:
         from routes.admin import _start_news_refresher_once
