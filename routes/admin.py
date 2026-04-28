@@ -5345,3 +5345,57 @@ async def edgar_backfill_batch(
     except Exception as e:
         logger.exception("edgar_backfill_batch failed")
         raise HTTPException(500, f"edgar_backfill_batch error: {e}")
+
+
+@router.get("/edgar/diag")
+async def edgar_diag(ticker: str = "NTLA"):
+    """Diagnostic: test which SEC endpoints work from this server.
+    SEC blocks some IPs/UAs; we need to know which paths are reachable."""
+    import requests
+    UA = "AEGRA Biotech Research [email protected]"
+    H = {"User-Agent": UA, "Accept-Encoding": "gzip, deflate"}
+    results = {}
+
+    # Test 1: data.sec.gov submissions for known CIK
+    try:
+        r = requests.get(
+            f"https://data.sec.gov/submissions/CIK0001652130.json",
+            headers=H, timeout=10,
+        )
+        results["data_sec_submissions"] = {
+            "status": r.status_code,
+            "bytes": len(r.content),
+            "ticker_match": "NTLA" in r.text if r.status_code == 200 else None,
+        }
+    except Exception as e:
+        results["data_sec_submissions"] = {"error": str(e)[:100]}
+
+    # Test 2: www.sec.gov/files company_tickers
+    try:
+        r = requests.get(
+            "https://www.sec.gov/files/company_tickers.json",
+            headers=H, timeout=10,
+        )
+        results["www_sec_company_tickers"] = {
+            "status": r.status_code,
+            "bytes": len(r.content),
+            "is_blocked_html": "Undeclared Automated Tool" in r.text,
+        }
+    except Exception as e:
+        results["www_sec_company_tickers"] = {"error": str(e)[:100]}
+
+    # Test 3: www.sec.gov Archives (where 8-K HTML lives)
+    try:
+        r = requests.get(
+            "https://www.sec.gov/Archives/edgar/data/1652130/000119312526179401/d138980d8k.htm",
+            headers=H, timeout=10,
+        )
+        results["www_sec_archives_8k"] = {
+            "status": r.status_code,
+            "bytes": len(r.content),
+            "is_blocked_html": "Undeclared Automated Tool" in r.text,
+        }
+    except Exception as e:
+        results["www_sec_archives_8k"] = {"error": str(e)[:100]}
+
+    return {"ticker_tested": ticker, "results": results, "user_agent": UA}
