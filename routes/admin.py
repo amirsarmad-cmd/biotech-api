@@ -5016,3 +5016,332 @@ async def outcome_label_stats():
     except Exception as e:
         logger.exception("outcome_label_stats failed")
         raise HTTPException(500, f"outcome_label_stats error: {e}")
+
+
+# ────────────────────────────────────────────────────────────
+# EDGAR 8-K backfill (historical catalyst scraping)
+# ────────────────────────────────────────────────────────────
+# User selected: 2015-2025 deepest, source priority EDGAR > Finnhub > BPC,
+# one-shot scrape. This backfills historical biotech catalysts from SEC
+# 8-K filings, extracts events via Gemini, dedupes against catalyst_universe.
+
+@router.get("/edgar/recon/{ticker}")
+async def edgar_recon(ticker: str, start_date: str = "2015-01-01",
+                      end_date: Optional[str] = None):
+    """Quick recon: how many 8-Ks does a ticker have in the window, and
+    how many look like catalysts? Read-only, no writes. ~1-2s per ticker."""
+    try:
+        from services.edgar_scraper import (
+            resolve_cik, list_8k_filings, fetch_filing_text, is_catalyst_8k,
+        )
+        cik = resolve_cik(ticker)
+        if not cik:
+            return {"ticker": ticker.upper(), "cik": None, "error": "ticker not in SEC company_tickers"}
+        filings = list_8k_filings(cik, start_date=start_date, end_date=end_date)
+
+        # Classify a sample of up to 10 to see hit rate
+        sample = filings[:10] if filings else []
+        catalyst_hits = 0
+        sampled = 0
+        sample_results = []
+        for f in sample:
+            if not f.get("primary_doc"):
+                continue
+            sampled += 1
+            text = fetch_filing_text(cik, f["accession"], f["primary_doc"])
+            if not text:
+                continue
+            is_cat, kws = is_catalyst_8k(text, f.get("items", ""))
+            if is_cat:
+                catalyst_hits += 1
+            sample_results.append({
+                "filing_date": f["filing_date"],
+                "items": f["items"],
+                "is_catalyst_keyword_hit": is_cat,
+                "keywords_matched": kws,
+            })
+
+        return {
+            "ticker": ticker.upper(),
+            "cik": cik,
+            "total_8ks_in_range": len(filings),
+            "sample_size": sampled,
+            "catalyst_hits_in_sample": catalyst_hits,
+            "estimated_catalyst_8ks": int(len(filings) * (catalyst_hits / sampled)) if sampled > 0 else None,
+            "sample_results": sample_results,
+        }
+    except Exception as e:
+        logger.exception("edgar_recon failed")
+        raise HTTPException(500, f"edgar_recon error: {e}")
+
+
+@router.post("/edgar/backfill-ticker")
+async def edgar_backfill_ticker(
+    ticker: str,
+    start_date: str = "2015-01-01",
+    end_date: Optional[str] = None,
+    max_filings: int = 50,
+    extract: bool = True,
+    dry_run: bool = False,
+):
+    """Scrape one ticker's 8-K archive, keyword-filter to catalysts,
+    LLM-extract structured events, dedupe + write to catalyst_universe.
+
+    extract=False stops after keyword filter (no LLM cost). Useful for
+    dry runs to see how many catalysts will be processed.
+
+    dry_run=True does everything except the final DB write.
+
+    Returns counts + sample extracted events.
+    """
+    try:
+        from services.edgar_scraper import (
+            resolve_cik, list_8k_filings, fetch_filing_text,
+            is_catalyst_8k, extract_catalyst_via_llm,
+        )
+        from services.universe_seeder import _canonicalize_drug
+        from services.database import BiotechDatabase
+
+        ticker_u = ticker.upper().strip()
+        cik = resolve_cik(ticker_u)
+        if not cik:
+            return {"error": f"ticker {ticker_u} not in SEC company_tickers"}
+
+        # Get company name from screener_stocks
+        db = BiotechDatabase()
+        company_name = ticker_u
+        try:
+            with db.get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT company_name FROM screener_stocks WHERE ticker = %s", (ticker_u,))
+                r = cur.fetchone()
+                if r:
+                    company_name = r[0] or ticker_u
+        except Exception:
+            pass
+
+        filings = list_8k_filings(cik, start_date=start_date, end_date=end_date)
+        if max_filings and len(filings) > max_filings:
+            filings = filings[:max_filings]
+
+        results = {
+            "ticker": ticker_u,
+            "cik": cik,
+            "total_8ks_in_range": len(filings),
+            "keyword_hits": 0,
+            "llm_extracted": 0,
+            "llm_skipped_not_catalyst": 0,
+            "llm_failures": 0,
+            "rows_added": 0,
+            "rows_updated": 0,
+            "rows_skipped_dup": 0,
+            "estimated_llm_cost_usd": 0.0,
+            "sample_events": [],
+        }
+
+        # Pass 1: keyword filter
+        candidates = []
+        for f in filings:
+            if not f.get("primary_doc"):
+                continue
+            text = fetch_filing_text(cik, f["accession"], f["primary_doc"])
+            if not text:
+                continue
+            is_cat, _ = is_catalyst_8k(text, f.get("items", ""))
+            if is_cat:
+                candidates.append({**f, "_text": text})
+        results["keyword_hits"] = len(candidates)
+
+        if not extract:
+            return results
+
+        # Pass 2: LLM extract
+        results["estimated_llm_cost_usd"] = round(len(candidates) * 0.0003, 4)
+        for c in candidates:
+            extracted = extract_catalyst_via_llm(
+                ticker=ticker_u, cik=cik,
+                filing_date=c["filing_date"],
+                text=c["_text"],
+            )
+            if not extracted:
+                results["llm_failures"] += 1
+                continue
+            if not extracted.get("is_catalyst"):
+                results["llm_skipped_not_catalyst"] += 1
+                continue
+
+            results["llm_extracted"] += 1
+            # Build canonical row
+            cat_type = extracted.get("catalyst_type")
+            cat_date = extracted.get("catalyst_date_iso") or c["filing_date"]
+            drug_name = extracted.get("drug_name")
+            indication = extracted.get("indication")
+            outcome_class = extracted.get("outcome_class")
+            evidence = extracted.get("evidence")
+            confidence = extracted.get("confidence", 0.5)
+
+            if not cat_type:
+                continue
+
+            source_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{c['accession'].replace('-', '')}/{c['primary_doc']}"
+
+            if dry_run:
+                if len(results["sample_events"]) < 5:
+                    results["sample_events"].append({
+                        "filing_date": c["filing_date"],
+                        "catalyst_type": cat_type,
+                        "drug_name": drug_name,
+                        "indication": indication,
+                        "outcome_class": outcome_class,
+                        "evidence": (evidence or "")[:120],
+                        "source_url": source_url,
+                    })
+                continue
+
+            # Write catalyst_universe row
+            try:
+                with db.get_conn() as conn:
+                    cur = conn.cursor()
+                    cur.execute("""
+                        INSERT INTO catalyst_universe
+                            (ticker, company_name, catalyst_type, catalyst_date, date_precision,
+                             description, drug_name, canonical_drug_name, indication, phase,
+                             source, source_url, confidence_score, status, last_updated)
+                        VALUES (%s, %s, %s, %s, 'exact', %s, %s, %s, %s, %s,
+                                'edgar_8k', %s, %s, 'active', NOW())
+                        ON CONFLICT (ticker, catalyst_type, catalyst_date, canonical_drug_name)
+                        WHERE canonical_drug_name IS NOT NULL AND status = 'active'
+                        DO UPDATE SET
+                            description = EXCLUDED.description,
+                            confidence_score = GREATEST(catalyst_universe.confidence_score,
+                                                         EXCLUDED.confidence_score),
+                            last_updated = NOW()
+                        WHERE catalyst_universe.is_manual_override = FALSE
+                           OR catalyst_universe.is_manual_override IS NULL
+                        RETURNING (xmax = 0) AS inserted
+                    """, (
+                        ticker_u, company_name, cat_type, cat_date,
+                        evidence,
+                        drug_name, _canonicalize_drug(drug_name),
+                        indication, None,
+                        source_url, confidence,
+                    ))
+                    row = cur.fetchone()
+                    conn.commit()
+
+                if row is None:
+                    results["rows_skipped_dup"] += 1
+                else:
+                    if row[0]:
+                        results["rows_added"] += 1
+                    else:
+                        results["rows_updated"] += 1
+                    if len(results["sample_events"]) < 5:
+                        results["sample_events"].append({
+                            "filing_date": c["filing_date"],
+                            "catalyst_type": cat_type,
+                            "drug_name": drug_name,
+                            "outcome_class": outcome_class,
+                            "evidence": (evidence or "")[:120],
+                        })
+            except Exception as e:
+                logger.warning(f"[edgar] insert failed for {ticker_u}/{cat_date}/{cat_type}: {e}")
+
+        return results
+    except Exception as e:
+        logger.exception("edgar_backfill_ticker failed")
+        raise HTTPException(500, f"edgar_backfill_ticker error: {e}")
+
+
+@router.post("/edgar/backfill-batch")
+async def edgar_backfill_batch(
+    max_tickers: int = 10,
+    start_date: str = "2015-01-01",
+    end_date: Optional[str] = None,
+    max_filings_per_ticker: int = 100,
+    skip_done: bool = True,
+    extract: bool = True,
+    dry_run: bool = False,
+):
+    """Batch over multiple tickers in our universe. Use skip_done=True
+    (default) to avoid re-scraping tickers that already have 'edgar_8k'-
+    sourced rows in catalyst_universe (idempotent across runs).
+
+    For the full 740-ticker / 10-year backfill, this should be called
+    repeatedly (each call processes max_tickers tickers) until no more
+    are returned.
+    """
+    try:
+        from services.edgar_scraper import resolve_cik
+        from services.database import BiotechDatabase
+        db = BiotechDatabase()
+
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            if skip_done:
+                cur.execute("""
+                    SELECT ticker FROM screener_stocks
+                    WHERE ticker NOT IN (
+                        SELECT DISTINCT ticker FROM catalyst_universe
+                        WHERE source = 'edgar_8k'
+                    )
+                    ORDER BY market_cap DESC NULLS LAST
+                    LIMIT %s
+                """, (max_tickers,))
+            else:
+                cur.execute("""
+                    SELECT ticker FROM screener_stocks
+                    ORDER BY market_cap DESC NULLS LAST
+                    LIMIT %s
+                """, (max_tickers,))
+            tickers = [r[0] for r in cur.fetchall()]
+
+        batch_results = {
+            "tickers_processed": 0,
+            "tickers_no_cik": 0,
+            "total_8ks_scanned": 0,
+            "total_keyword_hits": 0,
+            "total_llm_extracted": 0,
+            "total_rows_added": 0,
+            "total_rows_updated": 0,
+            "total_estimated_cost_usd": 0.0,
+            "errors": [],
+            "per_ticker": [],
+        }
+
+        for ticker in tickers:
+            try:
+                cik = resolve_cik(ticker)
+                if not cik:
+                    batch_results["tickers_no_cik"] += 1
+                    continue
+                # Inline the per-ticker logic by calling the function directly
+                r = await edgar_backfill_ticker(
+                    ticker=ticker, start_date=start_date, end_date=end_date,
+                    max_filings=max_filings_per_ticker,
+                    extract=extract, dry_run=dry_run,
+                )
+                if isinstance(r, dict) and "error" not in r:
+                    batch_results["tickers_processed"] += 1
+                    batch_results["total_8ks_scanned"] += r.get("total_8ks_in_range", 0)
+                    batch_results["total_keyword_hits"] += r.get("keyword_hits", 0)
+                    batch_results["total_llm_extracted"] += r.get("llm_extracted", 0)
+                    batch_results["total_rows_added"] += r.get("rows_added", 0)
+                    batch_results["total_rows_updated"] += r.get("rows_updated", 0)
+                    batch_results["total_estimated_cost_usd"] += r.get("estimated_llm_cost_usd", 0)
+                    batch_results["per_ticker"].append({
+                        "ticker": ticker,
+                        "8ks": r.get("total_8ks_in_range"),
+                        "keyword_hits": r.get("keyword_hits"),
+                        "extracted": r.get("llm_extracted"),
+                        "added": r.get("rows_added"),
+                        "updated": r.get("rows_updated"),
+                    })
+            except Exception as e:
+                batch_results["errors"].append({"ticker": ticker, "error": str(e)[:120]})
+
+        batch_results["total_estimated_cost_usd"] = round(batch_results["total_estimated_cost_usd"], 4)
+        return batch_results
+    except Exception as e:
+        logger.exception("edgar_backfill_batch failed")
+        raise HTTPException(500, f"edgar_backfill_batch error: {e}")
