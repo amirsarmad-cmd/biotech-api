@@ -159,6 +159,44 @@ def normalize_one_staging_row(*, db, staging_row: Dict[str, Any]) -> Optional[Di
     config_kwargs: Dict[str, Any] = {
         "max_output_tokens": 4000,  # bumped from 2048; some multi-clause filings still truncated
         "temperature": 0.1,
+        # Force structured JSON output. This bypasses markdown fences,
+        # enforces field types, and dramatically reduces mid-string
+        # truncation. Gemini's JSON mode is reliable for this kind of
+        # structured extraction task.
+        "response_mime_type": "application/json",
+        "response_schema": {
+            "type": "object",
+            "properties": {
+                "is_clinical_catalyst": {"type": "boolean"},
+                "catalyst_type": {
+                    "type": "string",
+                    "enum": [
+                        "FDA Decision", "Phase 1 Readout", "Phase 2 Readout",
+                        "Phase 3 Readout", "AdComm", "Submission",
+                        "Trial Initiation", "Other",
+                    ],
+                    "nullable": True,
+                },
+                "drug_name": {"type": "string", "nullable": True},
+                "indication": {"type": "string", "nullable": True},
+                "extracted_catalyst_date": {
+                    "type": "string", "nullable": True,
+                    "description": "YYYY-MM-DD format, or null",
+                },
+                "date_precision": {
+                    "type": "string",
+                    "enum": ["exact", "day", "month", "quarter", "unknown"],
+                },
+                "confidence": {
+                    "type": "number",
+                    "minimum": 0.0, "maximum": 1.0,
+                },
+                "reject_reason": {"type": "string", "nullable": True},
+            },
+            "required": [
+                "is_clinical_catalyst", "date_precision", "confidence",
+            ],
+        },
     }
     if safety_settings is not None:
         config_kwargs["safety_settings"] = safety_settings
