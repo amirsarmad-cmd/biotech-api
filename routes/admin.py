@@ -5974,3 +5974,56 @@ async def backfill_debug_insert():
     except Exception as e:
         logger.exception("backfill_debug_insert failed")
         raise HTTPException(500, f"backfill_debug_insert error: {e}")
+
+
+@router.post("/post-catalyst/backfill-reset-unclear-to-pending")
+async def backfill_reset_unclear_to_pending(
+    source: str = "edgar",
+    only_with_normalized_json: bool = True,
+    confirm: str = "",
+):
+    """Reset status='unclear' rows back to 'pending' so they can be
+    retried after normalizer bug fixes. By default, only resets rows
+    that have valid normalized_json (i.e. LLM succeeded but INSERT failed
+    or downstream had a bug) — these are the ones most likely to succeed
+    on retry. Skips runaway-newline-truncation rows since those will
+    fail again unless we re-call the LLM.
+
+    To also reset rows without normalized_json (genuine LLM failures),
+    pass only_with_normalized_json=false.
+
+    Requires confirm=yes.
+    """
+    if confirm != "yes":
+        raise HTTPException(400, "must pass confirm=yes")
+    try:
+        from services.database import BiotechDatabase
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            if only_with_normalized_json:
+                cur.execute("""
+                    UPDATE catalyst_backfill_staging
+                    SET status = 'pending',
+                        reject_reason = NULL,
+                        processed_at = NULL
+                    WHERE source = %s
+                      AND status = 'unclear'
+                      AND normalized_json IS NOT NULL
+                """, (source,))
+            else:
+                cur.execute("""
+                    UPDATE catalyst_backfill_staging
+                    SET status = 'pending',
+                        reject_reason = NULL,
+                        processed_at = NULL,
+                        normalized_json = NULL
+                    WHERE source = %s
+                      AND status = 'unclear'
+                """, (source,))
+            n = cur.rowcount
+            conn.commit()
+        return {"reset": n, "source": source, "only_with_normalized_json": only_with_normalized_json}
+    except Exception as e:
+        logger.exception("backfill_reset_unclear_to_pending failed")
+        raise HTTPException(500, f"reset error: {e}")
