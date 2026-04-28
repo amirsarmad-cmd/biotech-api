@@ -284,28 +284,40 @@ def edgar_backfill_for_cik(db, cik_padded: str, ticker: str,
     """Backfill all 8-K filings for one CIK over [start_year, end_year]
     that pass the clinical-keyword regex pre-filter. Writes to staging.
 
-    Returns {scraped, inserted, skipped, errored}.
+    Returns counters with skip-reason breakdown for diagnostics.
     """
-    counts = {"scraped": 0, "inserted": 0, "skipped": 0, "errored": 0}
+    counts = {
+        "scraped": 0, "inserted": 0, "skipped": 0, "errored": 0,
+        "skipped_items_filter": 0,
+        "skipped_no_excerpt": 0,
+        "skipped_no_keywords": 0,
+        "skipped_dup": 0,
+    }
 
     filings = fetch_filings_for_cik(cik_padded, start_year, end_year)
     counts["scraped"] = len(filings)
 
     for f in filings:
         try:
-            # Skip if not in items list (e.g. just acquisitions)
             items = f.get("items") or ""
+            # If items field is non-empty, must match relevant codes;
+            # if items is empty, we proceed (older filings often lack items field)
             if items and not RELEVANT_ITEM_CODES_RE.search(items):
                 counts["skipped"] += 1
+                counts["skipped_items_filter"] += 1
                 continue
 
-            # Fetch text and apply keyword filter
             excerpt = fetch_filing_text_excerpt(f, max_chars=3000)
-            if not excerpt or not looks_like_clinical_catalyst(excerpt, items):
+            if not excerpt:
                 counts["skipped"] += 1
+                counts["skipped_no_excerpt"] += 1
                 continue
 
-            # Build staging row
+            if not looks_like_clinical_catalyst(excerpt, items):
+                counts["skipped"] += 1
+                counts["skipped_no_keywords"] += 1
+                continue
+
             cik_padded_str = f["cik_padded"]
             accession = f["accession_no"]
             source_id = f"edgar:{cik_padded_str}:{accession}"
@@ -318,7 +330,6 @@ def edgar_backfill_for_cik(db, cik_padded: str, ticker: str,
 
             with db.get_conn() as conn:
                 cur = conn.cursor()
-                # Title heuristic: first 200 chars; LLM normalize will refine
                 title = excerpt[:200]
                 cur.execute("""
                     INSERT INTO catalyst_backfill_staging (
@@ -341,6 +352,7 @@ def edgar_backfill_for_cik(db, cik_padded: str, ticker: str,
                 counts["inserted"] += 1
             else:
                 counts["skipped"] += 1
+                counts["skipped_dup"] += 1
         except Exception as e:
             counts["errored"] += 1
             logger.warning(f"[edgar] error processing filing {f.get('accession_no')}: {e}")

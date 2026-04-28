@@ -5691,3 +5691,80 @@ async def backfill_normalize_batch(batch_size: int = 50):
     except Exception as e:
         logger.exception("backfill_normalize_batch failed")
         raise HTTPException(500, f"backfill_normalize_batch error: {e}")
+
+
+@router.post("/post-catalyst/edgar-backfill-debug-ticker")
+async def edgar_backfill_debug_ticker(
+    ticker: str,
+    start_year: int = 2024,
+    end_year: int = 2025,
+):
+    """Single-ticker EDGAR test with skip-reason breakdown. Helps debug
+    why filings are being filtered out.
+
+    Synchronous (no background task). Use for troubleshooting only —
+    don't call on a large set or it'll timeout.
+    """
+    try:
+        from services.database import BiotechDatabase
+        from services.edgar_backfill import (
+            _fetch_sec_ticker_map, fetch_filings_for_cik,
+            fetch_filing_text_excerpt, looks_like_clinical_catalyst,
+            CLINICAL_KEYWORDS_RE, RELEVANT_ITEM_CODES_RE,
+            edgar_backfill_for_cik,
+        )
+
+        db = BiotechDatabase()
+        ticker_map = _fetch_sec_ticker_map()
+        entry = ticker_map.get(ticker.upper())
+        if not entry:
+            return {"error": f"ticker {ticker} not in SEC company_tickers.json", "found_in_map": False}
+
+        cik_padded = entry["cik_padded"]
+        cik = entry["cik"]
+        company = entry["title"]
+
+        # Step 1: list filings (no body fetch)
+        filings = fetch_filings_for_cik(cik_padded, start_year, end_year)
+        result = {
+            "ticker": ticker,
+            "cik": cik,
+            "cik_padded": cik_padded,
+            "company": company,
+            "year_range": f"{start_year}-{end_year}",
+            "filings_listed": len(filings),
+            "filings_sample": [],
+            "step_results": {},
+        }
+        # Show first 3 filings raw
+        for f in filings[:3]:
+            result["filings_sample"].append({
+                "filing_date": str(f.get("filing_date")),
+                "accession": f.get("accession_no"),
+                "items": f.get("items", "")[:80],
+                "primary_doc": (f.get("primary_doc") or "")[:80],
+            })
+
+        # Run actual scraper for diagnostic counters
+        # Use temp run_id=0 since we're not creating a run record
+        counts = edgar_backfill_for_cik(db, cik_padded, ticker, start_year, end_year, run_id=0)
+        result["step_results"] = counts
+
+        # Show a couple sample excerpts (we have to re-fetch since the scraper
+        # already inserted what passed; but we want to see what FAILED)
+        for f in filings[:3]:
+            excerpt = fetch_filing_text_excerpt(f, max_chars=400)
+            has_keywords = looks_like_clinical_catalyst(excerpt) if excerpt else False
+            items = f.get("items") or ""
+            items_match = bool(RELEVANT_ITEM_CODES_RE.search(items)) if items else None  # None = no items field
+            result["filings_sample"][filings.index(f)].update({
+                "excerpt_first_400": (excerpt or "")[:400] + ("..." if excerpt and len(excerpt) > 400 else ""),
+                "has_clinical_keywords": has_keywords,
+                "items_field_present": bool(items),
+                "items_matches_relevant": items_match,
+            })
+
+        return result
+    except Exception as e:
+        logger.exception("edgar_backfill_debug_ticker failed")
+        raise HTTPException(500, f"edgar_backfill_debug_ticker error: {e}")
