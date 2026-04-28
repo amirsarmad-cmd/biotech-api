@@ -450,8 +450,6 @@ def find_existing_catalyst(*, db, ticker: str, catalyst_type: str,
 
 def insert_into_catalyst_universe(*, db, normalized: Dict[str, Any],
                                     staging: Dict[str, Any]) -> Optional[int]:
-def insert_into_catalyst_universe(*, db, normalized: Dict[str, Any],
-                                    staging: Dict[str, Any]) -> Optional[int]:
     """Insert a new row into catalyst_universe from normalized data.
     Returns the new catalyst_universe.id, or None on failure.
 
