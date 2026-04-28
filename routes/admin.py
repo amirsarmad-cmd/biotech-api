@@ -5804,3 +5804,53 @@ async def backfill_staging_sample(
     except Exception as e:
         logger.exception("backfill_staging_sample failed")
         raise HTTPException(500, f"backfill_staging_sample error: {e}")
+
+
+@router.post("/post-catalyst/backfill-reset-status")
+async def backfill_reset_status(
+    from_status: str = "unclear",
+    source: str = "edgar",
+    only_llm_failures: bool = True,
+):
+    """Reset rows from a given status back to 'pending' so they re-process.
+    Useful after fixing a bug or softening the prompt.
+
+    only_llm_failures=True (default for unclear): only resets rows whose
+    reject_reason indicates an LLM call failure (vs legitimate low-confidence
+    classification). For 'rejected' rows, set only_llm_failures=False to
+    re-evaluate them.
+    """
+    try:
+        from services.database import BiotechDatabase
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            if only_llm_failures and from_status == "unclear":
+                cur.execute("""
+                    UPDATE catalyst_backfill_staging
+                    SET status = 'pending',
+                        processed_at = NULL,
+                        reject_reason = NULL,
+                        normalized_json = NULL
+                    WHERE source = %s AND status = %s
+                      AND (reject_reason ILIKE '%%LLM call%%'
+                           OR reject_reason ILIKE '%%LLM call failed%%'
+                           OR reject_reason ILIKE '%%503%%'
+                           OR reject_reason ILIKE '%%UNAVAILABLE%%'
+                           OR reject_reason ILIKE '%%timeout%%')
+                """, (source, from_status))
+            else:
+                cur.execute("""
+                    UPDATE catalyst_backfill_staging
+                    SET status = 'pending',
+                        processed_at = NULL,
+                        reject_reason = NULL,
+                        normalized_json = NULL
+                    WHERE source = %s AND status = %s
+                """, (source, from_status))
+            n = cur.rowcount
+            conn.commit()
+        return {"reset_count": n, "source": source, "from_status": from_status}
+    except Exception as e:
+        logger.exception("backfill_reset_status failed")
+        raise HTTPException(500, f"backfill_reset_status error: {e}")

@@ -246,26 +246,33 @@ def fetch_filings_for_cik(cik_padded: str,
 
 def fetch_filing_text_excerpt(filing: Dict[str, Any], max_chars: int = 3000
                                 ) -> Optional[str]:
-    """Fetch the 8-K filing's text content. Returns the first max_chars
-    of plain text from the most-substantive document in the filing.
+    """Fetch the 8-K filing's actual press release content. Returns the
+    first max_chars of plain text from the press release exhibit.
 
-    Strategy: 8-K filings typically contain:
+    Strategy: an 8-K filing typically contains:
       - The 8-K cover page (small, just metadata + item descriptions)
-      - One or more EX-99.* exhibits (the actual press release)
-      - Other exhibits (consents, contracts, etc.)
-    The press release is what we want — it has the clinical/regulatory
-    content. So we fetch the filing's index, find all .htm files, fetch
-    each, and return the content from the LARGEST one (the press release
-    is almost always the biggest text exhibit).
+      - One or more EX-99.* exhibits (the actual press releases — the
+        SEC convention is that EX-99 = additional exhibits, used for PRs)
+      - XBRL R-files (R1.htm, R2.htm, ...) — financial taxonomy metadata
+      - Filing wrapper / index pages
+
+    The press release lives in EX-99.* files. The XBRL R-files often
+    appear LARGER than the press release because they contain dense
+    tables of XBRL elements. So we cannot just pick the largest .htm —
+    we must filter to press release exhibits specifically.
+
+    File ranking (preferred to least-preferred):
+      1. ex99* / ex-99* files (the SEC convention for press releases)
+      2. files matching d12345dexhibit*.htm or .../ex*.htm patterns
+      3. files NOT starting with R\\d (skip XBRL row files) AND NOT
+         starting with FilingSummary / MetaLinks / Show.js
+      4. fall back to any non-XBRL .htm
 
     Returns None on failure.
     """
     cik_padded = filing["cik_padded"].lstrip("0") or "0"
     accession_padded = filing["accession_padded"]
 
-    # First, get the filing index to enumerate exhibits
-    index_url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik_padded}&type=8-K"
-    # Better approach: directly hit the index.json for this filing
     idx_url = (
         f"https://www.sec.gov/Archives/edgar/data/"
         f"{cik_padded}/{accession_padded}/index.json"
@@ -280,18 +287,47 @@ def fetch_filing_text_excerpt(filing: Dict[str, Any], max_chars: int = 3000
     except Exception:
         return None
 
-    # Find HTML/HTM exhibits; rank by size (largest = press release usually)
-    htm_files = []
+    # Classify exhibits by type
+    candidates = []  # list of (priority, size, name) — lower priority = better
     for it in items:
-        name = it.get("name") or ""
+        name = (it.get("name") or "").lower()
         size = int(it.get("size") or 0)
-        if name.lower().endswith((".htm", ".html")):
-            htm_files.append((size, name))
 
-    htm_files.sort(reverse=True)  # largest first
+        # Skip non-text-like files
+        if not name.endswith((".htm", ".html", ".txt")):
+            continue
+        # Skip XBRL row data files (R1.htm, R2.htm, ...). These are
+        # synthetic per-fact XBRL output and never contain narrative.
+        if re.match(r"^r\d+\.htm$", name):
+            continue
+        # Skip XBRL infrastructure
+        if name in ("filingsummary.xml", "metalinks.json", "show.js"):
+            continue
+        if name.startswith("metalinks") or name.startswith("filingsummary"):
+            continue
 
-    # Try fetching the largest HTM file first; fall back to next if needed
-    for _size, name in htm_files[:3]:
+        # Priority 1: ex99 / ex-99 (press release convention)
+        if "ex99" in name or "ex-99" in name:
+            candidates.append((1, -size, it.get("name")))  # neg size = largest first within priority
+            continue
+        # Priority 2: anything with 'exhibit' or matching dXXXXX*ex*.htm
+        if "exhibit" in name or re.search(r"d\d+dex", name) or re.search(r"_ex\d", name):
+            candidates.append((2, -size, it.get("name")))
+            continue
+        # Priority 3: 8-K cover page (the d-numbered top-level htm)
+        # Skip XBRL definition files
+        if "_def.xml" in name or "_lab.xml" in name or "_pre.xml" in name or "_cal.xml" in name:
+            continue
+        if name.endswith("xbrl.htm"):
+            continue
+        # Plain narrative HTML (not XBRL row file)
+        candidates.append((3, -size, it.get("name")))
+
+    # Sort by (priority asc, size desc within priority)
+    candidates.sort()
+
+    # Try fetching the top 4 candidates in order
+    for priority, _neg_size, name in candidates[:4]:
         url = (
             f"https://www.sec.gov/Archives/edgar/data/"
             f"{cik_padded}/{accession_padded}/{name}"
@@ -308,8 +344,14 @@ def fetch_filing_text_excerpt(filing: Dict[str, Any], max_chars: int = 3000
         text = re.sub(r"&lt;", "<", text)
         text = re.sub(r"&gt;", ">", text)
         text = re.sub(r"&quot;", '"', text)
+        text = re.sub(r"&#160;", " ", text)
         text = re.sub(r"\s+", " ", text).strip()
-        if text and len(text) > 200:  # got meaningful content
+
+        # Reject if it still looks like XBRL boilerplate
+        if "XBRL DOCUMENT" in text[:200] or "Cover [Abstract]" in text[:300]:
+            continue
+
+        if text and len(text) > 200:
             return text[:max_chars]
 
     return None

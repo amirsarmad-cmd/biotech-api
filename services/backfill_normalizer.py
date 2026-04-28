@@ -54,14 +54,27 @@ A "clinical/regulatory catalyst" is one of these specific event types:
   - Trial Initiation (first patient dosed in a Phase 1/2/3)
   - Other (orphan designation, breakthrough designation, fast track, etc.)
 
+IMPORTANT — handling earnings filings with embedded clinical news:
+  - If the filing is a quarterly earnings report (Item 2.02) AND it
+    announces a NEW clinical/regulatory milestone (a readout, trial
+    initiation, FDA correspondence, etc.) in the body, classify by the
+    embedded catalyst type with the catalyst's actual date.
+  - Pure earnings reports without embedded clinical news → NOT a catalyst.
+  - When in doubt, look at the most material clinical content — if it's
+    forward-looking guidance about upcoming readouts, NOT a catalyst.
+    If it's announcing what just happened or what was filed, IS a catalyst.
+
 NON-catalysts (always return is_clinical_catalyst=false):
-  - Quarterly earnings reports
+  - Pure earnings reports without embedded clinical news
   - Stock offerings, financings, dilution
   - M&A, acquisitions, partnerships (unless tied to a clinical milestone)
-  - Management changes (CEO/CMO/CSO transitions) UNLESS the change is
-    co-announced with clinical news in the same filing
+  - Equity compensation plan amendments, board changes (unless co-announced
+    with clinical news)
   - Investor presentations, conferences (unless they include readout data)
-  - Insider trading filings, registration statements
+  - Insider trading filings, S-1/S-3 registration statements
+  - XBRL data files, financial taxonomy, document/entity information files
+    (these are NOT real 8-K content — return is_clinical_catalyst=false
+    with reject_reason="XBRL boilerplate, no narrative content")
 
 Return ONLY valid JSON in this schema (no markdown, no commentary):
 
@@ -96,14 +109,18 @@ ONLY return the JSON object. No prose, no markdown fences."""
 
 def normalize_one_staging_row(*, db, staging_row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Run the LLM on one staged row, return parsed JSON dict.
-    Returns None on failure."""
+    Returns None on failure. Sets staging_row['_last_error'] on failure for
+    diagnostics.
+    """
     if not GOOGLE_API_KEY:
+        staging_row["_last_error"] = "GOOGLE_API_KEY not set"
         return None
 
     try:
         from google import genai
         from google.genai import types as genai_types
     except ImportError:
+        staging_row["_last_error"] = "google-genai not installed"
         return None
 
     prompt = NORMALIZER_PROMPT.format(
@@ -156,6 +173,8 @@ def normalize_one_staging_row(*, db, staging_row: Dict[str, Any]) -> Optional[Di
         pass
 
     if status != "success" or not text:
+        # Bubble the error up so it ends up in reject_reason for diagnostics
+        staging_row["_last_error"] = f"LLM call: {err_msg or 'empty response'}"
         return None
 
     cleaned = text.strip()
@@ -169,6 +188,7 @@ def normalize_one_staging_row(*, db, staging_row: Dict[str, Any]) -> Optional[Di
         parsed = json.loads(cleaned)
     except json.JSONDecodeError as e:
         logger.warning(f"[normalizer] JSON parse failed: {e}")
+        staging_row["_last_error"] = f"JSON parse: {str(e)[:100]}; text[:200]={cleaned[:200]}"
         return None
 
     return parsed
@@ -279,15 +299,16 @@ def normalize_pending_batch(*, db, batch_size: int = 50) -> Dict[str, int]:
                 normalized = normalize_one_staging_row(db=db, staging_row=staging_dict)
                 if not normalized:
                     counts["errored"] += 1
+                    last_err = (staging_dict.get("_last_error") or "LLM call failed")[:500]
                     # Mark errored so we don't retry forever
                     with db.get_conn() as conn:
                         cur = conn.cursor()
                         cur.execute("""
                             UPDATE catalyst_backfill_staging
                             SET status = 'unclear', processed_at = now(),
-                                reject_reason = 'LLM call failed'
+                                reject_reason = %s
                             WHERE id = %s
-                        """, (sid,))
+                        """, (last_err, sid))
                         conn.commit()
                     continue
 
