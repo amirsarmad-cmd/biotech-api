@@ -450,15 +450,70 @@ def find_existing_catalyst(*, db, ticker: str, catalyst_type: str,
 
 def insert_into_catalyst_universe(*, db, normalized: Dict[str, Any],
                                     staging: Dict[str, Any]) -> Optional[int]:
+def insert_into_catalyst_universe(*, db, normalized: Dict[str, Any],
+                                    staging: Dict[str, Any]) -> Optional[int]:
     """Insert a new row into catalyst_universe from normalized data.
-    Returns the new catalyst_universe.id, or None on failure."""
+    Returns the new catalyst_universe.id, or None on failure.
+
+    Sanitizes LLM outputs:
+      - catalyst_type 'NONE'/'None'/empty → reject (return None)
+      - extracted_catalyst_date 'unknown'/'None'/non-ISO → fall back to
+        staging.catalyst_date (the filing date)
+    """
     try:
         ticker = staging.get("ticker")
-        cat_type = normalized.get("catalyst_type")
-        cat_date = normalized.get("extracted_catalyst_date") or staging.get("catalyst_date")
-        date_prec = normalized.get("date_precision") or "day"
+        cat_type = (normalized.get("catalyst_type") or "").strip()
+        # Reject sentinel values that aren't real catalyst types
+        if not cat_type or cat_type.upper() in ("NONE", "NULL"):
+            logger.info(f"insert_into_catalyst_universe: invalid cat_type='{cat_type}' for {ticker}, skipping")
+            return None
+
+        # Date handling — accept ISO strings, fall back to staging.catalyst_date
+        # if normalized produced a sentinel like 'unknown'/'None'
+        raw_date = normalized.get("extracted_catalyst_date")
+        cat_date = None
+        if isinstance(raw_date, str):
+            r = raw_date.strip()
+            if r and r.upper() not in ("UNKNOWN", "NONE", "NULL", ""):
+                # Attempt to parse YYYY-MM-DD; tolerant of YYYY-MM and YYYY too
+                if len(r) >= 10:
+                    try:
+                        datetime.strptime(r[:10], "%Y-%m-%d")
+                        cat_date = r[:10]
+                    except ValueError:
+                        cat_date = None
+                elif len(r) == 7:  # YYYY-MM
+                    try:
+                        datetime.strptime(r + "-01", "%Y-%m-%d")
+                        cat_date = r + "-01"
+                    except ValueError:
+                        cat_date = None
+                elif len(r) == 4 and r.isdigit():
+                    cat_date = r + "-01-01"
+        if not cat_date:
+            sd = staging.get("catalyst_date")
+            if sd:
+                cat_date = sd.isoformat() if hasattr(sd, "isoformat") else str(sd)[:10]
+
+        if not cat_date:
+            logger.info(f"insert_into_catalyst_universe: no usable date for {ticker}, skipping")
+            return None
+
+        date_prec = (normalized.get("date_precision") or "day").lower()
+        if date_prec not in ("exact", "day", "month", "quarter", "unknown"):
+            date_prec = "day"
+
         drug = normalized.get("drug_name")
+        if isinstance(drug, str):
+            drug = drug.strip() or None
+            if drug and drug.upper() in ("NONE", "NULL", "UNKNOWN"):
+                drug = None
         indication = normalized.get("indication")
+        if isinstance(indication, str):
+            indication = indication.strip() or None
+            if indication and indication.upper() in ("NONE", "NULL", "UNKNOWN"):
+                indication = None
+
         confidence = float(normalized.get("confidence") or 0.5)
 
         with db.get_conn() as conn:
@@ -482,7 +537,7 @@ def insert_into_catalyst_universe(*, db, normalized: Dict[str, Any],
             conn.commit()
         return new_id
     except Exception as e:
-        logger.warning(f"insert_into_catalyst_universe failed: {e}")
+        logger.warning(f"insert_into_catalyst_universe failed for {staging.get('ticker')}: {e}")
         return None
 
 
@@ -608,10 +663,40 @@ def normalize_pending_batch(*, db, batch_size: int = 50) -> Dict[str, int]:
                         conn.commit()
                     counts["accepted"] += 1
                 else:
+                    # INSERT failed — mark unclear with reject_reason so we
+                    # don't keep retrying. Most common cause: cat_type='NONE'
+                    # or extracted_catalyst_date sentinel. Storing the
+                    # normalized JSON helps debug.
                     counts["errored"] += 1
+                    with db.get_conn() as conn:
+                        cur = conn.cursor()
+                        cur.execute("""
+                            UPDATE catalyst_backfill_staging
+                            SET status = 'unclear', processed_at = now(),
+                                reject_reason = %s,
+                                normalized_json = %s
+                            WHERE id = %s
+                        """, (
+                            "INSERT into catalyst_universe failed (see normalized_json)",
+                            json.dumps(normalized), sid,
+                        ))
+                        conn.commit()
             except Exception as e:
                 counts["errored"] += 1
                 logger.exception(f"normalize_pending_batch row id={sid}: {e}")
+                # Mark as unclear with the exception message
+                try:
+                    with db.get_conn() as conn:
+                        cur = conn.cursor()
+                        cur.execute("""
+                            UPDATE catalyst_backfill_staging
+                            SET status = 'unclear', processed_at = now(),
+                                reject_reason = %s
+                            WHERE id = %s
+                        """, (f"Exception: {str(e)[:400]}", sid))
+                        conn.commit()
+                except Exception:
+                    pass
     except Exception as e:
         logger.exception(f"normalize_pending_batch top-level: {e}")
 
