@@ -63,13 +63,18 @@ CLINICAL_KEYWORDS_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Item codes in 8-K cover pages we care about. Item 7.01 (Reg FD) and 8.01
-# (Other Events) are where most clinical/regulatory news lives. Item 2.02
-# (Earnings) often co-announces readouts. Item 5.02 is for management
-# changes — usually not clinical, but sometimes "Chief Medical Officer"
-# transitions get co-bundled.
+# Item codes in 8-K cover pages we care about. The submissions API returns
+# items as a comma-separated list of bare codes like "7.01,8.01,9.01" — no
+# "Item " prefix. Item 7.01 (Reg FD) and 8.01 (Other Events) are where most
+# clinical/regulatory news lives. Item 2.02 (Earnings) often co-announces
+# readouts. Item 5.02 is for management changes — usually not clinical, but
+# sometimes "Chief Medical Officer" transitions get co-bundled.
+#
+# Format A: "7.01,8.01,9.01" (data.sec.gov submissions API)
+# Format B: "Item 7.01 Regulation FD Disclosure" (filing cover text)
 RELEVANT_ITEM_CODES_RE = re.compile(
-    r"\bItem\s+(2\.02|5\.02|7\.01|8\.01)\b", re.IGNORECASE,
+    r"(?:^|[\s,])(?:Item\s+)?(2\.02|5\.02|7\.01|8\.01)(?:[\s,]|$)",
+    re.IGNORECASE,
 )
 
 
@@ -241,32 +246,73 @@ def fetch_filings_for_cik(cik_padded: str,
 
 def fetch_filing_text_excerpt(filing: Dict[str, Any], max_chars: int = 3000
                                 ) -> Optional[str]:
-    """Fetch the primary document HTML and extract the first max_chars of
-    plain text. Returns None on failure.
+    """Fetch the 8-K filing's text content. Returns the first max_chars
+    of plain text from the most-substantive document in the filing.
+
+    Strategy: 8-K filings typically contain:
+      - The 8-K cover page (small, just metadata + item descriptions)
+      - One or more EX-99.* exhibits (the actual press release)
+      - Other exhibits (consents, contracts, etc.)
+    The press release is what we want — it has the clinical/regulatory
+    content. So we fetch the filing's index, find all .htm files, fetch
+    each, and return the content from the LARGEST one (the press release
+    is almost always the biggest text exhibit).
+
+    Returns None on failure.
     """
     cik_padded = filing["cik_padded"].lstrip("0") or "0"
-    accession = filing["accession_padded"]
-    primary = filing.get("primary_doc")
-    if not primary:
-        return None
+    accession_padded = filing["accession_padded"]
 
-    url = f"https://www.sec.gov/Archives/edgar/data/{cik_padded}/{accession}/{primary}"
-    r = _polite_get(url)
+    # First, get the filing index to enumerate exhibits
+    index_url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik_padded}&type=8-K"
+    # Better approach: directly hit the index.json for this filing
+    idx_url = (
+        f"https://www.sec.gov/Archives/edgar/data/"
+        f"{cik_padded}/{accession_padded}/index.json"
+    )
+    r = _polite_get(idx_url)
     if not r:
         return None
 
-    text = r.text
-    # Strip HTML
-    text = re.sub(r"<script[^>]*>.*?</script>", "", text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r"<style[^>]*>.*?</style>", "", text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = re.sub(r"&nbsp;", " ", text)
-    text = re.sub(r"&amp;", "&", text)
-    text = re.sub(r"&lt;", "<", text)
-    text = re.sub(r"&gt;", ">", text)
-    text = re.sub(r"&quot;", '"', text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text[:max_chars] if text else None
+    try:
+        idx_data = r.json()
+        items = (idx_data.get("directory") or {}).get("item") or []
+    except Exception:
+        return None
+
+    # Find HTML/HTM exhibits; rank by size (largest = press release usually)
+    htm_files = []
+    for it in items:
+        name = it.get("name") or ""
+        size = int(it.get("size") or 0)
+        if name.lower().endswith((".htm", ".html")):
+            htm_files.append((size, name))
+
+    htm_files.sort(reverse=True)  # largest first
+
+    # Try fetching the largest HTM file first; fall back to next if needed
+    for _size, name in htm_files[:3]:
+        url = (
+            f"https://www.sec.gov/Archives/edgar/data/"
+            f"{cik_padded}/{accession_padded}/{name}"
+        )
+        rr = _polite_get(url)
+        if not rr:
+            continue
+        text = rr.text
+        text = re.sub(r"<script[^>]*>.*?</script>", "", text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r"<style[^>]*>.*?</style>", "", text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"&nbsp;", " ", text)
+        text = re.sub(r"&amp;", "&", text)
+        text = re.sub(r"&lt;", "<", text)
+        text = re.sub(r"&gt;", ">", text)
+        text = re.sub(r"&quot;", '"', text)
+        text = re.sub(r"\s+", " ", text).strip()
+        if text and len(text) > 200:  # got meaningful content
+            return text[:max_chars]
+
+    return None
 
 
 def looks_like_clinical_catalyst(text: str, items: str = "") -> bool:
