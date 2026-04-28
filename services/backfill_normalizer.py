@@ -453,6 +453,12 @@ def insert_into_catalyst_universe(*, db, normalized: Dict[str, Any],
     """Insert a new row into catalyst_universe from normalized data.
     Returns the new catalyst_universe.id, or None on failure.
 
+    Schema match (from universe_seeder pattern):
+      - column is `confidence_score` (not `confidence`)
+      - has `canonical_drug_name` for dedupe via ON CONFLICT
+      - includes `company_name`, `description`, `phase`, `source_url`
+      - uses `last_updated` only (no `created_at` column)
+
     Sanitizes LLM outputs:
       - catalyst_type 'NONE'/'None'/empty → reject (return None)
       - extracted_catalyst_date 'unknown'/'None'/non-ISO → fall back to
@@ -461,26 +467,23 @@ def insert_into_catalyst_universe(*, db, normalized: Dict[str, Any],
     try:
         ticker = staging.get("ticker")
         cat_type = (normalized.get("catalyst_type") or "").strip()
-        # Reject sentinel values that aren't real catalyst types
         if not cat_type or cat_type.upper() in ("NONE", "NULL"):
             logger.info(f"insert_into_catalyst_universe: invalid cat_type='{cat_type}' for {ticker}, skipping")
             return None
 
-        # Date handling — accept ISO strings, fall back to staging.catalyst_date
-        # if normalized produced a sentinel like 'unknown'/'None'
+        # Date handling
         raw_date = normalized.get("extracted_catalyst_date")
         cat_date = None
         if isinstance(raw_date, str):
             r = raw_date.strip()
             if r and r.upper() not in ("UNKNOWN", "NONE", "NULL", ""):
-                # Attempt to parse YYYY-MM-DD; tolerant of YYYY-MM and YYYY too
                 if len(r) >= 10:
                     try:
                         datetime.strptime(r[:10], "%Y-%m-%d")
                         cat_date = r[:10]
                     except ValueError:
                         cat_date = None
-                elif len(r) == 7:  # YYYY-MM
+                elif len(r) == 7:
                     try:
                         datetime.strptime(r + "-01", "%Y-%m-%d")
                         cat_date = r + "-01"
@@ -492,9 +495,7 @@ def insert_into_catalyst_universe(*, db, normalized: Dict[str, Any],
             sd = staging.get("catalyst_date")
             if sd:
                 cat_date = sd.isoformat() if hasattr(sd, "isoformat") else str(sd)[:10]
-
         if not cat_date:
-            logger.info(f"insert_into_catalyst_universe: no usable date for {ticker}, skipping")
             return None
 
         date_prec = (normalized.get("date_precision") or "day").lower()
@@ -506,34 +507,67 @@ def insert_into_catalyst_universe(*, db, normalized: Dict[str, Any],
             drug = drug.strip() or None
             if drug and drug.upper() in ("NONE", "NULL", "UNKNOWN"):
                 drug = None
+        # Compute canonical_drug_name (lowercase, strip suffixes) for dedupe
+        canonical_drug = None
+        if drug:
+            canonical_drug = drug.lower().strip()
+            # Strip trade-name parens like "FDA Approval of TYBOST (cobicistat)"
+            if "(" in canonical_drug:
+                canonical_drug = canonical_drug.split("(")[0].strip()
+
         indication = normalized.get("indication")
         if isinstance(indication, str):
             indication = indication.strip() or None
             if indication and indication.upper() in ("NONE", "NULL", "UNKNOWN"):
                 indication = None
 
-        confidence = float(normalized.get("confidence") or 0.5)
+        confidence_score = float(normalized.get("confidence") or 0.5)
+        source_url = staging.get("source_url")
+
+        # Description: short LLM-derived blurb. Use reject_reason if it has
+        # content, else cat_type as fallback.
+        description = normalized.get("reject_reason") or cat_type
 
         with db.get_conn() as conn:
             cur = conn.cursor()
+            # Use the same INSERT shape as universe_seeder, with ON CONFLICT
+            # on the canonical-drug uniqueness constraint to avoid dupes.
             cur.execute("""
                 INSERT INTO catalyst_universe (
-                    ticker, catalyst_type, catalyst_date,
-                    date_precision, drug_name, indication,
-                    confidence, source, status,
-                    created_at, last_updated
-                ) VALUES (
-                    %s, %s, %s, %s, %s, %s, %s,
-                    'edgar_backfill', 'active', now(), now()
+                    ticker, company_name, catalyst_type, catalyst_date, date_precision,
+                    description, drug_name, canonical_drug_name, indication, phase,
+                    source, source_url, confidence_score, status, last_updated
                 )
+                VALUES (
+                    %s, NULL, %s, %s, %s,
+                    %s, %s, %s, %s, NULL,
+                    'edgar_backfill', %s, %s, 'active', NOW()
+                )
+                ON CONFLICT (ticker, catalyst_type, catalyst_date, canonical_drug_name)
+                WHERE canonical_drug_name IS NOT NULL AND status = 'active'
+                DO NOTHING
                 RETURNING id
             """, (
-                ticker, cat_type, cat_date,
-                date_prec, drug, indication, confidence,
+                ticker, cat_type, cat_date, date_prec,
+                description, drug, canonical_drug, indication,
+                source_url, confidence_score,
             ))
-            new_id = cur.fetchone()[0]
+            row = cur.fetchone()
             conn.commit()
-        return new_id
+            if row is None:
+                # ON CONFLICT DO NOTHING — duplicate found
+                logger.info(f"catalyst_universe: dupe on {ticker}/{cat_type}/{cat_date}/{canonical_drug}")
+                # Find the existing row id so we can link it
+                cur.execute("""
+                    SELECT id FROM catalyst_universe
+                    WHERE ticker = %s AND catalyst_type = %s
+                      AND catalyst_date = %s AND canonical_drug_name = %s
+                      AND status = 'active'
+                    LIMIT 1
+                """, (ticker, cat_type, cat_date, canonical_drug))
+                ex = cur.fetchone()
+                return ex[0] if ex else None
+            return row[0]
     except Exception as e:
         logger.warning(f"insert_into_catalyst_universe failed for {staging.get('ticker')}: {e}")
         return None
