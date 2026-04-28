@@ -157,12 +157,12 @@ def normalize_one_staging_row(*, db, staging_row: Dict[str, Any]) -> Optional[Di
         safety_settings = None
 
     config_kwargs: Dict[str, Any] = {
-        "max_output_tokens": 4000,  # bumped from 2048; some multi-clause filings still truncated
-        "temperature": 0.1,
-        # Force structured JSON output. This bypasses markdown fences,
-        # enforces field types, and dramatically reduces mid-string
-        # truncation. Gemini's JSON mode is reliable for this kind of
-        # structured extraction task.
+        "max_output_tokens": 1500,  # plenty for the simplified schema
+        "temperature": 0.0,  # zero — we want deterministic structured output
+        # Force structured JSON output. Gemini's JSON mode constrains output
+        # to the schema. We keep the schema small to reduce the surface area
+        # for Gemini to hallucinate (e.g. infinite newlines in nullable
+        # string fields, which we observed on Alzheimer's-disease excerpts).
         "response_mime_type": "application/json",
         "response_schema": {
             "type": "object",
@@ -173,15 +173,14 @@ def normalize_one_staging_row(*, db, staging_row: Dict[str, Any]) -> Optional[Di
                     "enum": [
                         "FDA Decision", "Phase 1 Readout", "Phase 2 Readout",
                         "Phase 3 Readout", "AdComm", "Submission",
-                        "Trial Initiation", "Other",
+                        "Trial Initiation", "Other", "NONE",
                     ],
-                    "nullable": True,
                 },
-                "drug_name": {"type": "string", "nullable": True},
-                "indication": {"type": "string", "nullable": True},
+                "drug_name": {"type": "string"},
+                "indication": {"type": "string"},
                 "extracted_catalyst_date": {
-                    "type": "string", "nullable": True,
-                    "description": "YYYY-MM-DD format, or null",
+                    "type": "string",
+                    "description": "YYYY-MM-DD format, or 'unknown'",
                 },
                 "date_precision": {
                     "type": "string",
@@ -191,12 +190,22 @@ def normalize_one_staging_row(*, db, staging_row: Dict[str, Any]) -> Optional[Di
                     "type": "number",
                     "minimum": 0.0, "maximum": 1.0,
                 },
-                "reject_reason": {"type": "string", "nullable": True},
+                "reject_reason": {"type": "string"},
             },
             "required": [
-                "is_clinical_catalyst", "date_precision", "confidence",
+                "is_clinical_catalyst", "catalyst_type", "date_precision",
+                "confidence",
+            ],
+            "propertyOrdering": [
+                "is_clinical_catalyst", "catalyst_type", "drug_name",
+                "indication", "extracted_catalyst_date", "date_precision",
+                "confidence", "reject_reason",
             ],
         },
+        # Belt-and-suspenders: if Gemini gets stuck in a newline loop,
+        # this aborts the generation. Observed pattern was 50+ consecutive
+        # \n inside a string field on certain biomedical excerpts.
+        "stop_sequences": ["\n\n\n\n\n"],
     }
     if safety_settings is not None:
         config_kwargs["safety_settings"] = safety_settings
@@ -297,6 +306,13 @@ def normalize_one_staging_row(*, db, staging_row: Dict[str, Any]) -> Optional[Di
         logger.warning(f"[normalizer] record_usage failed: {e}")
 
     if status != "success" or not text:
+        # Gemini failed (503, SAFETY block, MAX_TOKENS, or runaway newline
+        # generation that aborted via stop_sequences). Try OpenAI as
+        # fallback — its JSON mode is more reliable on biomedical text.
+        # Same cost (~$0.0003/call for gpt-4o-mini).
+        openai_result = _try_openai_fallback(staging_row, prompt)
+        if openai_result is not None:
+            return openai_result
         # Bubble the error up so it ends up in reject_reason for diagnostics
         staging_row["_last_error"] = f"LLM call: {err_msg or 'empty response'}"
         return None
@@ -311,11 +327,97 @@ def normalize_one_staging_row(*, db, staging_row: Dict[str, Any]) -> Optional[Di
     try:
         parsed = json.loads(cleaned)
     except json.JSONDecodeError as e:
-        logger.warning(f"[normalizer] JSON parse failed: {e}")
+        # Same fix as above — try OpenAI when Gemini emits invalid JSON
+        # (the runaway-newline-in-Alzheimer's bug we observed empirically).
+        logger.warning(f"[normalizer] JSON parse failed: {e}; trying OpenAI fallback")
+        openai_result = _try_openai_fallback(staging_row, prompt)
+        if openai_result is not None:
+            return openai_result
         staging_row["_last_error"] = f"JSON parse: {str(e)[:100]}; text[:200]={cleaned[:200]}"
         return None
 
     return parsed
+
+
+# ────────────────────────────────────────────────────────────
+# OpenAI fallback (used when Gemini fails)
+# ────────────────────────────────────────────────────────────
+
+OPENAI_API_KEY_BACKFILL = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL_BACKFILL = os.getenv("BACKFILL_OPENAI_MODEL", "gpt-4o-mini")
+
+
+def _try_openai_fallback(staging_row: Dict[str, Any], prompt: str) -> Optional[Dict[str, Any]]:
+    """OpenAI gpt-4o-mini fallback for the normalizer. Triggered when
+    Gemini fails (503s, runaway-newline JSON corruption, SAFETY blocks).
+
+    Uses OpenAI's response_format=json_object which is more reliable than
+    Gemini's response_schema for this kind of biomedical text. Same cost
+    bracket (~$0.0003 per call).
+    """
+    if not OPENAI_API_KEY_BACKFILL:
+        return None
+
+    import requests as _requests
+    body = {
+        "model": OPENAI_MODEL_BACKFILL,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 800,
+        "temperature": 0.0,
+        "response_format": {"type": "json_object"},
+    }
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY_BACKFILL}",
+        "Content-Type": "application/json",
+    }
+
+    t0 = time.time()
+    status = "success"
+    err_msg = None
+    tokens_in = 0
+    tokens_out = 0
+    text = ""
+    try:
+        r = _requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            json=body, headers=headers, timeout=30,
+        )
+        r.raise_for_status()
+        resp = r.json()
+        text = resp["choices"][0]["message"]["content"]
+        usage = resp.get("usage") or {}
+        tokens_in = int(usage.get("prompt_tokens") or 0)
+        tokens_out = int(usage.get("completion_tokens") or 0)
+    except Exception as e:
+        status = "error"
+        err_msg = str(e)[:300]
+        logger.warning(f"[normalizer] OpenAI fallback failed: {err_msg}")
+    finally:
+        elapsed_ms = int((time.time() - t0) * 1000)
+        try:
+            from services.llm_usage import record_usage
+            record_usage(
+                provider="openai", model=OPENAI_MODEL_BACKFILL,
+                feature="backfill-normalizer-fallback",
+                ticker=staging_row.get("ticker"),
+                tokens_input=tokens_in, tokens_output=tokens_out,
+                duration_ms=elapsed_ms, status=status, error_message=err_msg,
+            )
+        except Exception:
+            pass
+
+    if status != "success" or not text:
+        return None
+
+    try:
+        parsed = json.loads(text)
+        # Tag which provider succeeded for downstream diagnostics
+        if isinstance(parsed, dict):
+            parsed["_normalizer_provider"] = "openai"
+        return parsed
+    except json.JSONDecodeError as e:
+        logger.warning(f"[normalizer] OpenAI returned invalid JSON: {e}")
+        return None
 
 
 def find_existing_catalyst(*, db, ticker: str, catalyst_type: str,
