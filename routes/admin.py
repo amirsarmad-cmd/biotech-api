@@ -5768,3 +5768,39 @@ async def edgar_backfill_debug_ticker(
     except Exception as e:
         logger.exception("edgar_backfill_debug_ticker failed")
         raise HTTPException(500, f"edgar_backfill_debug_ticker error: {e}")
+
+
+@router.get("/post-catalyst/backfill-staging-sample")
+async def backfill_staging_sample(
+    status: str = "rejected", source: str = "edgar", limit: int = 5,
+):
+    """Peek at sample rows in catalyst_backfill_staging by status, for debugging."""
+    try:
+        from services.database import BiotechDatabase
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT id, ticker, filing_date, raw_title, reject_reason, normalized_json
+                FROM catalyst_backfill_staging
+                WHERE source = %s AND status = %s
+                ORDER BY filing_date DESC
+                LIMIT %s
+            """, (source, status, limit))
+            rows = cur.fetchall()
+        out = []
+        for r in rows:
+            sid, ticker, fd, title, reject, nj = r
+            normalized = nj if isinstance(nj, dict) else (json.loads(nj) if nj else None)
+            out.append({
+                "id": sid,
+                "ticker": ticker,
+                "filing_date": str(fd) if fd else None,
+                "raw_title": (title or "")[:200],
+                "reject_reason": (reject or "")[:300],
+                "normalized": normalized,
+            })
+        return {"rows": out}
+    except Exception as e:
+        logger.exception("backfill_staging_sample failed")
+        raise HTTPException(500, f"backfill_staging_sample error: {e}")
