@@ -224,6 +224,7 @@ PRICED_IN_LOW_THRESHOLD  = 0.60   # composite ≤ this → CLEAN, real long edge
 def compute_priced_in_score(
     *,
     runup_30d_pct: Optional[float] = None,
+    runup_30d_vs_xbi_pct: Optional[float] = None,
     options_implied_move_pct: Optional[float] = None,
     iv_euphoria_pct: Optional[float] = None,
 ) -> Optional[float]:
@@ -233,18 +234,27 @@ def compute_priced_in_score(
     IV is elevated). Returns None if no inputs are available.
 
     Components (each contributes a 0..1 sub-score):
-      runup_30d:    0% = neutral (0.5 axis), +30% = max priced-in (1.0),
-                    -20% = max washed-out (0.0). Scaled linearly between.
+      runup:        Prefers runup_30d_vs_xbi_pct (sector-adjusted, the actual
+                    catalyst-specific runup). Falls back to raw runup_30d_pct
+                    if sector data is missing. Same mapping either way:
+                    -20% → 0.0, 0% → 0.5, +30% → 1.0.
       options:      Above 25% implied move = priced-in. Below 8% = clean.
       iv_euphoria:  IV percentile / 100. Higher = more priced.
 
     The composite is the simple mean of available sub-scores.
+
+    Why sector-adjusted: a stock that ran +20% during a +25% biotech rally
+    underperformed sector — the runup is sector beta, not catalyst-specific
+    crowd. Without adjustment, those rows get classified as priced-in when
+    they're actually clean setups.
     """
     sub_scores = []
 
-    if runup_30d_pct is not None:
+    # Prefer sector-adjusted runup; fall back to raw if not available.
+    runup_to_use = runup_30d_vs_xbi_pct if runup_30d_vs_xbi_pct is not None else runup_30d_pct
+    if runup_to_use is not None:
         # Map runup to 0..1: -20% → 0.0, 0% → 0.5, +30% → 1.0
-        r = float(runup_30d_pct)
+        r = float(runup_to_use)
         if r >= 30: s = 1.0
         elif r <= -20: s = 0.0
         elif r >= 0: s = 0.5 + (r / 30.0) * 0.5
@@ -271,6 +281,7 @@ def classify_trade_signal_v2(
     *,
     probability: Optional[float],
     runup_30d_pct: Optional[float] = None,
+    runup_30d_vs_xbi_pct: Optional[float] = None,
     catalyst_type: Optional[str] = None,
     confidence_score: Optional[float] = None,
     date_precision: Optional[str] = None,
@@ -294,19 +305,21 @@ def classify_trade_signal_v2(
       options too expensive → NO_TRADE_OPTIONS_TOO_EXPENSIVE
 
       For LONG-direction bias (probability > 0.5+threshold):
-        priced_in score >= 0.65 → SHORT_SELL_THE_NEWS  (the inverse signal)
-        priced_in score <= 0.45 → LONG_UNDERPRICED_POSITIVE
-        else (mid)              → NO_TRADE_PRICED_IN
-        priced_in unknown       → LONG (fallback to V1 behavior)
+        priced_in score ≥ HIGH_THRESHOLD → SHORT_SELL_THE_NEWS
+        priced_in score ≤ LOW_THRESHOLD  → LONG_UNDERPRICED_POSITIVE
+        else (mid)                       → NO_TRADE_PRICED_IN
+        priced_in unknown                → LONG (fallback to V1 behavior)
 
       For SHORT-direction bias (probability < 0.5-threshold):
-        always → SHORT_LOW_PROBABILITY (priced-in adjustment doesn't apply
-        because if the market thinks approval is unlikely, more pessimism
-        priced in is irrelevant — the move is still down)
+        always → SHORT_LOW_PROBABILITY
+
+    runup_30d_vs_xbi_pct (sector-adjusted) is preferred when available.
+    Falls back to raw runup_30d_pct when XBI data is missing.
     """
     # Compute priced-in score upfront (returned even on abstention)
     priced_in = compute_priced_in_score(
         runup_30d_pct=runup_30d_pct,
+        runup_30d_vs_xbi_pct=runup_30d_vs_xbi_pct,
         options_implied_move_pct=options_implied_move_pct,
         iv_euphoria_pct=iv_euphoria_pct,
     )

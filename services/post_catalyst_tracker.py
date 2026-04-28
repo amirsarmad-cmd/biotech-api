@@ -327,6 +327,11 @@ def _fetch_sector_basket_window(basket: str, catalyst_date_str: str) -> Optional
     """Fetch sector ETF prices over the same window as a catalyst.
     Cached in module-level dict (per-process) so we don't re-fetch XBI for
     every catalyst on the same day.
+
+    Window: -35 to +45 days around catalyst. The -35 (was -10 prior to
+    runup-vs-XBI work) captures the 30d-before close needed for sector-
+    adjusted runup. Slight memory increase per cache entry; XBI history
+    is cheap so this is fine.
     """
     cache_key = f"{basket}:{catalyst_date_str[:10]}"
     if cache_key in _sector_cache:
@@ -335,7 +340,7 @@ def _fetch_sector_basket_window(basket: str, catalyst_date_str: str) -> Optional
         import yfinance as yf
         from datetime import datetime as _dt
         cdt = _dt.strptime(catalyst_date_str[:10], "%Y-%m-%d").date()
-        start = cdt - timedelta(days=10)
+        start = cdt - timedelta(days=35)
         end = cdt + timedelta(days=45)
         today = date.today()
         if end > today:
@@ -406,6 +411,50 @@ def _compute_sector_moves(catalyst_date_str: str, basket: str = "XBI"
         if d and prices.get(d):
             out[label] = (prices[d] - pre) / pre * 100.0
     return out
+
+
+def _compute_sector_runup_30d(catalyst_date_str: str, basket: str = "XBI"
+                               ) -> Optional[float]:
+    """Sector ETF % move over the 30 days BEFORE the catalyst.
+
+    Used to compute runup_vs_xbi = stock_runup_30d - sector_runup_30d, the
+    catalyst-specific runup that strips out sector beta. Without this
+    correction, a stock that ran +20% during a +25% biotech rally is
+    miscategorized as "priced in" when it actually underperformed sector.
+
+    Returns sector % runup, or None if the window is missing data.
+    Window: earliest close in the [catalyst-35d, catalyst-1d] range to
+    pre_event close. Mirrors the pre-event window used for the stock.
+    """
+    sw = _fetch_sector_basket_window(basket, catalyst_date_str)
+    if not sw:
+        return None
+    from datetime import datetime as _dt
+    cdt = _dt.strptime(catalyst_date_str[:10], "%Y-%m-%d").date()
+    sorted_dates = sw["sorted_dates"]
+    prices = sw["prices_by_date"]
+
+    # Pre-event close (last trading day before catalyst)
+    pre_candidates = [d for d in sorted_dates if d <= cdt - timedelta(days=1)]
+    if not pre_candidates:
+        return None
+    pre_d = pre_candidates[-1]
+    pre_price = prices.get(pre_d)
+    if not pre_price:
+        return None
+
+    # 30d-before close: earliest available close in [catalyst-35d, pre_d).
+    # We use earliest-in-window not exact-30d to handle weekends/holidays
+    # consistently with how the stock's runup is computed.
+    pre_window = [d for d in sorted_dates
+                  if cdt - timedelta(days=35) <= d <= cdt - timedelta(days=1)]
+    if len(pre_window) < 5:  # too few trading days = unreliable
+        return None
+    earliest = pre_window[0]
+    earliest_price = prices.get(earliest)
+    if not earliest_price:
+        return None
+    return (pre_price - earliest_price) / earliest_price * 100.0
 
 
 def _fetch_price_window_polygon(ticker: str, catalyst_date_str: str) -> Optional[Dict]:

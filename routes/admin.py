@@ -4029,3 +4029,322 @@ async def runup_buckets():
     except Exception as e:
         logger.exception("runup_buckets failed")
         raise HTTPException(500, f"runup_buckets error: {e}")
+
+
+# ────────────────────────────────────────────────────────────
+# Sector-adjusted runup backfill (migration 014)
+# ────────────────────────────────────────────────────────────
+
+@router.post("/post-catalyst/apply-migration-014")
+async def apply_migration_014():
+    """One-shot for migration 014 — sector-adjusted runup. Idempotent."""
+    try:
+        from services.database import BiotechDatabase
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                ALTER TABLE post_catalyst_outcomes
+                ADD COLUMN IF NOT EXISTS sector_runup_30d_pct NUMERIC,
+                ADD COLUMN IF NOT EXISTS runup_pre_event_30d_vs_xbi_pct NUMERIC
+            """)
+            cur.execute("""
+                UPDATE alembic_version_biotech
+                SET version_num = '014_sector_runup'
+                WHERE version_num = '013_priced_in_features'
+            """)
+            stamped = cur.rowcount
+            cur.execute("SELECT version_num FROM alembic_version_biotech")
+            new_v = cur.fetchone()[0]
+            conn.commit()
+        return {"success": True, "new_alembic_version": new_v, "stamped_rows": stamped}
+    except Exception as e:
+        logger.exception("apply_migration_014 failed")
+        raise HTTPException(500, f"apply_migration_014 error: {e}")
+
+
+@router.post("/post-catalyst/backfill-sector-runup-and-reclassify")
+async def backfill_sector_runup_and_reclassify(max_rows: int = 100,
+                                                 only_compute_signals: bool = False):
+    """Two-phase backfill for sector-adjusted runup:
+
+    Phase A: Fetch XBI 30d-before close for rows missing
+             sector_runup_30d_pct. Computes:
+               sector_runup_30d_pct = XBI_30d_before → XBI_pre_event % move
+               runup_30d_vs_xbi_pct = stock_runup - sector_runup
+             Persists both. Skips rows where catalyst_date is missing or
+             runup_pre_event_30d_pct is null (no stock baseline to subtract).
+
+    Phase B: Re-classify ALL rows with V2 logic using sector-adjusted runup.
+             Falls back to raw runup when sector data is missing.
+
+    Pass only_compute_signals=True to skip phase A.
+
+    Returns: {phase_a_*, phase_b_classified, signal_v2_distribution,
+              with_sector_runup, fallback_to_raw_runup}
+    """
+    try:
+        from services.database import BiotechDatabase
+        from services.post_catalyst_tracker import _compute_sector_runup_30d
+        from services.catalyst_signal import (
+            classify_trade_signal_v2, is_tradeable_v2,
+            predicted_direction_v2,
+        )
+        db = BiotechDatabase()
+        results = {
+            "phase_a_processed": 0,
+            "phase_a_succeeded": 0,
+            "phase_a_skipped_no_window": 0,
+            "phase_b_classified": 0,
+            "tradeable_v2": 0,
+            "with_sector_runup": 0,
+            "fallback_to_raw_runup": 0,
+            "signal_v2_distribution": {},
+            "errors": [],
+        }
+
+        # ── Phase A: backfill sector runup ──────────────────────────
+        if not only_compute_signals:
+            with db.get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute("""
+                    SELECT id, ticker, catalyst_date, runup_pre_event_30d_pct
+                    FROM post_catalyst_outcomes
+                    WHERE sector_runup_30d_pct IS NULL
+                      AND catalyst_date IS NOT NULL
+                      AND runup_pre_event_30d_pct IS NOT NULL
+                    ORDER BY catalyst_date DESC
+                    LIMIT %s
+                """, (max_rows,))
+                rows = cur.fetchall()
+
+            for outcome_id, ticker, cat_date, stock_runup in rows:
+                results["phase_a_processed"] += 1
+                try:
+                    cat_str = cat_date.strftime("%Y-%m-%d") if hasattr(cat_date, "strftime") else str(cat_date)[:10]
+                    sector_runup = _compute_sector_runup_30d(cat_str, basket="XBI")
+                    if sector_runup is None:
+                        results["phase_a_skipped_no_window"] += 1
+                        continue
+                    runup_vs_xbi = float(stock_runup) - float(sector_runup)
+                    with db.get_conn() as conn:
+                        cur = conn.cursor()
+                        cur.execute("""
+                            UPDATE post_catalyst_outcomes
+                            SET sector_runup_30d_pct = %s,
+                                runup_pre_event_30d_vs_xbi_pct = %s
+                            WHERE id = %s
+                        """, (sector_runup, runup_vs_xbi, outcome_id))
+                        conn.commit()
+                    results["phase_a_succeeded"] += 1
+                except Exception as e:
+                    if len(results["errors"]) < 10:
+                        results["errors"].append({"id": outcome_id, "ticker": ticker, "phase": "A", "error": str(e)[:100]})
+
+        # ── Phase B: re-classify with sector-adjusted runup ─────────
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT pco.id, pco.ticker, pco.catalyst_type,
+                       pco.predicted_prob,
+                       pco.runup_pre_event_30d_pct,
+                       pco.runup_pre_event_30d_vs_xbi_pct,
+                       pco.abnormal_move_pct_3d,
+                       cu.date_precision
+                FROM post_catalyst_outcomes pco
+                LEFT JOIN catalyst_universe cu
+                  ON cu.ticker = pco.ticker
+                 AND cu.catalyst_type = pco.catalyst_type
+                 AND cu.catalyst_date::text = pco.catalyst_date::text
+                 AND cu.status = 'active'
+            """)
+            rows = cur.fetchall()
+
+        sig_dist: Dict[str, int] = {}
+        tradeable_n = 0
+        for outcome_id, ticker, cat_type, pred_prob, runup_raw, runup_vs_xbi, abnormal_3d, dprec in rows:
+            try:
+                # Track which runup variant we're using
+                if runup_vs_xbi is not None:
+                    results["with_sector_runup"] += 1
+                elif runup_raw is not None:
+                    results["fallback_to_raw_runup"] += 1
+
+                signal, priced_in = classify_trade_signal_v2(
+                    probability=float(pred_prob) if pred_prob is not None else None,
+                    runup_30d_pct=float(runup_raw) if runup_raw is not None else None,
+                    runup_30d_vs_xbi_pct=float(runup_vs_xbi) if runup_vs_xbi is not None else None,
+                    catalyst_type=cat_type,
+                    confidence_score=float(pred_prob) if pred_prob is not None else None,
+                    date_precision=dprec,
+                )
+                tradeable_flag = is_tradeable_v2(signal)
+                pred_dir = predicted_direction_v2(signal)
+                dir_correct_v2 = None
+                if abnormal_3d is not None and pred_dir is not None and tradeable_flag:
+                    ab = float(abnormal_3d)
+                    if abs(ab) >= 3.0:
+                        actual_dir = 1 if ab > 0 else -1
+                        dir_correct_v2 = (pred_dir == actual_dir)
+                with db.get_conn() as conn:
+                    cur = conn.cursor()
+                    cur.execute("""
+                        UPDATE post_catalyst_outcomes
+                        SET signal_v2 = %s,
+                            priced_in_score = %s,
+                            direction_correct_v2 = %s
+                        WHERE id = %s
+                    """, (signal, priced_in, dir_correct_v2, outcome_id))
+                    conn.commit()
+                results["phase_b_classified"] += 1
+                sig_dist[signal] = sig_dist.get(signal, 0) + 1
+                if tradeable_flag:
+                    tradeable_n += 1
+            except Exception as e:
+                if len(results["errors"]) < 10:
+                    results["errors"].append({"id": outcome_id, "ticker": ticker, "phase": "B", "error": str(e)[:100]})
+
+        results["signal_v2_distribution"] = sig_dist
+        results["tradeable_v2"] = tradeable_n
+        return results
+    except Exception as e:
+        logger.exception("backfill_sector_runup_and_reclassify failed")
+        raise HTTPException(500, f"backfill_sector_runup_and_reclassify error: {e}")
+
+
+# ────────────────────────────────────────────────────────────
+# Precision-coverage curve (item 2 from next-phase plan)
+# ────────────────────────────────────────────────────────────
+# ChatGPT critique: "If 70% only happens at 5% coverage, it is probably
+# not useful. You need a curve: coverage 10% → hit rate ?, coverage 20%
+# → hit rate ?, etc."
+#
+# This sweeps min_confidence from 0.50 to 0.80 and reports for each
+# threshold the resulting (coverage, hit rate, CI, n_judged). Lets us
+# pick a threshold that actually lands in the 25-40% coverage band
+# while preserving accuracy.
+
+@router.get("/post-catalyst/precision-coverage-curve")
+async def precision_coverage_curve():
+    """Sweep min_confidence threshold and report (coverage, accuracy, CI)
+    at each level. Uses V2 classifier with sector-adjusted runup when
+    available.
+
+    Reads existing rows; does NOT re-write signal_v2. This is read-only —
+    a what-if curve, not a re-classify.
+
+    Returns:
+      total_events: total backtest rows
+      points: [{min_confidence, n_tradeable, n_judged, coverage_pct,
+                hits, accuracy_pct, ci_95_pct, classification_distribution}, ...]
+      sweet_spot: heuristic recommendation (highest CI lower bound where
+                  coverage stays >= 25%)
+    """
+    try:
+        from services.database import BiotechDatabase
+        from services.catalyst_signal import (
+            classify_trade_signal_v2, is_tradeable_v2,
+            predicted_direction_v2,
+        )
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT pco.id, pco.predicted_prob, pco.catalyst_type,
+                       pco.runup_pre_event_30d_pct,
+                       pco.runup_pre_event_30d_vs_xbi_pct,
+                       pco.abnormal_move_pct_3d,
+                       cu.date_precision
+                FROM post_catalyst_outcomes pco
+                LEFT JOIN catalyst_universe cu
+                  ON cu.ticker = pco.ticker
+                 AND cu.catalyst_type = pco.catalyst_type
+                 AND cu.catalyst_date::text = pco.catalyst_date::text
+                 AND cu.status = 'active'
+            """)
+            rows = cur.fetchall()
+
+        total_events = len(rows)
+        if total_events == 0:
+            return {"total_events": 0, "points": [], "sweet_spot": None}
+
+        # Sweep thresholds
+        thresholds = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]
+        points = []
+
+        for thresh in thresholds:
+            n_tradeable = 0
+            n_judged = 0
+            hits = 0
+            class_dist: Dict[str, int] = {}
+
+            for r in rows:
+                _, pred_prob, cat_type, runup_raw, runup_vs_xbi, abnormal_3d, dprec = r
+                signal, _ = classify_trade_signal_v2(
+                    probability=float(pred_prob) if pred_prob is not None else None,
+                    runup_30d_pct=float(runup_raw) if runup_raw is not None else None,
+                    runup_30d_vs_xbi_pct=float(runup_vs_xbi) if runup_vs_xbi is not None else None,
+                    catalyst_type=cat_type,
+                    confidence_score=float(pred_prob) if pred_prob is not None else None,
+                    date_precision=dprec,
+                    min_confidence=thresh,  # vary this
+                )
+                class_dist[signal] = class_dist.get(signal, 0) + 1
+                if not is_tradeable_v2(signal):
+                    continue
+                n_tradeable += 1
+
+                pred_dir = predicted_direction_v2(signal)
+                if pred_dir is None or abnormal_3d is None:
+                    continue
+                ab = float(abnormal_3d)
+                if abs(ab) < 3.0:  # deadband, NULL
+                    continue
+                n_judged += 1
+                actual_dir = 1 if ab > 0 else -1
+                if pred_dir == actual_dir:
+                    hits += 1
+
+            ci = _wilson_ci_pct(hits, n_judged) if n_judged >= 5 else None
+            points.append({
+                "min_confidence": thresh,
+                "n_tradeable": n_tradeable,
+                "n_judged": n_judged,
+                "coverage_pct": round(100.0 * n_tradeable / total_events, 1),
+                "hits": hits,
+                "accuracy_pct": round(100.0 * hits / n_judged, 1) if n_judged > 0 else None,
+                "ci_95_pct": ci,
+                "classification_distribution": class_dist,
+            })
+
+        # Heuristic sweet spot: highest CI lower bound where:
+        #   coverage_pct >= 25% AND n_judged >= 30 AND CI lower > 55
+        eligible = [
+            p for p in points
+            if p["coverage_pct"] >= 25
+               and p["n_judged"] >= 30
+               and p["ci_95_pct"]
+               and p["ci_95_pct"]["lower_pct"] > 55.0
+        ]
+        sweet_spot = max(eligible, key=lambda p: p["ci_95_pct"]["lower_pct"]) if eligible else None
+
+        return {
+            "total_events": total_events,
+            "current_default_threshold": 0.55,
+            "points": points,
+            "sweet_spot": {
+                "min_confidence": sweet_spot["min_confidence"],
+                "coverage_pct": sweet_spot["coverage_pct"],
+                "accuracy_pct": sweet_spot["accuracy_pct"],
+                "ci_95_pct": sweet_spot["ci_95_pct"],
+                "n_judged": sweet_spot["n_judged"],
+                "rationale": "Highest CI lower bound among thresholds where coverage ≥ 25%, n_judged ≥ 30, and CI lower > 55%.",
+            } if sweet_spot else None,
+            "interpretation": {
+                "method": "What-if sweep over min_confidence. For each value, classifies all backtest rows with V2, counts tradeable, scores direction on rows with |abnormal_3d| ≥ 3%.",
+                "caveat": "All numbers are in-sample. Tightening the threshold reduces coverage but may not improve accuracy uniformly — the precision-coverage curve shows whether tightening helps or just shrinks sample.",
+            },
+        }
+    except Exception as e:
+        logger.exception("precision_coverage_curve failed")
+        raise HTTPException(500, f"precision_coverage_curve error: {e}")
