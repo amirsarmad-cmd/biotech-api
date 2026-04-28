@@ -5884,3 +5884,93 @@ async def backfill_wipe_source(
     except Exception as e:
         logger.exception("backfill_wipe_source failed")
         raise HTTPException(500, f"backfill_wipe_source error: {e}")
+
+
+@router.post("/post-catalyst/backfill-debug-insert")
+async def backfill_debug_insert():
+    """Debug: take ONE staging row marked unclear with valid normalized_json
+    and try the INSERT manually, returning the actual exception text."""
+    try:
+        from services.database import BiotechDatabase
+        from services.backfill_normalizer import insert_into_catalyst_universe
+        db = BiotechDatabase()
+
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT id, ticker, filing_date, catalyst_date, normalized_json
+                FROM catalyst_backfill_staging
+                WHERE status = 'unclear'
+                  AND normalized_json IS NOT NULL
+                  AND normalized_json->>'is_clinical_catalyst' = 'true'
+                ORDER BY filing_date DESC
+                LIMIT 1
+            """)
+            row = cur.fetchone()
+            if not row:
+                return {"error": "no qualifying unclear row found"}
+            sid, ticker, filing_date, cat_date, normalized = row
+
+        # Show what we're about to attempt
+        out = {
+            "row_id": sid, "ticker": ticker,
+            "filing_date": str(filing_date) if filing_date else None,
+            "catalyst_date_staging": str(cat_date) if cat_date else None,
+            "normalized": normalized if isinstance(normalized, dict) else json.loads(normalized) if normalized else None,
+        }
+
+        # Manual INSERT attempt with raw exception
+        n = out['normalized'] or {}
+        try:
+            with db.get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute("""
+                    INSERT INTO catalyst_universe (
+                        ticker, catalyst_type, catalyst_date,
+                        date_precision, drug_name, indication,
+                        confidence, source, status,
+                        created_at, last_updated
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s,
+                        'edgar_backfill_test', 'inactive', now(), now()
+                    )
+                    RETURNING id
+                """, (
+                    ticker,
+                    n.get('catalyst_type'),
+                    n.get('extracted_catalyst_date') or cat_date,
+                    n.get('date_precision') or 'day',
+                    n.get('drug_name'),
+                    n.get('indication'),
+                    float(n.get('confidence') or 0.5),
+                ))
+                new_id = cur.fetchone()[0]
+                conn.commit()
+                # Now delete the test row
+                cur.execute("DELETE FROM catalyst_universe WHERE id = %s AND source = 'edgar_backfill_test'", (new_id,))
+                conn.commit()
+                out['raw_insert'] = {'success': True, 'new_id': new_id, 'cleaned_up': True}
+        except Exception as e:
+            out['raw_insert'] = {'success': False, 'error': str(e)[:600], 'error_type': type(e).__name__}
+
+        # Now try via the helper (for comparison)
+        try:
+            staging_dict = {
+                "ticker": ticker, "catalyst_date": cat_date,
+            }
+            new_id = insert_into_catalyst_universe(
+                db=db, normalized=n, staging=staging_dict,
+            )
+            out['helper_insert'] = {'success': new_id is not None, 'new_id': new_id}
+            if new_id:
+                with db.get_conn() as conn:
+                    cur = conn.cursor()
+                    cur.execute("DELETE FROM catalyst_universe WHERE id = %s AND source = 'edgar_backfill'", (new_id,))
+                    conn.commit()
+        except Exception as e:
+            out['helper_insert'] = {'success': False, 'error': str(e)[:600], 'error_type': type(e).__name__}
+
+        return out
+    except Exception as e:
+        logger.exception("backfill_debug_insert failed")
+        raise HTTPException(500, f"backfill_debug_insert error: {e}")
