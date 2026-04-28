@@ -3686,26 +3686,29 @@ async def backfill_runup_and_classify_v2(max_rows: int = 100,
 
 @router.get("/post-catalyst/aggregate-v3")
 async def post_catalyst_aggregate_v3():
-    """Three-tier scoreboard updated for V2 (priced-in aware) signals.
+    """Multi-tier scoreboard with the corrected math + 95% Wilson CIs.
 
-    all_events:        same as v2 — noise floor
-    tradeable_v1:      V1 LONG/SHORT classification (probability bias only)
-    tradeable_v2:      V2 LONG_UNDERPRICED_POSITIVE / SHORT_SELL_THE_NEWS /
-                       SHORT_LOW_PROBABILITY (priced-in aware)
-    sell_the_news:     subset that the V2 classifier specifically flagged
-                       as "high P + crowded setup, fade the news"
-    long_underpriced:  subset flagged as "high P + clean setup, real long"
+    HISTORICAL CONTEXT: The original 31.7% / 'inverse 68.3%' analysis that
+    motivated V2 was caused by a SQL denominator bug — direction_correct_3d
+    is NULL on deadband rows (|abnormal_3d| < 3%), and including those NULLs
+    in COUNT(*) deflated accuracy. After the fix, V1 is at 58.4% (modest
+    edge, not anti-alpha). V2 adds a runup-based priced-in filter and lifts
+    accuracy to 65.7% on a smaller subset.
 
-    The V2 numbers are the real test of the user's hypothesis: the
-    SHORT_SELL_THE_NEWS subset should hit ≥65% direction accuracy on
-    the 3D abnormal-vs-XBI window if the inverse-of-31.7% finding holds.
+    All numbers are IN-SAMPLE — the V2 thresholds were retuned against the
+    same 459 rows we're scoring against. Out-of-sample validation pending.
+
+    Wilson 95% CIs are reported alongside point estimates because at n=24-105
+    judged rows, point estimates are not enough to claim production-grade
+    accuracy. ChatGPT's critique was correct: the lower bound of V2's CI is
+    ~56%, which means we cannot rule out coin-flip with statistical confidence.
     """
     try:
         from services.database import BiotechDatabase
         db = BiotechDatabase()
         with db.get_conn() as conn:
             cur = conn.cursor()
-            # All events (raw 30D)
+            # All-event metrics (legacy 30D-raw target)
             cur.execute("""
                 SELECT COUNT(*),
                        COUNT(*) FILTER (WHERE direction_correct),
@@ -3720,7 +3723,6 @@ async def post_catalyst_aggregate_v3():
             avg_err_30d = float(r[2]) if r[2] is not None else None
 
             # V1 tradeable (legacy LONG/SHORT) — denominator excludes deadband
-            # rows where |abnormal_3d| < 3% (direction_correct_3d IS NULL).
             cur.execute("""
                 SELECT
                     COUNT(*) FILTER (WHERE direction_correct_3d IS NOT NULL) AS judged,
@@ -3755,7 +3757,7 @@ async def post_catalyst_aggregate_v3():
             v2_hits = r[1] or 0
             v2_err = float(r[2]) if r[2] is not None else None
 
-            # Per-bucket V2 breakdown — same fix
+            # Per-bucket V2 breakdown
             cur.execute("""
                 SELECT signal_v2,
                        COUNT(*) AS total,
@@ -3772,6 +3774,15 @@ async def post_catalyst_aggregate_v3():
             for row in cur.fetchall():
                 sig, total, judged, hits, avg_pi, avg_err = row
                 acc = round(100.0 * hits / judged, 1) if judged > 0 else None
+                ci = _wilson_ci_pct(hits, judged) if judged >= 5 else None
+                # Mark buckets as 'production-ready' vs 'research only'
+                # based on n>=50 AND CI lower bound > 55%
+                production_ready = (
+                    judged >= 50
+                    and ci is not None
+                    and ci.get("lower_pct") is not None
+                    and ci["lower_pct"] > 55.0
+                )
                 buckets.append({
                     "signal": sig,
                     "count": total,
@@ -3779,6 +3790,8 @@ async def post_catalyst_aggregate_v3():
                     "hits": hits,
                     "deadband_excluded": total - judged,
                     "direction_accuracy_pct": acc,
+                    "ci_95_pct": ci,  # {lower_pct, upper_pct} or None
+                    "production_ready": production_ready,
                     "avg_priced_in_score": float(avg_pi) if avg_pi is not None else None,
                     "avg_abs_error_pct": float(avg_err) if avg_err is not None else None,
                 })
@@ -3790,6 +3803,7 @@ async def post_catalyst_aggregate_v3():
                 "direction_accuracy_pct": (
                     round(100.0 * hits_all / total_all, 1) if total_all > 0 else None
                 ),
+                "ci_95_pct": _wilson_ci_pct(hits_all, total_all) if total_all >= 5 else None,
                 "avg_abs_error_pct": round(avg_err_30d, 1) if avg_err_30d is not None else None,
                 "_target": "raw 30D move (noisy — sector + macro contaminated)",
             },
@@ -3801,6 +3815,7 @@ async def post_catalyst_aggregate_v3():
                 "direction_accuracy_pct": (
                     round(100.0 * v1_hits / v1_judged, 1) if v1_judged > 0 else None
                 ),
+                "ci_95_pct": _wilson_ci_pct(v1_hits, v1_judged) if v1_judged >= 5 else None,
                 "coverage_pct": (
                     round(100.0 * v1_total / total_all, 1) if total_all > 0 else None
                 ),
@@ -3815,19 +3830,131 @@ async def post_catalyst_aggregate_v3():
                 "direction_accuracy_pct": (
                     round(100.0 * v2_hits / v2_judged, 1) if v2_judged > 0 else None
                 ),
+                "ci_95_pct": _wilson_ci_pct(v2_hits, v2_judged) if v2_judged >= 5 else None,
                 "coverage_pct": (
                     round(100.0 * v2_total / total_all, 1) if total_all > 0 else None
                 ),
                 "avg_abs_error_pct": round(v2_err, 1) if v2_err is not None else None,
-                "_target": "V2: priced-in-aware classifier (sell-the-news split out)",
+                "_target": "V2: priced-in-aware (uses 30d runup as priced-in proxy; thresholds 0.60/0.80 retuned in-sample)",
             },
             "v2_buckets": buckets,
             "interpretation": {
-                "v2_thesis": "V1 was anti-alpha because high-conf catalysts get faded after the event. V2 splits high-prob LONGs by priced-in score: clean setup → LONG, crowded → SHORT_SELL_THE_NEWS.",
-                "denominator_note": "Direction accuracy excludes deadband rows (|abnormal_3d| < 3%) where there is no clear actual direction to score against. 'judged' is the denominator.",
-                "actionable_target": "tradeable_v2 ≥ 60-65% direction accuracy with coverage 25-40%",
+                "v2_methodology": "V1 uses probability bias (p>0.60 → LONG, p<0.40 → SHORT). V2 adds a runup-based priced-in filter: flat/clean setups (priced_in ≤ 0.60) → LONG_UNDERPRICED, strong-runup (priced_in ≥ 0.80) → SHORT_SELL_THE_NEWS, mid-runup (0.60-0.80) → NO_TRADE. This was retuned after empirical bucket data showed flat-runup events have ~78% V1 LONG accuracy and strong-runup events fade ~67%.",
+                "denominator_note": "Direction accuracy excludes deadband rows (|abnormal_3d| < 3%) where there is no clear actual direction to score against. 'judged' is the denominator; 'count' is total in bucket including deadband.",
+                "in_sample_warning": "V2 thresholds were tuned on the same 459 rows being scored. Numbers should be treated as in-sample diagnostics, not proven OOS performance. With n_judged in the 24-105 range, 95% CIs are wide; some buckets cannot be statistically distinguished from coin-flip yet.",
+                "production_target": "tradeable hit rate ≥ 60% with CI lower bound > 55% AND n_judged ≥ 50 AND coverage 25-40%. SHORT_SELL_THE_NEWS does not currently meet n_judged threshold and is treated as research-only.",
             },
         }
+    except Exception as e:
+        logger.exception("aggregate_v3 failed")
+        raise HTTPException(500, f"aggregate_v3 error: {e}")
+
+
+def _wilson_ci_pct(hits: int, n: int, z: float = 1.96) -> Optional[Dict]:
+    """Wilson score 95% confidence interval for a proportion.
+
+    Returns {lower_pct, upper_pct, n, hits} or None if n is too small.
+    Wilson is preferred over normal-approximation because it stays in
+    [0,1] and behaves well for small n and extreme p.
+    """
+    if n < 1:
+        return None
+    p = hits / n
+    z2 = z * z
+    denom = 1 + z2 / n
+    center = (p + z2 / (2 * n)) / denom
+    spread = (z / denom) * ((p * (1 - p) / n + z2 / (4 * n * n)) ** 0.5)
+    lower = max(0.0, center - spread)
+    upper = min(1.0, center + spread)
+    return {
+        "lower_pct": round(100.0 * lower, 1),
+        "upper_pct": round(100.0 * upper, 1),
+        "n": n,
+        "hits": hits,
+    }
+
+
+@router.get("/post-catalyst/v1-vs-v2-same-row")
+async def v1_vs_v2_same_row():
+    """Same-row A/B: V1 vs V2 on the rows where BOTH classify as tradeable
+    AND both have a clear actual direction (|abnormal_3d| >= 3%).
+
+    Per ChatGPT's critique: comparing V1's 237-row subset to V2's 190-row
+    subset is misleading because they're different row sets. The true V2
+    lift is only meaningful on the intersection.
+
+    Returns: common_judged, v1_hits, v2_hits, both_correct, both_wrong,
+             v1_only_correct, v2_only_correct, lift_pct
+    """
+    try:
+        from services.database import BiotechDatabase
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT
+                    COUNT(*) AS common_judged,
+                    COUNT(*) FILTER (WHERE direction_correct_3d = TRUE) AS v1_hits,
+                    COUNT(*) FILTER (WHERE direction_correct_v2 = TRUE) AS v2_hits,
+                    COUNT(*) FILTER (
+                        WHERE direction_correct_3d = TRUE
+                          AND direction_correct_v2 = TRUE
+                    ) AS both_correct,
+                    COUNT(*) FILTER (
+                        WHERE direction_correct_3d = FALSE
+                          AND direction_correct_v2 = FALSE
+                    ) AS both_wrong,
+                    COUNT(*) FILTER (
+                        WHERE direction_correct_3d = TRUE
+                          AND direction_correct_v2 = FALSE
+                    ) AS v1_only_correct,
+                    COUNT(*) FILTER (
+                        WHERE direction_correct_3d = FALSE
+                          AND direction_correct_v2 = TRUE
+                    ) AS v2_only_correct
+                FROM post_catalyst_outcomes
+                WHERE direction_correct_3d IS NOT NULL
+                  AND direction_correct_v2 IS NOT NULL
+            """)
+            r = cur.fetchone()
+            common = r[0] or 0
+            v1_hits = r[1] or 0
+            v2_hits = r[2] or 0
+            both_correct = r[3] or 0
+            both_wrong = r[4] or 0
+            v1_only = r[5] or 0
+            v2_only = r[6] or 0
+
+        v1_acc = round(100.0 * v1_hits / common, 1) if common > 0 else None
+        v2_acc = round(100.0 * v2_hits / common, 1) if common > 0 else None
+        lift = round(v2_acc - v1_acc, 1) if (v1_acc is not None and v2_acc is not None) else None
+
+        return {
+            "common_judged": common,
+            "v1": {
+                "hits": v1_hits,
+                "accuracy_pct": v1_acc,
+                "ci_95_pct": _wilson_ci_pct(v1_hits, common) if common >= 5 else None,
+            },
+            "v2": {
+                "hits": v2_hits,
+                "accuracy_pct": v2_acc,
+                "ci_95_pct": _wilson_ci_pct(v2_hits, common) if common >= 5 else None,
+            },
+            "agreement": {
+                "both_correct": both_correct,
+                "both_wrong": both_wrong,
+                "v1_only_correct": v1_only,
+                "v2_only_correct": v2_only,
+            },
+            "v2_lift_pp": lift,
+            "interpretation": {
+                "rule_of_thumb": "V2 is meaningfully better than V1 if v2_lift_pp ≥ 3 AND v2_only_correct > v1_only_correct AND CI ranges don't substantially overlap. If lift is small or negative, V2 is just being more selective, not more accurate.",
+            },
+        }
+    except Exception as e:
+        logger.exception("v1_vs_v2_same_row failed")
+        raise HTTPException(500, f"v1_vs_v2_same_row error: {e}")
     except Exception as e:
         logger.exception("aggregate_v3 failed")
         raise HTTPException(500, f"aggregate_v3 error: {e}")
