@@ -2,31 +2,32 @@
 
 User selected: 2015-2025, source priority EDGAR > Finnhub > BPC, one-shot.
 
-This module fetches 8-K filings for our 740-ticker biotech universe and
-identifies clinical / regulatory catalysts. The pipeline:
+ARCHITECTURE NOTE (post-deploy revision):
+  Initial design fetched 8-K filing HTML from www.sec.gov/Archives. That
+  endpoint returns 403 from Railway IPs (SEC blocks our network range with
+  the 'Undeclared Automated Tool' page despite a polite UA). However,
+  data.sec.gov works fine (different SEC subdomain, different access policy).
 
-  1. resolve_cik(ticker)          — ticker → CIK lookup via SEC company_tickers
-  2. list_8k_filings(cik, range)  — submissions JSON, filter to 8-K
-  3. fetch_filing_text(accession) — get the primary 8-K HTML, extract Items
-  4. is_catalyst_8k(text)         — keyword classifier (Phase / topline /
-                                     PDUFA / FDA / approval / CRL)
-  5. extract_event(text)          — LLM extraction of structured event:
-                                     {catalyst_type, drug_name, indication,
-                                      outcome_class, evidence, source_url}
-  6. write to catalyst_universe + post_catalyst_outcomes
+  Revised pipeline uses ONLY data.sec.gov endpoints:
+    1. resolve_cik_via_data_sec(ticker) — first lookup hits data.sec.gov
+       per-ticker (we don't need the master list).
+    2. list_8k_filings(cik, range)      — data.sec.gov/submissions JSON
+       gives us {filing_date, accession, items, primary_doc} for every 8-K.
+    3. is_catalyst_by_items_code(items) — pre-filter on item codes alone.
+       Items 7.01 (Reg FD), 8.01 (Other Events), 1.01 (Material Agreements)
+       cover virtually all clinical/regulatory disclosures. Skip 2.02
+       (financial results) and 5.x (governance) only filings.
+    4. extract_via_gemini_grounded(ticker, date) — Gemini 2.5 Flash with
+       Google Search grounding. We feed it (ticker, company, filing_date,
+       item_codes) and ask it to find the company's press release for
+       that date and extract the catalyst event. This is more robust than
+       parsing 8-K legalese — the press releases are structured for humans.
 
 Cost model:
-  - EDGAR is free, no rate limit beyond 10 req/sec polite limit
-  - LLM extraction: ~0.0003/call (Gemini Flash)
-  - Estimated 4000-5000 catalyst-relevant 8-Ks across 740 tickers / 10y
-  - Total LLM cost: ~$1.50
-
-Scope notes:
-  - We keyword-prefilter to avoid LLM-extracting every 8-K (most are
-    earnings / dividends / management changes). Only ~10-15% of biotech
-    8-Ks are catalyst-relevant.
-  - Item codes 7.01 (Reg FD) and 8.01 (Other Events) cover most clinical /
-    regulatory disclosures. Item 2.02 (Financial Results) is excluded.
+  - data.sec.gov: free, polite limit 10 req/sec
+  - LLM extraction: ~$0.0003/call (Gemini Flash + grounding)
+  - Estimated 1500-3000 catalyst-relevant 8-Ks across 740 tickers / 10y
+  - Total LLM cost: ~$0.50-1.00
 """
 from __future__ import annotations
 import logging
@@ -35,25 +36,22 @@ import re
 import time
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urljoin
 
 import requests
 
 logger = logging.getLogger(__name__)
 
 
-# EDGAR requires a contact email in User-Agent. Use the AEGRA project owner
-# (per the brief) so SEC can contact us if our crawler misbehaves.
+# EDGAR requires a contact email in User-Agent. data.sec.gov accepts our
+# Railway-IP requests with this UA (we tested — the block is www.sec.gov only).
 EDGAR_UA = "AEGRA Biotech Research [email protected]"
 EDGAR_HEADERS = {
     "User-Agent": EDGAR_UA,
     "Accept-Encoding": "gzip, deflate",
+    "Host": "data.sec.gov",
 }
 
-# Polite rate limit: SEC asks for max 10 req/sec
-EDGAR_MIN_INTERVAL_SEC = 0.12  # ~8 req/sec to leave headroom
-
-# In-process state for rate limiting
+EDGAR_MIN_INTERVAL_SEC = 0.12  # ~8 req/sec
 _last_edgar_call_at = 0.0
 
 
@@ -65,42 +63,69 @@ def _rate_limit():
     _last_edgar_call_at = time.time()
 
 
-# Module-level CIK lookup cache (rebuilt on first use)
-_cik_lookup_cache: Optional[Dict[str, str]] = None
-
-
-def _build_cik_lookup() -> Dict[str, str]:
-    """SEC publishes a master company_tickers.json with ticker → CIK."""
-    global _cik_lookup_cache
-    if _cik_lookup_cache is not None:
-        return _cik_lookup_cache
-    _rate_limit()
-    try:
-        r = requests.get(
-            "https://www.sec.gov/files/company_tickers.json",
-            headers=EDGAR_HEADERS, timeout=20,
-        )
-        r.raise_for_status()
-        data = r.json()
-        # Format: {"0": {"cik_str": 1234, "ticker": "ABC", "title": "..."}, ...}
-        lookup = {}
-        for v in data.values():
-            ticker = (v.get("ticker") or "").upper().strip()
-            cik = v.get("cik_str")
-            if ticker and cik:
-                lookup[ticker] = str(cik).zfill(10)
-        _cik_lookup_cache = lookup
-        logger.info(f"[edgar] built CIK lookup with {len(lookup)} tickers")
-        return lookup
-    except Exception as e:
-        logger.exception(f"[edgar] CIK lookup build failed: {e}")
-        return {}
+# Module-level CIK cache (populated lazily as tickers are looked up)
+_cik_cache: Dict[str, Optional[str]] = {}
 
 
 def resolve_cik(ticker: str) -> Optional[str]:
-    """ticker → 10-digit CIK string. Returns None if not found."""
-    lookup = _build_cik_lookup()
-    return lookup.get((ticker or "").upper().strip())
+    """ticker → 10-digit CIK string. Looks up via data.sec.gov per-ticker
+    (we can't use the master list because www.sec.gov is blocked).
+
+    The trick: data.sec.gov/submissions/CIK{cik}.json works only with a
+    known CIK. To get from ticker → CIK from this side, we need to use
+    the EDGAR full-text search which IS on a third subdomain (efts.sec.gov)
+    that may also work.
+    """
+    ticker_u = (ticker or "").upper().strip()
+    if not ticker_u:
+        return None
+    if ticker_u in _cik_cache:
+        return _cik_cache[ticker_u]
+
+    # Strategy 1: efts.sec.gov full-text search (returns CIK in results)
+    _rate_limit()
+    try:
+        # Use EDGAR's company search via efts (different from www)
+        url = f"https://efts.sec.gov/LATEST/search-index?q=%22{ticker_u}%22&forms=10-K&hits=1"
+        r = requests.get(
+            url,
+            headers={"User-Agent": EDGAR_UA, "Accept-Encoding": "gzip"},
+            timeout=10,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            hits = data.get("hits", {}).get("hits", [])
+            for h in hits:
+                src = h.get("_source", {})
+                ciks = src.get("ciks") or []
+                tickers = src.get("tickers") or []
+                if ticker_u in [t.upper() for t in tickers]:
+                    cik = str(ciks[0]).zfill(10) if ciks else None
+                    if cik:
+                        _cik_cache[ticker_u] = cik
+                        return cik
+    except Exception as e:
+        logger.debug(f"[edgar] efts search failed for {ticker_u}: {e}")
+
+    # Strategy 2: data.sec.gov ticker → CIK via the ticker.txt feed (legacy)
+    # SEC publishes a plain text list at https://www.sec.gov/include/ticker.txt
+    # but that's also blocked. Try the data.sec.gov canonical alternative:
+    # /api/xbrl/companyconcept/CIK{cik}/... — requires CIK already.
+
+    # Strategy 3: Embedded fallback list — populated from a one-time scrape
+    # of company_tickers.json. We bundle this with the deploy. See
+    # services/edgar_cik_seed.py for the static dict.
+    try:
+        from services.edgar_cik_seed import CIK_BY_TICKER
+        cik = CIK_BY_TICKER.get(ticker_u)
+        if cik:
+            _cik_cache[ticker_u] = cik
+            return cik
+    except ImportError:
+        pass
+
+    _cik_cache[ticker_u] = None
+    return None
 
 
 def list_8k_filings(
@@ -109,15 +134,16 @@ def list_8k_filings(
     start_date: str = "2015-01-01",
     end_date: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """List 8-K filings for a CIK in a date range. Uses
-    data.sec.gov/submissions/CIK{cik}.json.
+    """List 8-K filings for a CIK in a date range via data.sec.gov.
 
     Returns list of {accession, filing_date, primary_doc, items} dicts.
     """
     _rate_limit()
     try:
         url = f"https://data.sec.gov/submissions/CIK{cik}.json"
-        r = requests.get(url, headers=EDGAR_HEADERS, timeout=20)
+        r = requests.get(url, headers={
+            "User-Agent": EDGAR_UA, "Accept-Encoding": "gzip",
+        }, timeout=20)
         r.raise_for_status()
         data = r.json()
     except Exception as e:
@@ -125,15 +151,15 @@ def list_8k_filings(
         return []
 
     end_date = end_date or date.today().isoformat()
-
     out: List[Dict[str, Any]] = []
-    # Recent filings
+
+    # Recent filings (latest 1000 — covers ~3-5 years for active filers)
     recent = data.get("filings", {}).get("recent", {})
     forms = recent.get("form", [])
     accessions = recent.get("accessionNumber", [])
     dates_arr = recent.get("filingDate", [])
     docs = recent.get("primaryDocument", [])
-    items_arr = recent.get("items", [])  # comma-separated string per filing
+    items_arr = recent.get("items", [])
 
     for i, form in enumerate(forms):
         if form != "8-K":
@@ -148,11 +174,9 @@ def list_8k_filings(
             "items": items_arr[i] if i < len(items_arr) else "",
         })
 
-    # Older filings live in "files" list of paginated archives
+    # Older filings — paginated archives in "files"
     older_files = data.get("filings", {}).get("files", [])
     for old_meta in older_files:
-        # Each entry has {"name": "CIK0001234567-submissions-001.json", ...}
-        # Date range is in old_meta["filingFrom"] / "filingTo"
         f_from = old_meta.get("filingFrom", "9999-12-31")
         f_to = old_meta.get("filingTo", "0000-01-01")
         if f_to < start_date or f_from > end_date:
@@ -160,25 +184,27 @@ def list_8k_filings(
         try:
             _rate_limit()
             old_url = f"https://data.sec.gov/submissions/{old_meta['name']}"
-            r = requests.get(old_url, headers=EDGAR_HEADERS, timeout=20)
+            r = requests.get(old_url, headers={
+                "User-Agent": EDGAR_UA, "Accept-Encoding": "gzip",
+            }, timeout=20)
             r.raise_for_status()
             old_data = r.json()
-            forms = old_data.get("form", [])
-            accessions = old_data.get("accessionNumber", [])
-            dates_arr = old_data.get("filingDate", [])
-            docs = old_data.get("primaryDocument", [])
-            items_arr = old_data.get("items", [])
-            for i, form in enumerate(forms):
+            ofs = old_data.get("form", [])
+            oaccs = old_data.get("accessionNumber", [])
+            odates = old_data.get("filingDate", [])
+            odocs = old_data.get("primaryDocument", [])
+            oitems = old_data.get("items", [])
+            for i, form in enumerate(ofs):
                 if form != "8-K":
                     continue
-                fdate = dates_arr[i]
+                fdate = odates[i]
                 if fdate < start_date or fdate > end_date:
                     continue
                 out.append({
-                    "accession": accessions[i],
+                    "accession": oaccs[i],
                     "filing_date": fdate,
-                    "primary_doc": docs[i] if i < len(docs) else None,
-                    "items": items_arr[i] if i < len(items_arr) else "",
+                    "primary_doc": odocs[i] if i < len(odocs) else None,
+                    "items": oitems[i] if i < len(oitems) else "",
                 })
         except Exception as e:
             logger.warning(f"[edgar] older filings page {old_meta.get('name')} failed: {e}")
@@ -186,148 +212,85 @@ def list_8k_filings(
     return out
 
 
-def fetch_filing_text(cik: str, accession: str, primary_doc: str) -> Optional[str]:
-    """Fetch the primary 8-K document's text. accession comes with hyphens
-    in submissions JSON (e.g. '0001193125-26-179401'); the URL needs them
-    stripped from the directory part.
+def is_catalyst_by_items_code(items: str) -> Tuple[bool, str]:
+    """Filter 8-Ks based on their EDGAR Item codes alone.
+
+    Items 7.01 (Reg FD Disclosure) — most common for clinical/PR
+    Items 8.01 (Other Events)      — most common for FDA decisions
+    Items 1.01 (Material Agreement) — partnerships, sometimes catalyst-adj
+    Items 1.02 (Termination)        — clinical trial terminations
+    Items 5.07 (Shareholder Vote)   — usually not a catalyst, skip
+
+    Skip if the filing is ONLY 2.02 (financial results) and/or 5.x or 9.01
+    with nothing catalyst-relevant.
     """
-    _rate_limit()
-    try:
-        acc_dir = accession.replace("-", "")
-        url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc_dir}/{primary_doc}"
-        r = requests.get(url, headers=EDGAR_HEADERS, timeout=20)
-        if r.status_code != 200:
-            return None
-        return r.text
-    except Exception as e:
-        logger.warning(f"[edgar] fetch_filing_text failed for {accession}: {e}")
-        return None
-
-
-# ────────────────────────────────────────────────────────────
-# Catalyst keyword classifier
-# ────────────────────────────────────────────────────────────
-# 8-K text is HTML — we strip tags then pattern-match. Most biotech 8-Ks
-# falling in the catalyst category include one of these phrase clusters.
-
-# Compiled once for performance
-_CLINICAL_PATTERNS = [
-    re.compile(p, re.IGNORECASE) for p in [
-        r"top-?line\s+(results?|data)",
-        r"primary\s+endpoint",
-        r"\bphase\s+(?:1|2|3|i|ii|iii)\b",
-        r"\bpdufa\b",
-        r"\bnda\s+(submission|filing|acceptance|approval)",
-        r"\bbla\s+(submission|filing|acceptance|approval)",
-        r"FDA\s+(approval|approved|approves|granted|accepted|cleared|grants)",
-        r"complete\s+response\s+letter",
-        r"\bCRL\b",
-        r"breakthrough\s+therapy",
-        r"orphan\s+drug",
-        r"fast\s+track",
-        r"priority\s+review",
-        r"advisory\s+committee",
-        r"\badcomm?\b",
-        r"clinical\s+(hold|trial|study)",
-        r"interim\s+(analysis|results)",
-    ]
-]
-
-
-def is_catalyst_8k(text: str, items: str = "") -> Tuple[bool, List[str]]:
-    """Returns (is_catalyst, matched_keywords). True if any clinical pattern
-    matches the text. Items is a comma-separated string from EDGAR; we
-    skip pure financial-results filings (Item 2.02 only).
-    """
-    if not text or len(text) < 500:
-        return (False, [])
-
-    # Skip if filing is only Item 2.02 (financial results) without 7.01/8.01
     item_set = {it.strip() for it in (items or "").split(",") if it.strip()}
-    if item_set and item_set <= {"2.02", "9.01"}:
-        return (False, [])
+    if not item_set:
+        return (False, "no_items")
 
-    # Strip HTML tags for keyword matching
-    plain = re.sub(r"<[^>]+>", " ", text)
-    plain = re.sub(r"\s+", " ", plain)
+    catalyst_items = {"7.01", "8.01", "1.01", "1.02"}
+    governance_only = {"2.02", "5.02", "5.03", "5.07", "9.01"}
 
-    matched = []
-    for pat in _CLINICAL_PATTERNS:
-        m = pat.search(plain)
-        if m:
-            matched.append(m.group(0).lower())
-            if len(matched) >= 3:
-                break  # Enough signal; don't waste cycles
-    return (len(matched) > 0, matched)
+    if item_set & catalyst_items:
+        # Has at least one catalyst-relevant item
+        matched = ",".join(sorted(item_set & catalyst_items))
+        return (True, f"item_match:{matched}")
 
+    if item_set <= governance_only:
+        return (False, "governance_only")
 
-def extract_text_for_llm(html_text: str, max_chars: int = 8000) -> str:
-    """Strip HTML and trim to a reasonable size for LLM extraction.
-    Catalysts are usually announced in the first 3-5K chars of the 8-K."""
-    if not html_text:
-        return ""
-    plain = re.sub(r"<script[^>]*>.*?</script>", "", html_text,
-                   flags=re.DOTALL | re.IGNORECASE)
-    plain = re.sub(r"<style[^>]*>.*?</style>", "", plain,
-                   flags=re.DOTALL | re.IGNORECASE)
-    plain = re.sub(r"<[^>]+>", " ", plain)
-    plain = re.sub(r"&nbsp;", " ", plain)
-    plain = re.sub(r"&amp;", "&", plain)
-    plain = re.sub(r"&lt;", "<", plain)
-    plain = re.sub(r"&gt;", ">", plain)
-    plain = re.sub(r"\s+", " ", plain).strip()
-    if len(plain) > max_chars:
-        plain = plain[:max_chars]
-    return plain
+    # Other items — uncertain; let it through
+    return (True, "other_items")
 
 
 # ────────────────────────────────────────────────────────────
-# LLM extraction
+# LLM extraction via Gemini grounding (no 8-K text needed)
 # ────────────────────────────────────────────────────────────
 
-EXTRACTION_PROMPT = """You are a biotech catalyst extractor. Given the text of an 8-K filing, extract any clinical or regulatory catalyst event(s) it announces.
+EXTRACTION_PROMPT = """You are a biotech catalyst extractor. A company filed an 8-K on the date below. Search for the company's press release published on or near that date and extract the catalyst event it announces.
 
-Filing context:
-  Ticker: {ticker}
-  Filing date: {filing_date}
-  CIK: {cik}
+Company: {company} ({ticker})
+Filing date: {filing_date}
+8-K Item codes: {items}
 
-Filing text:
----
-{text}
----
+Search Google for:
+  - Company press release on {filing_date} (or 1-2 days before/after)
+  - PR Newswire / GlobeNewswire / BusinessWire announcement
+  - Company IR site investor news
+  - The 8-K filing itself on EDGAR
 
-Return ONLY a JSON object (no markdown, no prose) with this shape. If the filing has no catalyst event, return {{"is_catalyst": false}}.
+Return ONLY a JSON object (no markdown, no prose). If the filing has no clinical/regulatory catalyst event (e.g., financial results, governance), return {{"is_catalyst": false}}.
 
+Schema:
 {{
   "is_catalyst": true,
-  "catalyst_type": "FDA Decision" | "Phase 1 Readout" | "Phase 2 Readout" | "Phase 3 Readout" | "Phase 1/2 Readout" | "AdComm" | "NDA Submission" | "BLA Submission" | "Designation Granted" | "Clinical Hold",
+  "catalyst_type": "FDA Decision" | "Phase 1 Readout" | "Phase 2 Readout" | "Phase 3 Readout" | "Phase 1/2 Readout" | "AdComm" | "NDA Submission" | "BLA Submission" | "Designation Granted" | "Clinical Hold" | "Partnership" | "Other",
   "drug_name": "string or null",
   "indication": "string or null",
-  "catalyst_date_iso": "YYYY-MM-DD (the event date, often = filing date)",
+  "catalyst_date_iso": "YYYY-MM-DD",
   "outcome_class": "APPROVED" | "REJECTED" | "MET_ENDPOINT" | "MISSED_ENDPOINT" | "DELAYED" | "WITHDRAWN" | "MIXED" | "ANNOUNCED",
   "endpoint_met": true | false | null,
   "approval_granted": true | false | null,
-  "evidence": "verbatim short quote from the filing, under 50 words",
+  "evidence": "verbatim short quote from source (under 50 words)",
+  "primary_source_url": "https://...",
   "confidence": 0.0 - 1.0
 }}
 
 Rules:
-  - Extract ONE primary event per filing. If multiple are announced, pick the most material.
-  - "ANNOUNCED" outcome_class is for forward-looking events (e.g., NDA filed but no decision yet).
-  - Phase trials get "MET_ENDPOINT" / "MISSED_ENDPOINT" only if results are reported, not just announced.
-  - confidence < 0.5 means the filing is borderline (e.g., business update touching on clinical work in passing).
+  - Extract ONE primary event per filing. If multiple, pick the most material.
+  - "ANNOUNCED" is for forward-looking events (NDA filed, no decision yet).
+  - confidence < 0.5 = borderline (e.g., business update mentioning clinical work in passing).
   - If is_catalyst=false, return ONLY {{"is_catalyst": false}}."""
 
 
-def extract_catalyst_via_llm(
+def extract_catalyst_via_gemini(
     *,
     ticker: str,
-    cik: str,
+    company: str,
     filing_date: str,
-    text: str,
+    items: str,
 ) -> Optional[Dict[str, Any]]:
-    """Run Gemini extraction. Returns parsed JSON or None on failure.
+    """Gemini-grounded extraction. Returns parsed JSON or None.
     Cost ~$0.0003 per call."""
     google_api_key = os.getenv("GOOGLE_API_KEY")
     if not google_api_key:
@@ -340,17 +303,15 @@ def extract_catalyst_via_llm(
         logger.warning("[edgar-llm] google-genai not available")
         return None
 
-    plain = extract_text_for_llm(text, max_chars=6000)
-    if len(plain) < 200:
-        return None
-
     prompt = EXTRACTION_PROMPT.format(
-        ticker=ticker, cik=cik, filing_date=filing_date, text=plain,
+        ticker=ticker, company=company or ticker,
+        filing_date=filing_date, items=items or "(none)",
     )
     client = genai.Client(api_key=google_api_key)
     config = genai_types.GenerateContentConfig(
         max_output_tokens=2000,
         temperature=0.1,
+        tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())],
     )
 
     t0 = time.time()
@@ -392,7 +353,7 @@ def extract_catalyst_via_llm(
             model=os.getenv("EDGAR_LLM_MODEL", "gemini-2.5-flash"),
             tokens_in=tokens_in, tokens_out=tokens_out,
             latency_sec=elapsed, status=status, error=err_msg,
-            context=f"edgar-extract:{ticker}",
+            context=f"edgar-extract:{ticker}:{filing_date}",
         )
     except Exception:
         pass
@@ -400,7 +361,6 @@ def extract_catalyst_via_llm(
     if status != "success" or not response_text:
         return None
 
-    # Strip markdown fences if present
     cleaned = response_text.strip()
     if cleaned.startswith("```"):
         cleaned = cleaned.split("```", 2)[1]

@@ -4,7 +4,7 @@
 import logging, os, json
 from datetime import datetime
 from typing import Optional, Dict
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
@@ -5399,3 +5399,295 @@ async def edgar_diag(ticker: str = "NTLA"):
         results["www_sec_archives_8k"] = {"error": str(e)[:100]}
 
     return {"ticker_tested": ticker, "results": results, "user_agent": UA}
+
+
+# ────────────────────────────────────────────────────────────
+# Backfill staging + EDGAR scraper (one-shot)
+# ────────────────────────────────────────────────────────────
+
+@router.post("/post-catalyst/apply-migration-017")
+async def apply_migration_017():
+    """One-shot for migration 017 — backfill_staging table."""
+    try:
+        from services.database import BiotechDatabase
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS catalyst_backfill_staging (
+                    id BIGSERIAL PRIMARY KEY,
+                    source TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    UNIQUE (source, source_id),
+                    ticker TEXT, cik TEXT,
+                    filing_date DATE, catalyst_date DATE,
+                    date_precision TEXT DEFAULT 'unknown',
+                    catalyst_type TEXT, drug_name TEXT, indication TEXT,
+                    raw_title TEXT, raw_text_excerpt TEXT, source_url TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    reject_reason TEXT, catalyst_id INTEGER,
+                    normalized_json JSONB,
+                    scraped_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+                    processed_at TIMESTAMP WITH TIME ZONE
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS catalyst_backfill_runs (
+                    id BIGSERIAL PRIMARY KEY,
+                    source TEXT NOT NULL,
+                    started_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+                    ended_at TIMESTAMP WITH TIME ZONE,
+                    year_range TEXT,
+                    params_json JSONB,
+                    rows_scraped INTEGER DEFAULT 0,
+                    rows_inserted INTEGER DEFAULT 0,
+                    rows_skipped INTEGER DEFAULT 0,
+                    rows_errored INTEGER DEFAULT 0,
+                    status TEXT DEFAULT 'running',
+                    error_message TEXT
+                )
+            """)
+            for stmt in [
+                "CREATE INDEX IF NOT EXISTS idx_bks_status_source ON catalyst_backfill_staging(status, source)",
+                "CREATE INDEX IF NOT EXISTS idx_bks_ticker_filing_date ON catalyst_backfill_staging(ticker, filing_date) WHERE ticker IS NOT NULL",
+                "CREATE INDEX IF NOT EXISTS idx_bks_cik ON catalyst_backfill_staging(cik) WHERE cik IS NOT NULL",
+                "CREATE INDEX IF NOT EXISTS idx_bks_pending ON catalyst_backfill_staging(scraped_at) WHERE status = 'pending'",
+            ]:
+                cur.execute(stmt)
+            cur.execute("""
+                UPDATE alembic_version_biotech
+                SET version_num = '017_backfill_staging'
+                WHERE version_num = '016_outcome_labels'
+            """)
+            stamped = cur.rowcount
+            cur.execute("SELECT version_num FROM alembic_version_biotech")
+            new_v = cur.fetchone()[0]
+            conn.commit()
+        return {"success": True, "new_alembic_version": new_v, "stamped_rows": stamped}
+    except Exception as e:
+        logger.exception("apply_migration_017 failed")
+        raise HTTPException(500, f"apply_migration_017 error: {e}")
+
+
+# Module-level state for tracking long-running EDGAR backfill
+_edgar_backfill_state: dict = {
+    "running": False,
+    "current_run_id": None,
+    "ciks_total": 0,
+    "ciks_processed": 0,
+    "filings_scraped": 0,
+    "filings_inserted": 0,
+    "current_ticker": None,
+    "started_at": None,
+    "last_error": None,
+}
+
+
+@router.post("/post-catalyst/edgar-backfill-start")
+async def edgar_backfill_start(
+    start_year: int = 2015,
+    end_year: int = 2025,
+    max_ciks: int = 0,  # 0 = no limit
+    background_tasks: BackgroundTasks = None,
+):
+    """Kick off the EDGAR 10-year backfill in the background.
+    One-shot — does not run on a schedule.
+
+    Reads CIKs from catalyst_universe + screener_stocks, looks up each
+    via SEC's company_tickers.json, then scans 8-K filings.
+
+    max_ciks: cap for testing (0 = scan all)
+    """
+    if _edgar_backfill_state["running"]:
+        raise HTTPException(409, "EDGAR backfill already running")
+
+    import asyncio
+    from services.database import BiotechDatabase
+    from services.edgar_backfill import (
+        fetch_biotech_ciks_from_universe, edgar_backfill_for_cik,
+    )
+
+    db = BiotechDatabase()
+
+    # Create run record
+    try:
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO catalyst_backfill_runs (
+                    source, year_range, params_json, status
+                ) VALUES (
+                    'edgar', %s, %s, 'running'
+                )
+                RETURNING id
+            """, (
+                f"{start_year}-{end_year}",
+                json.dumps({
+                    "start_year": start_year, "end_year": end_year,
+                    "max_ciks": max_ciks,
+                }),
+            ))
+            run_id = cur.fetchone()[0]
+            conn.commit()
+    except Exception as e:
+        raise HTTPException(500, f"failed to create run record: {e}")
+
+    _edgar_backfill_state.update({
+        "running": True,
+        "current_run_id": run_id,
+        "ciks_total": 0,
+        "ciks_processed": 0,
+        "filings_scraped": 0,
+        "filings_inserted": 0,
+        "current_ticker": None,
+        "started_at": datetime.utcnow().isoformat(),
+        "last_error": None,
+    })
+
+    async def _run():
+        from datetime import datetime as _dt
+        try:
+            cik_list = fetch_biotech_ciks_from_universe(db)
+            if max_ciks:
+                cik_list = cik_list[:max_ciks]
+            _edgar_backfill_state["ciks_total"] = len(cik_list)
+            logger.info(f"[edgar-backfill] starting {len(cik_list)} CIKs, "
+                        f"years {start_year}-{end_year}, run_id={run_id}")
+
+            total_scraped = 0
+            total_inserted = 0
+            total_errored = 0
+
+            for cik_padded, ticker, _name in cik_list:
+                _edgar_backfill_state["current_ticker"] = ticker
+                try:
+                    counts = edgar_backfill_for_cik(
+                        db, cik_padded, ticker, start_year, end_year, run_id,
+                    )
+                    total_scraped += counts.get("scraped", 0)
+                    total_inserted += counts.get("inserted", 0)
+                    total_errored += counts.get("errored", 0)
+                    _edgar_backfill_state["ciks_processed"] += 1
+                    _edgar_backfill_state["filings_scraped"] = total_scraped
+                    _edgar_backfill_state["filings_inserted"] = total_inserted
+                    # Periodic progress update
+                    if _edgar_backfill_state["ciks_processed"] % 20 == 0:
+                        with db.get_conn() as conn:
+                            cur = conn.cursor()
+                            cur.execute("""
+                                UPDATE catalyst_backfill_runs
+                                SET rows_scraped = %s,
+                                    rows_inserted = %s,
+                                    rows_errored = %s
+                                WHERE id = %s
+                            """, (total_scraped, total_inserted, total_errored, run_id))
+                            conn.commit()
+                except Exception as e:
+                    total_errored += 1
+                    _edgar_backfill_state["last_error"] = str(e)[:200]
+                    logger.warning(f"[edgar-backfill] CIK {cik_padded} ({ticker}) failed: {e}")
+
+            with db.get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute("""
+                    UPDATE catalyst_backfill_runs
+                    SET ended_at = now(), status = 'completed',
+                        rows_scraped = %s, rows_inserted = %s, rows_errored = %s
+                    WHERE id = %s
+                """, (total_scraped, total_inserted, total_errored, run_id))
+                conn.commit()
+            logger.info(f"[edgar-backfill] DONE: {total_inserted} inserted "
+                        f"out of {total_scraped} scraped, {total_errored} errors")
+        except Exception as e:
+            logger.exception(f"[edgar-backfill] top-level failure: {e}")
+            try:
+                with db.get_conn() as conn:
+                    cur = conn.cursor()
+                    cur.execute("""
+                        UPDATE catalyst_backfill_runs
+                        SET ended_at = now(), status = 'failed',
+                            error_message = %s
+                        WHERE id = %s
+                    """, (str(e)[:500], run_id))
+                    conn.commit()
+            except Exception:
+                pass
+            _edgar_backfill_state["last_error"] = str(e)[:200]
+        finally:
+            _edgar_backfill_state["running"] = False
+            _edgar_backfill_state["current_ticker"] = None
+
+    asyncio.create_task(_run())
+    return {
+        "ok": True, "run_id": run_id,
+        "status_url": "/admin/post-catalyst/edgar-backfill-status",
+    }
+
+
+@router.get("/post-catalyst/edgar-backfill-status")
+async def edgar_backfill_status():
+    """Live progress of the EDGAR backfill."""
+    return _edgar_backfill_state.copy()
+
+
+@router.get("/post-catalyst/backfill-staging-stats")
+async def backfill_staging_stats():
+    """Counts of staging rows by source × status."""
+    try:
+        from services.database import BiotechDatabase
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT source, status, COUNT(*)
+                FROM catalyst_backfill_staging
+                GROUP BY source, status
+                ORDER BY source, status
+            """)
+            rows = cur.fetchall()
+            cur.execute("""
+                SELECT id, source, started_at, ended_at, year_range,
+                       rows_scraped, rows_inserted, rows_errored, status,
+                       error_message
+                FROM catalyst_backfill_runs
+                ORDER BY started_at DESC
+                LIMIT 10
+            """)
+            runs = cur.fetchall()
+        by_source = {}
+        for source, status, n in rows:
+            by_source.setdefault(source, {})[status] = n
+        return {
+            "by_source_status": by_source,
+            "recent_runs": [
+                {
+                    "id": r[0], "source": r[1],
+                    "started_at": r[2].isoformat() if r[2] else None,
+                    "ended_at": r[3].isoformat() if r[3] else None,
+                    "year_range": r[4],
+                    "rows_scraped": r[5], "rows_inserted": r[6],
+                    "rows_errored": r[7], "status": r[8],
+                    "error": (r[9] or "")[:200],
+                }
+                for r in runs
+            ],
+        }
+    except Exception as e:
+        logger.exception("backfill_staging_stats failed")
+        raise HTTPException(500, f"backfill_staging_stats error: {e}")
+
+
+@router.post("/post-catalyst/backfill-normalize-batch")
+async def backfill_normalize_batch(batch_size: int = 50):
+    """Run the LLM normalizer on a batch of pending staging rows.
+    Promotes accepted rows into catalyst_universe.
+    Cost: ~$0.0003 per row.
+    """
+    try:
+        from services.database import BiotechDatabase
+        from services.backfill_normalizer import normalize_pending_batch
+        db = BiotechDatabase()
+        return normalize_pending_batch(db=db, batch_size=batch_size)
+    except Exception as e:
+        logger.exception("backfill_normalize_batch failed")
+        raise HTTPException(500, f"backfill_normalize_batch error: {e}")
