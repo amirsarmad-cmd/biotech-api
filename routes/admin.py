@@ -5854,3 +5854,33 @@ async def backfill_reset_status(
     except Exception as e:
         logger.exception("backfill_reset_status failed")
         raise HTTPException(500, f"backfill_reset_status error: {e}")
+
+
+@router.post("/post-catalyst/backfill-wipe-source")
+async def backfill_wipe_source(
+    source: str,
+    confirm: str = "",
+):
+    """Delete ALL staging rows for a given source. Destructive — requires
+    confirm='yes'. Useful when a scraper bug invalidated a batch and we
+    want a clean re-scrape.
+
+    Does NOT delete from catalyst_universe (those are already promoted).
+    """
+    if confirm != "yes":
+        raise HTTPException(400, "must pass confirm=yes")
+    try:
+        from services.database import BiotechDatabase
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                DELETE FROM catalyst_backfill_staging
+                WHERE source = %s
+            """, (source,))
+            n = cur.rowcount
+            conn.commit()
+        return {"deleted": n, "source": source}
+    except Exception as e:
+        logger.exception("backfill_wipe_source failed")
+        raise HTTPException(500, f"backfill_wipe_source error: {e}")
