@@ -131,46 +131,132 @@ def normalize_one_staging_row(*, db, staging_row: Dict[str, Any]) -> Optional[Di
     )
 
     client = genai.Client(api_key=GOOGLE_API_KEY)
-    config = genai_types.GenerateContentConfig(
-        max_output_tokens=1500,
-        temperature=0.1,
-    )
+    # Disable BLOCK_MEDIUM_AND_ABOVE safety thresholds — clinical/regulatory
+    # content (cancer drugs, gene editing, FDA hold letters, adverse events)
+    # is precisely what we want to classify, and default Gemini safety filters
+    # block it as "medical" / "dangerous content" surprisingly often. Using
+    # BLOCK_NONE keeps medical content flowing; this is a research/classification
+    # task, not a generative one with end-user output.
+    # Defensive: skip if SafetySetting symbol isn't available in this genai
+    # version (we'll still get default safety, just without our override).
+    safety_settings = None
+    try:
+        SafetySetting = getattr(genai_types, "SafetySetting", None)
+        if SafetySetting is not None:
+            safety_settings = [
+                SafetySetting(category=c, threshold="BLOCK_NONE")
+                for c in (
+                    "HARM_CATEGORY_HATE_SPEECH",
+                    "HARM_CATEGORY_DANGEROUS_CONTENT",
+                    "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                    "HARM_CATEGORY_HARASSMENT",
+                )
+            ]
+    except Exception as e:
+        logger.warning(f"[normalizer] safety_settings setup failed (using defaults): {e}")
+        safety_settings = None
+
+    config_kwargs: Dict[str, Any] = {
+        "max_output_tokens": 2048,  # was 1500 — give headroom; rare overruns counted as failures
+        "temperature": 0.1,
+    }
+    if safety_settings is not None:
+        config_kwargs["safety_settings"] = safety_settings
+    config = genai_types.GenerateContentConfig(**config_kwargs)
 
     t0 = time.time()
     status = "success"
     err_msg = None
     text = ""
-    saw_503 = False
-    for attempt in (1, 2):
+    finish_reason: Optional[str] = None
+    tokens_in = 0
+    tokens_out = 0
+
+    def _is_transient(msg: str) -> bool:
+        m = msg.lower()
+        return any(s in m for s in (
+            "503", "unavailable", "500", "internal", "502", "bad gateway",
+            "504", "deadline", "timeout", "connection reset",
+            "429", "rate limit", "resource_exhausted",
+        ))
+
+    for attempt in (1, 2, 3):
         try:
             response = client.models.generate_content(
                 model=LLM_MODEL, contents=prompt, config=config,
             )
-            text = response.text or ""
-            err_msg = None
-            status = "success"
+            # Capture finish_reason & token counts even on partial responses.
+            try:
+                cand = (response.candidates or [None])[0]
+                if cand is not None and getattr(cand, "finish_reason", None) is not None:
+                    finish_reason = str(cand.finish_reason)
+            except Exception:
+                pass
+            try:
+                um = getattr(response, "usage_metadata", None)
+                if um is not None:
+                    tokens_in = int(getattr(um, "prompt_token_count", 0) or 0)
+                    tokens_out = int(getattr(um, "candidates_token_count", 0) or 0)
+            except Exception:
+                pass
+
+            # response.text raises if no text content (SAFETY block, MAX_TOKENS
+            # before any text, RECITATION, etc.). Wrap defensively.
+            try:
+                text = response.text or ""
+            except Exception as te:
+                text = ""
+                # Try to pull text from candidate parts as a fallback
+                try:
+                    cand = (response.candidates or [None])[0]
+                    if cand is not None and getattr(cand, "content", None):
+                        for part in (cand.content.parts or []):
+                            t = getattr(part, "text", None)
+                            if t:
+                                text = (text + t) if text else t
+                except Exception:
+                    pass
+                if not text:
+                    err_msg = (f"finish_reason={finish_reason} "
+                               f"text_access_failed={str(te)[:160]}")[:300]
+
+            if text:
+                err_msg = None
+                status = "success"
+                break
+            # No text — treat as error and decide whether to retry.
+            status = "error"
+            err_msg = err_msg or f"empty_response finish_reason={finish_reason}"
+            # SAFETY / RECITATION / OTHER are not transient — don't retry
+            if finish_reason and any(s in finish_reason for s in ("SAFETY", "RECITATION", "PROHIBITED_CONTENT", "BLOCKLIST")):
+                break
+            # MAX_TOKENS is not transient either — already gave it the budget
+            if finish_reason and "MAX_TOKENS" in finish_reason:
+                break
+            if attempt < 3:
+                time.sleep(2.0 * attempt)
+                continue
             break
         except Exception as e:
             status = "error"
             err_msg = str(e)[:300]
-            if "503" in err_msg and "UNAVAILABLE" in err_msg:
-                saw_503 = True
-            if attempt == 1 and saw_503:
-                time.sleep(3.0)
+            if attempt < 3 and _is_transient(err_msg):
+                time.sleep(2.0 * attempt)
                 continue
             break
 
-    elapsed = time.time() - t0
+    elapsed_ms = int((time.time() - t0) * 1000)
     try:
         from services.llm_usage import record_usage
         record_usage(
             provider="google", model=LLM_MODEL,
-            tokens_in=0, tokens_out=0,
-            latency_sec=elapsed, status=status, error=err_msg,
-            context=f"backfill-normalizer:{staging_row.get('ticker')}",
+            tokens_input=tokens_in, tokens_output=tokens_out,
+            duration_ms=elapsed_ms, status=status, error_message=err_msg,
+            feature="backfill-normalizer",
+            ticker=staging_row.get("ticker"),
         )
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"[normalizer] record_usage failed: {e}")
 
     if status != "success" or not text:
         # Bubble the error up so it ends up in reject_reason for diagnostics
