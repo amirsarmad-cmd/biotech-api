@@ -157,7 +157,7 @@ def normalize_one_staging_row(*, db, staging_row: Dict[str, Any]) -> Optional[Di
         safety_settings = None
 
     config_kwargs: Dict[str, Any] = {
-        "max_output_tokens": 2048,  # was 1500 — give headroom; rare overruns counted as failures
+        "max_output_tokens": 4000,  # bumped from 2048; some multi-clause filings still truncated
         "temperature": 0.1,
     }
     if safety_settings is not None:
