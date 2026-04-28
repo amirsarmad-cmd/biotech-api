@@ -6027,3 +6027,9 @@ async def backfill_reset_unclear_to_pending(
     except Exception as e:
         logger.exception("backfill_reset_unclear_to_pending failed")
         raise HTTPException(500, f"reset error: {e}")
+
+
+@router.get("/_deploy_sentinel_v1")
+async def _deploy_sentinel_v1():
+    """Sentinel endpoint to verify which commit is live."""
+    return {"sentinel": "v1", "commit": "deploy-marker-2026-04-28-15-50"}
