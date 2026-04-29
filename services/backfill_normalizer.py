@@ -586,15 +586,24 @@ def normalize_pending_batch(*, db, batch_size: int = 50) -> Dict[str, int]:
     try:
         with db.get_conn() as conn:
             cur = conn.cursor()
+            # Atomically claim rows so concurrent workers don't double-process.
+            # FOR UPDATE SKIP LOCKED skips rows already locked by another worker.
             cur.execute("""
-                SELECT id, source, source_id, ticker, cik, filing_date,
-                       catalyst_date, raw_title, raw_text_excerpt, source_url
-                FROM catalyst_backfill_staging
-                WHERE status = 'pending'
-                ORDER BY filing_date DESC NULLS LAST
-                LIMIT %s
+                WITH claimed AS (
+                    SELECT id FROM catalyst_backfill_staging
+                    WHERE status = 'pending'
+                    ORDER BY filing_date DESC NULLS LAST
+                    LIMIT %s
+                    FOR UPDATE SKIP LOCKED
+                )
+                UPDATE catalyst_backfill_staging
+                SET status = 'processing', processed_at = now()
+                WHERE id IN (SELECT id FROM claimed)
+                RETURNING id, source, source_id, ticker, cik, filing_date,
+                          catalyst_date, raw_title, raw_text_excerpt, source_url
             """, (batch_size,))
             rows = cur.fetchall()
+            conn.commit()
 
         for row in rows:
             (sid, source, source_id, ticker, cik, filing_date, cat_date,

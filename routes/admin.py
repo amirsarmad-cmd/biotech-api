@@ -5707,10 +5707,14 @@ async def backfill_normalize_batch(batch_size: int = 50):
         raise HTTPException(500, f"backfill_normalize_batch error: {e}")
 
 
+_NORMALIZE_WORKERS = 4
+
+
 @router.post("/post-catalyst/normalize-all-start")
 async def normalize_all_start():
     """Start a background task that runs normalize_pending_batch() in a loop
     until pending=0. Returns immediately; poll /normalize-all-status for progress.
+    Runs _NORMALIZE_WORKERS concurrent workers with SKIP LOCKED for throughput.
     Cost: ~$0.0003 per row.
     """
     if _normalize_all_state["running"]:
@@ -5719,6 +5723,22 @@ async def normalize_all_start():
     import asyncio
     from services.database import BiotechDatabase
     from services.backfill_normalizer import normalize_pending_batch
+
+    # Reset any rows stuck in 'processing' state from a previous crashed run.
+    try:
+        db_reset = BiotechDatabase()
+        with db_reset.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE catalyst_backfill_staging SET status = 'pending'
+                WHERE status = 'processing'
+            """)
+            reset_count = cur.rowcount
+            conn.commit()
+        if reset_count:
+            logger.info(f"[normalize-all] reset {reset_count} stuck 'processing' rows → 'pending'")
+    except Exception as e:
+        logger.warning(f"[normalize-all] failed to reset processing rows: {e}")
 
     _normalize_all_state.update({
         "running": True,
@@ -5732,20 +5752,23 @@ async def normalize_all_start():
         "last_error": None,
     })
 
-    async def _run():
+    async def _worker():
         db = BiotechDatabase()
+        while True:
+            result = await asyncio.to_thread(normalize_pending_batch, db=db, batch_size=50)
+            if result.get("scanned", 0) == 0:
+                break
+            _normalize_all_state["batches_done"] += 1
+            _normalize_all_state["rows_accepted"] += result.get("accepted", 0)
+            _normalize_all_state["rows_rejected"] += result.get("rejected", 0)
+            _normalize_all_state["rows_duplicate"] += result.get("duplicate", 0)
+            _normalize_all_state["rows_unclear"] += result.get("unclear", 0)
+            _normalize_all_state["rows_errored"] += result.get("errored", 0)
+            await asyncio.sleep(0.1)
+
+    async def _run():
         try:
-            while True:
-                result = await asyncio.to_thread(normalize_pending_batch, db=db, batch_size=50)
-                if result.get("scanned", 0) == 0:
-                    break
-                _normalize_all_state["batches_done"] += 1
-                _normalize_all_state["rows_accepted"] += result.get("accepted", 0)
-                _normalize_all_state["rows_rejected"] += result.get("rejected", 0)
-                _normalize_all_state["rows_duplicate"] += result.get("duplicate", 0)
-                _normalize_all_state["rows_unclear"] += result.get("unclear", 0)
-                _normalize_all_state["rows_errored"] += result.get("errored", 0)
-                await asyncio.sleep(0.1)
+            await asyncio.gather(*[_worker() for _ in range(_NORMALIZE_WORKERS)])
         except Exception as e:
             logger.exception(f"[normalize-all] error: {e}")
             _normalize_all_state["last_error"] = str(e)[:200]
