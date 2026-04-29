@@ -5469,6 +5469,20 @@ async def apply_migration_017():
         raise HTTPException(500, f"apply_migration_017 error: {e}")
 
 
+# Module-level state for the background normalize-all task
+_normalize_all_state: dict = {
+    "running": False,
+    "batches_done": 0,
+    "rows_accepted": 0,
+    "rows_rejected": 0,
+    "rows_duplicate": 0,
+    "rows_unclear": 0,
+    "rows_errored": 0,
+    "started_at": None,
+    "last_error": None,
+}
+
+
 # Module-level state for tracking long-running EDGAR backfill
 _edgar_backfill_state: dict = {
     "running": False,
@@ -5691,6 +5705,61 @@ async def backfill_normalize_batch(batch_size: int = 50):
     except Exception as e:
         logger.exception("backfill_normalize_batch failed")
         raise HTTPException(500, f"backfill_normalize_batch error: {e}")
+
+
+@router.post("/post-catalyst/normalize-all-start")
+async def normalize_all_start():
+    """Start a background task that runs normalize_pending_batch() in a loop
+    until pending=0. Returns immediately; poll /normalize-all-status for progress.
+    Cost: ~$0.0003 per row.
+    """
+    if _normalize_all_state["running"]:
+        raise HTTPException(409, "normalize-all already running")
+
+    import asyncio
+    from services.database import BiotechDatabase
+    from services.backfill_normalizer import normalize_pending_batch
+
+    _normalize_all_state.update({
+        "running": True,
+        "batches_done": 0,
+        "rows_accepted": 0,
+        "rows_rejected": 0,
+        "rows_duplicate": 0,
+        "rows_unclear": 0,
+        "rows_errored": 0,
+        "started_at": datetime.utcnow().isoformat(),
+        "last_error": None,
+    })
+
+    async def _run():
+        db = BiotechDatabase()
+        try:
+            while True:
+                result = normalize_pending_batch(db=db, batch_size=50)
+                if result.get("scanned", 0) == 0:
+                    break
+                _normalize_all_state["batches_done"] += 1
+                _normalize_all_state["rows_accepted"] += result.get("accepted", 0)
+                _normalize_all_state["rows_rejected"] += result.get("rejected", 0)
+                _normalize_all_state["rows_duplicate"] += result.get("duplicate", 0)
+                _normalize_all_state["rows_unclear"] += result.get("unclear", 0)
+                _normalize_all_state["rows_errored"] += result.get("errored", 0)
+                await asyncio.sleep(0.1)
+        except Exception as e:
+            logger.exception(f"[normalize-all] error: {e}")
+            _normalize_all_state["last_error"] = str(e)[:200]
+        finally:
+            _normalize_all_state["running"] = False
+
+    asyncio.create_task(_run())
+    return {"ok": True, "status_url": "/admin/post-catalyst/normalize-all-status"}
+
+
+@router.get("/post-catalyst/normalize-all-status")
+async def normalize_all_status():
+    """Live progress for the background normalize-all task."""
+    return _normalize_all_state.copy()
 
 
 @router.post("/post-catalyst/edgar-backfill-debug-ticker")
