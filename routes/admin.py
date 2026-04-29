@@ -5736,7 +5736,7 @@ async def normalize_all_start():
         db = BiotechDatabase()
         try:
             while True:
-                result = normalize_pending_batch(db=db, batch_size=50)
+                result = await asyncio.to_thread(normalize_pending_batch, db=db, batch_size=50)
                 if result.get("scanned", 0) == 0:
                     break
                 _normalize_all_state["batches_done"] += 1
