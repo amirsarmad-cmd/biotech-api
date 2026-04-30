@@ -5785,6 +5785,137 @@ async def normalize_all_status():
     return _normalize_all_state.copy()
 
 
+# ============================================================
+# Price-window backfill — concurrent background workers
+# ============================================================
+
+import threading as _threading
+
+_backfill_price_state: dict = {
+    "running": False,
+    "events_processed": 0,
+    "events_created": 0,
+    "events_failed": 0,
+    "events_skipped": 0,
+    "started_at": None,
+    "last_error": None,
+}
+_backfill_price_in_progress: set = set()
+_backfill_price_lock = _threading.Lock()
+_BACKFILL_PRICE_WORKERS = 8
+
+
+def _claim_due_catalysts(limit: int, min_age_days: int):
+    """Atomically claim N due catalysts in the in-process set so concurrent
+    workers don't double-process the same rows. Returns list of catalyst dicts.
+    """
+    from datetime import date, timedelta
+    from services.database import BiotechDatabase
+    cutoff = (date.today() - timedelta(days=min_age_days)).isoformat()
+    with _backfill_price_lock:
+        excluded = list(_backfill_price_in_progress)
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT cu.id, cu.ticker, cu.catalyst_type, cu.catalyst_date,
+                       cu.drug_name, cu.indication, cu.confidence_score,
+                       cu.description, cu.phase
+                FROM catalyst_universe cu
+                LEFT JOIN post_catalyst_outcomes pco
+                    ON pco.catalyst_id = cu.id
+                    OR (pco.ticker = cu.ticker
+                        AND pco.catalyst_type = cu.catalyst_type
+                        AND pco.catalyst_date::text = cu.catalyst_date::text)
+                WHERE cu.catalyst_date::text <= %s
+                  AND cu.catalyst_date IS NOT NULL
+                  AND cu.catalyst_date::text != ''
+                  AND pco.id IS NULL
+                  AND (cu.status IS NULL OR cu.status NOT IN ('superseded', 'invalid'))
+                  AND cu.id != ALL(%s)
+                ORDER BY cu.catalyst_date ASC
+                LIMIT %s
+            """, (cutoff, excluded, limit))
+            rows = cur.fetchall()
+            cols = [d[0] for d in cur.description]
+        catalysts = [dict(zip(cols, r)) for r in rows]
+        for c in catalysts:
+            _backfill_price_in_progress.add(c["id"])
+    return catalysts
+
+
+def _release_catalysts(ids):
+    with _backfill_price_lock:
+        for i in ids:
+            _backfill_price_in_progress.discard(i)
+
+
+@router.post("/post-catalyst/backfill-price-start")
+async def backfill_price_start(min_age_days: int = 7, claim_size: int = 10):
+    """Start a background task that runs price-window backfill across many
+    concurrent workers. Each worker claims a small batch (claim_size) atomically
+    via an in-process exclusion set, processes them, then claims the next batch.
+    Returns immediately; poll /backfill-price-status for progress.
+    """
+    if _backfill_price_state["running"]:
+        raise HTTPException(409, "backfill-price already running")
+
+    import asyncio
+    from services.post_catalyst_tracker import backfill_one
+
+    _backfill_price_state.update({
+        "running": True,
+        "events_processed": 0,
+        "events_created": 0,
+        "events_failed": 0,
+        "events_skipped": 0,
+        "started_at": datetime.utcnow().isoformat(),
+        "last_error": None,
+    })
+
+    async def _worker():
+        while True:
+            catalysts = await asyncio.to_thread(_claim_due_catalysts, claim_size, min_age_days)
+            if not catalysts:
+                break
+            ids = [c["id"] for c in catalysts]
+            try:
+                for c in catalysts:
+                    result = await asyncio.to_thread(backfill_one, c)
+                    _backfill_price_state["events_processed"] += 1
+                    status = (result or {}).get("status")
+                    if status == "created":
+                        _backfill_price_state["events_created"] += 1
+                    elif status == "skipped":
+                        _backfill_price_state["events_skipped"] += 1
+                    else:
+                        _backfill_price_state["events_failed"] += 1
+            finally:
+                await asyncio.to_thread(_release_catalysts, ids)
+            await asyncio.sleep(0.05)
+
+    async def _run():
+        try:
+            await asyncio.gather(*[_worker() for _ in range(_BACKFILL_PRICE_WORKERS)])
+        except Exception as e:
+            logger.exception(f"[backfill-price-all] error: {e}")
+            _backfill_price_state["last_error"] = str(e)[:200]
+        finally:
+            _backfill_price_state["running"] = False
+
+    asyncio.create_task(_run())
+    return {"ok": True, "status_url": "/admin/post-catalyst/backfill-price-status",
+            "workers": _BACKFILL_PRICE_WORKERS}
+
+
+@router.get("/post-catalyst/backfill-price-status")
+async def backfill_price_status():
+    """Live progress for the background price-window backfill task."""
+    state = _backfill_price_state.copy()
+    state["in_progress_count"] = len(_backfill_price_in_progress)
+    return state
+
+
 @router.post("/post-catalyst/edgar-backfill-debug-ticker")
 async def edgar_backfill_debug_ticker(
     ticker: str,
