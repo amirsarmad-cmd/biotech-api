@@ -224,7 +224,7 @@ def find_due_catalysts(limit: int = 50, min_age_days: int = 7) -> List[Dict]:
                     ON pco.catalyst_id = cu.id
                     OR (pco.ticker = cu.ticker
                         AND pco.catalyst_type = cu.catalyst_type
-                        AND pco.catalyst_date = cu.catalyst_date::date)
+                        AND pco.catalyst_date::text = cu.catalyst_date)
                 WHERE cu.catalyst_date <= %s
                   AND cu.catalyst_date != ''
                   AND cu.catalyst_date IS NOT NULL
