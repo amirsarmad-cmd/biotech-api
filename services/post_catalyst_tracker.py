@@ -868,6 +868,13 @@ def backfill_one(catalyst: Dict) -> Dict:
     if not ticker or not cat_date:
         return {"status": "failed", "reason": "missing ticker or catalyst_date"}
 
+    # cu.catalyst_date is a date column — psycopg2 returns datetime.date objects
+    # for new edgar_backfill rows. Downstream price-window fetchers expect a
+    # YYYY-MM-DD string, so normalize here.
+    if hasattr(cat_date, "isoformat"):
+        cat_date = cat_date.isoformat()
+    catalyst["catalyst_date"] = cat_date
+
     # Skip earnings — too noisy for the inference heuristic
     if cat_type and "earnings" in cat_type.lower():
         return {"status": "skipped", "reason": "earnings catalyst skipped (too noisy for outcome inference)"}
