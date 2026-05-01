@@ -162,9 +162,11 @@ def label_catalyst_outcome(
         from services.llm_usage import record_usage
         record_usage(
             provider="google", model=LLM_MODEL,
-            tokens_in=tokens_in, tokens_out=tokens_out,
-            latency_sec=elapsed, status=status, error=err_msg,
-            context=f"outcome-labeler:{ticker}",
+            feature="outcome_labeler",
+            ticker=ticker,
+            tokens_input=tokens_in, tokens_output=tokens_out,
+            duration_ms=int(elapsed * 1000),
+            status=status, error_message=err_msg,
         )
     except Exception:
         pass

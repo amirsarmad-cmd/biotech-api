@@ -351,9 +351,11 @@ def extract_catalyst_via_gemini(
         record_usage(
             provider="google",
             model=os.getenv("EDGAR_LLM_MODEL", "gemini-2.5-flash"),
-            tokens_in=tokens_in, tokens_out=tokens_out,
-            latency_sec=elapsed, status=status, error=err_msg,
-            context=f"edgar-extract:{ticker}:{filing_date}",
+            feature="edgar_scraper",
+            ticker=ticker,
+            tokens_input=tokens_in, tokens_output=tokens_out,
+            duration_ms=int(elapsed * 1000),
+            status=status, error_message=err_msg,
         )
     except Exception:
         pass
