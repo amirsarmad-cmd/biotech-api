@@ -3685,8 +3685,18 @@ async def backfill_runup_and_classify_v2(max_rows: int = 100,
 
 
 @router.get("/post-catalyst/aggregate-v3")
-async def post_catalyst_aggregate_v3():
+async def post_catalyst_aggregate_v3(
+    min_outcome_confidence: float = 0.0,
+    catalyst_type: Optional[str] = None,
+):
     """Multi-tier scoreboard with the corrected math + 95% Wilson CIs.
+
+    Query params:
+      - min_outcome_confidence (0.0-1.0, default 0.0): only count events whose
+        outcome label confidence is at least this high. Use 0.7+ to exclude
+        noisy LLM-derived labels and see "clean" accuracy.
+      - catalyst_type: filter to a single catalyst type (e.g. "FDA Decision",
+        "Phase 2 Readout"). Useful for per-type tuning.
 
     HISTORICAL CONTEXT: The original 31.7% / 'inverse 68.3%' analysis that
     motivated V2 was caused by a SQL denominator bug — direction_correct_3d
@@ -3706,24 +3716,37 @@ async def post_catalyst_aggregate_v3():
     try:
         from services.database import BiotechDatabase
         db = BiotechDatabase()
+        # Build optional filter fragments. We ALWAYS pass them as separate
+        # parameters to avoid SQL injection; empty string when unused.
+        conf_filter = ""
+        type_filter = ""
+        params_extra = []
+        if min_outcome_confidence > 0.0:
+            conf_filter = " AND outcome_confidence >= %s "
+            params_extra.append(min_outcome_confidence)
+        if catalyst_type:
+            type_filter = " AND catalyst_type = %s "
+            params_extra.append(catalyst_type)
         with db.get_conn() as conn:
             cur = conn.cursor()
             # All-event metrics (legacy 30D-raw target)
-            cur.execute("""
+            cur.execute(f"""
                 SELECT COUNT(*),
                        COUNT(*) FILTER (WHERE direction_correct),
                        AVG(error_abs_pct)
                 FROM post_catalyst_outcomes
                 WHERE actual_move_pct_30d IS NOT NULL
                   AND predicted_move_pct IS NOT NULL
-            """)
+                  {conf_filter}
+                  {type_filter}
+            """, tuple(params_extra))
             r = cur.fetchone()
             total_all = r[0] or 0
             hits_all = r[1] or 0
             avg_err_30d = float(r[2]) if r[2] is not None else None
 
             # V1 tradeable (legacy LONG/SHORT) — denominator excludes deadband
-            cur.execute("""
+            cur.execute(f"""
                 SELECT
                     COUNT(*) FILTER (WHERE direction_correct_3d IS NOT NULL) AS judged,
                     COUNT(*) FILTER (WHERE direction_correct_3d) AS hits,
@@ -3731,7 +3754,9 @@ async def post_catalyst_aggregate_v3():
                     COUNT(*) AS total_in_bucket
                 FROM post_catalyst_outcomes
                 WHERE tradeable = TRUE
-            """)
+                  {conf_filter}
+                  {type_filter}
+            """, tuple(params_extra))
             r = cur.fetchone()
             v1_judged = r[0] or 0
             v1_total = r[3] or 0
@@ -3739,7 +3764,7 @@ async def post_catalyst_aggregate_v3():
             v1_err = float(r[2]) if r[2] is not None else None
 
             # V2 tradeable
-            cur.execute("""
+            cur.execute(f"""
                 SELECT
                     COUNT(*) FILTER (WHERE direction_correct_v2 IS NOT NULL) AS judged,
                     COUNT(*) FILTER (WHERE direction_correct_v2) AS hits,
@@ -3750,7 +3775,9 @@ async def post_catalyst_aggregate_v3():
                                     'SHORT_SELL_THE_NEWS',
                                     'SHORT_LOW_PROBABILITY',
                                     'LONG', 'SHORT')
-            """)
+                  {conf_filter}
+                  {type_filter}
+            """, tuple(params_extra))
             r = cur.fetchone()
             v2_judged = r[0] or 0
             v2_total = r[3] or 0
@@ -3758,7 +3785,7 @@ async def post_catalyst_aggregate_v3():
             v2_err = float(r[2]) if r[2] is not None else None
 
             # Per-bucket V2 breakdown
-            cur.execute("""
+            cur.execute(f"""
                 SELECT signal_v2,
                        COUNT(*) AS total,
                        COUNT(*) FILTER (WHERE direction_correct_v2 IS NOT NULL) AS judged,
@@ -3767,9 +3794,11 @@ async def post_catalyst_aggregate_v3():
                        AVG(error_abs_abnormal_3d_pct)
                 FROM post_catalyst_outcomes
                 WHERE signal_v2 IS NOT NULL
+                  {conf_filter}
+                  {type_filter}
                 GROUP BY signal_v2
                 ORDER BY signal_v2
-            """)
+            """, tuple(params_extra))
             buckets = []
             for row in cur.fetchall():
                 sig, total, judged, hits, avg_pi, avg_err = row
