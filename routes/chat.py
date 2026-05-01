@@ -92,8 +92,25 @@ Your job:
          "change_summary": "what to change (1-2 sentences)",
          "confidence": "high|medium|low"
        }}
-   Only include this block when you genuinely believe a change is
-   warranted. The user can click "implement" to have a developer apply it.
+
+   CRITICAL — read this before emitting a proposal:
+   - You do NOT have access to the codebase. You cannot see file names,
+     directory layout, function names, or imports. Do NOT invent file
+     paths. Generic guesses like `frontend/components/foo_bar.tsx` or
+     `backend/utils/calc.py` are almost always wrong and waste the
+     developer's time.
+   - Only emit IMPROVEMENT_PROPOSAL when (a) the user has named a
+     specific file or function in this conversation, OR (b) the context
+     block above contains an explicit module/function reference you can
+     cite verbatim. Otherwise, put the suggestion in prose: "A developer
+     should review the [methodology / threshold / weight] for X" — no
+     JSON block.
+   - Confidence "high" requires concrete evidence from the context
+     numbers contradicting the calculation. "I think the UI might be
+     wrong" is not evidence — it's speculation, and speculation is
+     never high confidence.
+   - When in doubt, omit the proposal. A missing proposal is fine. A
+     wrong proposal makes the user distrust the whole feature.
 
 Style:
 - Concise but rigorous. No hedging filler.
@@ -249,6 +266,31 @@ def _build_context(ticker: str) -> Dict[str, Any]:
     return ctx
 
 
+_REPO_ROOTS = [
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),  # biotech-api
+    os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "biotech-frontend",
+    ),
+]
+
+
+def _proposal_target_exists(target: str) -> bool:
+    """Check whether the file portion of a `path : symbol` target resolves
+    against either repo root. Models without codebase access tend to
+    hallucinate plausible-sounding paths; rejecting bad targets keeps
+    those proposals from reaching the user."""
+    if not target:
+        return False
+    file_part = target.split(":", 1)[0].strip().replace("\\", "/")
+    if not file_part:
+        return False
+    for root in _REPO_ROOTS:
+        if os.path.isfile(os.path.join(root, *file_part.split("/"))):
+            return True
+    return False
+
+
 def _parse_improvement_proposal(text: str) -> tuple[str, Optional[ImprovementProposal]]:
     """Extract IMPROVEMENT_PROPOSAL JSON if present. Returns (cleaned_text, proposal_or_None)."""
     marker = "IMPROVEMENT_PROPOSAL:"
@@ -267,10 +309,16 @@ def _parse_improvement_proposal(text: str) -> tuple[str, Optional[ImprovementPro
             json_part = json_part[4:].strip()
     try:
         parsed = json.loads(json_part)
-        return prose, ImprovementProposal(**parsed)
+        proposal = ImprovementProposal(**parsed)
     except Exception as e:
         logger.info(f"chat: failed to parse IMPROVEMENT_PROPOSAL JSON: {e}")
         return text, None
+    if not _proposal_target_exists(proposal.target):
+        logger.info(
+            f"chat: dropped proposal with non-existent target {proposal.target!r}"
+        )
+        return prose, None
+    return prose, proposal
 
 
 @router.post("/chat/explain", response_model=ChatResponse)
@@ -309,7 +357,7 @@ async def chat_explain(req: ChatRequest):
         import anthropic
         client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY", ""), timeout=60.0)
         msg = client.messages.create(
-            model="claude-sonnet-4-5",
+            model="claude-sonnet-4-6",
             max_tokens=1500,
             system=system,
             messages=messages,
@@ -321,7 +369,7 @@ async def chat_explain(req: ChatRequest):
         try:
             from services.llm_usage import record_call
             record_call(
-                provider="anthropic", model="claude-sonnet-4-5",
+                provider="anthropic", model="claude-sonnet-4-6",
                 feature="chat_explain", ticker=ticker, status="success",
                 tokens_input=getattr(msg.usage, "input_tokens", 0) if hasattr(msg, "usage") else 0,
                 tokens_output=getattr(msg.usage, "output_tokens", 0) if hasattr(msg, "usage") else 0,
@@ -333,7 +381,7 @@ async def chat_explain(req: ChatRequest):
             reply=prose,
             improvement_proposal=proposal,
             duration_ms=duration_ms,
-            model="claude-sonnet-4-5",
+            model="claude-sonnet-4-6",
         )
     except Exception as e:
         logger.exception("chat_explain failed")
