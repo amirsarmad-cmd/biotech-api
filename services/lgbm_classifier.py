@@ -114,6 +114,11 @@ def train_v3_lgbm(db, min_outcome_confidence: float = MIN_OUTCOME_CONFIDENCE) ->
         raise RuntimeError(f"Only {len(rows)} labeled rows — too few to train")
 
     df = pd.DataFrame(rows)
+    # Force numeric dtypes — psycopg2 returns Decimal objects which pandas
+    # infers as object, and lightgbm refuses object dtypes for numeric features.
+    for col in NUMERIC_FEATURES:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
     # Walk-forward split by catalyst_date order (already sorted ASC)
     n = len(df)
     n_test = max(20, int(n * TEST_FRACTION))
