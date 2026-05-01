@@ -5001,6 +5001,125 @@ async def label_outcomes_batch(max_rows: int = 20, only_new: bool = True):
         raise HTTPException(500, f"label_outcomes_batch error: {e}")
 
 
+# ============================================================
+# Background labeler — concurrent workers
+# ============================================================
+
+_label_state: dict = {
+    "running": False,
+    "labeled": 0,
+    "errors": 0,
+    "started_at": None,
+    "last_error": None,
+    "estimated_cost_usd": 0.0,
+    "class_distribution": {},
+}
+_label_in_progress: set = set()
+_label_lock = _threading.Lock()
+_LABEL_WORKERS = 6
+
+
+def _claim_unlabeled(limit: int) -> list:
+    """Atomically grab N unlabeled outcome IDs, marking them in-process."""
+    from services.database import BiotechDatabase
+    with _label_lock:
+        excluded = list(_label_in_progress)
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT id FROM post_catalyst_outcomes
+                WHERE outcome_labeled_at IS NULL
+                  AND catalyst_date IS NOT NULL
+                  AND id != ALL(%s)
+                ORDER BY catalyst_date DESC
+                LIMIT %s
+            """, (excluded, limit))
+            ids = [r[0] for r in cur.fetchall()]
+        for i in ids:
+            _label_in_progress.add(i)
+    return ids
+
+
+def _release_label_ids(ids):
+    with _label_lock:
+        for i in ids:
+            _label_in_progress.discard(i)
+
+
+@router.post("/post-catalyst/label-all-start")
+async def label_all_start(claim_size: int = 5):
+    """Start a background task that labels all unlabeled outcomes via Gemini.
+    Spawns _LABEL_WORKERS concurrent workers; each claims claim_size IDs at a time.
+    Cost ~$0.0003/event.
+    """
+    if _label_state["running"]:
+        raise HTTPException(409, "label-all already running")
+
+    import asyncio
+    from services.database import BiotechDatabase
+    from services.outcome_labeler import label_outcome_for_db_row
+
+    _label_state.update({
+        "running": True,
+        "labeled": 0,
+        "errors": 0,
+        "started_at": datetime.utcnow().isoformat(),
+        "last_error": None,
+        "estimated_cost_usd": 0.0,
+        "class_distribution": {},
+    })
+
+    async def _worker():
+        db = BiotechDatabase()
+        while True:
+            ids = await asyncio.to_thread(_claim_unlabeled, claim_size)
+            if not ids:
+                break
+            try:
+                for outcome_id in ids:
+                    try:
+                        labeled = await asyncio.to_thread(label_outcome_for_db_row, db, outcome_id)
+                        if labeled:
+                            _label_state["labeled"] += 1
+                            _label_state["estimated_cost_usd"] = round(_label_state["labeled"] * 0.0003, 4)
+                            cls = labeled.get("outcome_class", "UNKNOWN")
+                            _label_state["class_distribution"][cls] = _label_state["class_distribution"].get(cls, 0) + 1
+                        else:
+                            _label_state["errors"] += 1
+                    except Exception as e:
+                        _label_state["errors"] += 1
+                        logger.warning(f"label-all row {outcome_id}: {e}")
+            finally:
+                await asyncio.to_thread(_release_label_ids, ids)
+            await asyncio.sleep(0.05)
+
+    async def _run():
+        try:
+            await asyncio.gather(*[_worker() for _ in range(_LABEL_WORKERS)])
+        except Exception as e:
+            logger.exception(f"[label-all] error: {e}")
+            _label_state["last_error"] = str(e)[:200]
+        finally:
+            _label_state["running"] = False
+
+    asyncio.create_task(_run())
+    return {
+        "ok": True,
+        "status_url": "/admin/post-catalyst/label-all-status",
+        "workers": _LABEL_WORKERS,
+        "claim_size": claim_size,
+    }
+
+
+@router.get("/post-catalyst/label-all-status")
+async def label_all_status():
+    """Live progress for background label-all task."""
+    state = _label_state.copy()
+    state["in_progress_count"] = len(_label_in_progress)
+    return state
+
+
 @router.get("/post-catalyst/outcome-label-stats")
 async def outcome_label_stats():
     """Coverage + class distribution of labeled outcomes."""
