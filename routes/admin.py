@@ -5815,6 +5815,61 @@ async def normalize_all_status():
 
 
 # ============================================================
+# V3 LightGBM classifier — train + predict + info
+# ============================================================
+
+@router.post("/post-catalyst/train-v3-model")
+async def train_v3_model(
+    min_outcome_confidence: float = 0.7,
+    notes: str = "",
+):
+    """Train a fresh V3 LightGBM model on currently-labeled events.
+    Returns metrics; persists model to lgbm_models table (marks prior active=false).
+
+    Walk-forward split: oldest 80% train, newest 20% test (catches era overfit).
+    """
+    try:
+        from services.database import BiotechDatabase
+        from services.lgbm_classifier import train_v3_lgbm, save_model_to_db
+        db = BiotechDatabase()
+        version = f"v3-lgbm-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
+        result = train_v3_lgbm(db=db, min_outcome_confidence=min_outcome_confidence)
+        new_id = save_model_to_db(db=db, training_result=result, model_version=version, notes=notes)
+        return {
+            "ok": True,
+            "model_id": new_id,
+            "model_version": version,
+            "train_n": result["train_n"],
+            "test_n": result["test_n"],
+            "train_accuracy": round(result["train_accuracy"], 4),
+            "test_accuracy": round(result["test_accuracy"], 4),
+            "test_ci_lower_pct": result["test_ci_lower_pct"],
+            "test_ci_upper_pct": result["test_ci_upper_pct"],
+            "high_conf_subset": result["metrics_json"].get("high_conf_subset"),
+            "feature_importance": result["metrics_json"].get("feature_importance"),
+        }
+    except Exception as e:
+        logger.exception("train_v3_model failed")
+        raise HTTPException(500, f"train_v3_model error: {e}")
+
+
+@router.get("/post-catalyst/v3-model-info")
+async def v3_model_info():
+    """Return the active V3 model metadata. Null if no model has been trained."""
+    try:
+        from services.database import BiotechDatabase
+        from services.lgbm_classifier import load_active_model
+        db = BiotechDatabase()
+        info = load_active_model(db)
+        if info is None:
+            return {"active_model": None, "note": "No V3 model trained yet. POST /train-v3-model to create one."}
+        return {"active_model": info}
+    except Exception as e:
+        logger.exception("v3_model_info failed")
+        raise HTTPException(500, f"v3_model_info error: {e}")
+
+
+# ============================================================
 # Price-window backfill — concurrent background workers
 # ============================================================
 
