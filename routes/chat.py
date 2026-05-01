@@ -78,6 +78,30 @@ Your job:
    immediate binary catalyst is past; the long-term cash flow story
    (still ahead) is what makes the rNPV upside.
 
+   The "System-wide backtest scoreboard" card on the page surfaces how
+   well the system has predicted past catalysts. It is in the context
+   bundle as:
+     - `backtest_scoreboard_v2` — three-tier breakdown:
+         all_events (raw 30D direction across every backfilled catalyst,
+         ~50% noise floor) vs tradeable_events (3D abnormal-vs-XBI on
+         the high-confidence subset, the actual model edge) plus
+         coverage (% of all events that became tradeable signals).
+         The actionable target is tradeable accuracy ≥ 65-70% with
+         coverage 25-40%.
+     - `backtest_scoreboard_v3` — V1 (probability-bias only) vs V2
+         (priced-in-aware: LONG_UNDERPRICED_POSITIVE / SHORT_SELL_THE_NEWS
+         / SHORT_LOW_PROBABILITY) head-to-head with 95% Wilson CIs,
+         and per-bucket accuracy. In-sample. `production_ready=True`
+         on a bucket means n_judged ≥ 50 AND CI lower bound > 55%.
+     - `backtest_oos` — out-of-sample: prediction snapshots frozen
+         before outcomes were known, scored against actual abnormal_3d
+         once they become judgeable. This is the unbiased number; if
+         days_of_oos_data is small, treat it as preliminary.
+     - `post_catalyst_history` — this ticker's last 5 catalysts with
+         predicted vs actual moves and the inferred outcome label.
+   Use these numbers verbatim if asked. Do NOT say "I don't have data
+   on the backtest scoreboard" when these fields are populated.
+
 4. **Evaluate critiques rigorously.** If the user says "your run-up axis
    threshold is too low" or "you're missing X factor", actually think
    about whether they're right. Don't agree just to be agreeable.
@@ -129,12 +153,14 @@ Today's date: {today}
 """
 
 
-def _build_context(ticker: str) -> Dict[str, Any]:
+async def _build_context(ticker: str) -> Dict[str, Any]:
     """Pull the full data bundle for a ticker.
 
     Mirrors what the FE displays. Includes rNPV (V2), setup_quality,
-    materiality, risks, options_implied, fundamentals — everything the
-    user can see on the detail page.
+    materiality, risks, options_implied, fundamentals, plus the per-ticker
+    post-catalyst history and the system-wide backtest scoreboard
+    (aggregate v2, aggregate v3 with V1/V2 priced-in CIs, OOS validation)
+    that the user can see on the detail page.
     """
     from services.database import BiotechDatabase
     ctx: Dict[str, Any] = {"ticker": ticker}
@@ -263,6 +289,142 @@ def _build_context(ticker: str) -> Dict[str, Any]:
     except Exception as e:
         logger.info(f"chat _build_context setup_quality failed for {ticker}: {e}")
 
+    # Per-ticker post-catalyst history — table the user sees at the
+    # bottom of "Post-Catalyst History". Cap at 5 rows; older ones rarely
+    # matter for the conversation.
+    try:
+        from services.post_catalyst_tracker import get_outcomes_for_ticker
+        rows = get_outcomes_for_ticker(ticker, limit=5) or []
+        if rows:
+            ctx["post_catalyst_history"] = [
+                {
+                    "catalyst_date": (r.get("catalyst_date").isoformat()
+                                      if hasattr(r.get("catalyst_date"), "isoformat")
+                                      else r.get("catalyst_date")),
+                    "catalyst_type": r.get("catalyst_type"),
+                    "drug_name": r.get("drug_name"),
+                    "predicted_move_pct": (float(r["predicted_move_pct"])
+                                           if r.get("predicted_move_pct") is not None else None),
+                    "actual_move_pct_1d": (float(r["actual_move_pct_1d"])
+                                           if r.get("actual_move_pct_1d") is not None else None),
+                    "actual_move_pct_30d": (float(r["actual_move_pct_30d"])
+                                            if r.get("actual_move_pct_30d") is not None else None),
+                    "outcome": r.get("outcome"),
+                    "direction_correct": r.get("direction_correct"),
+                    "error_abs_pct": (float(r["error_abs_pct"])
+                                      if r.get("error_abs_pct") is not None else None),
+                }
+                for r in rows
+            ]
+    except Exception as e:
+        logger.info(f"chat _build_context post_catalyst_history failed for {ticker}: {e}")
+
+    # System-wide backtest scoreboard — mirrors the ThreeTierScoreboard
+    # + V2 priced-in classifier + OOS cards on the page. Without this
+    # the AskAI chat says "I don't have any data about a System-wide
+    # backtest scoreboard" — the data exists, the chat just couldn't see it.
+    # Slim each section so we stay under the 12 KB context ceiling.
+    try:
+        from routes.admin import (
+            post_catalyst_aggregate_v2 as _agg_v2_handler,
+            post_catalyst_aggregate_v3 as _agg_v3_handler,
+            oos_aggregate as _oos_handler,
+        )
+        try:
+            agg_v2 = await _agg_v2_handler()
+            if agg_v2:
+                all_e = agg_v2.get("all_events") or {}
+                tr_e = agg_v2.get("tradeable_events") or {}
+                ctx["backtest_scoreboard_v2"] = {
+                    "all_events": {
+                        "count": all_e.get("count"),
+                        "direction_accuracy_pct": all_e.get("direction_accuracy_pct"),
+                        "_target": all_e.get("_target"),
+                    },
+                    "tradeable_events": {
+                        "count": tr_e.get("count"),
+                        "direction_accuracy_pct": tr_e.get("direction_accuracy_pct"),
+                        "coverage_pct": tr_e.get("coverage_pct"),
+                        "_target": tr_e.get("_target"),
+                    },
+                    "interpretation": agg_v2.get("interpretation"),
+                }
+        except Exception as e:
+            logger.info(f"chat _build_context aggregate_v2 failed: {e}")
+
+        try:
+            agg_v3 = await _agg_v3_handler(min_outcome_confidence=0.7)
+            if agg_v3:
+                v1 = agg_v3.get("tradeable_v1") or {}
+                v2 = agg_v3.get("tradeable_v2") or {}
+                tradeable_signals = (
+                    "LONG_UNDERPRICED_POSITIVE",
+                    "SHORT_SELL_THE_NEWS",
+                    "SHORT_LOW_PROBABILITY",
+                    "LONG",
+                    "SHORT",
+                )
+                ctx["backtest_scoreboard_v3"] = {
+                    "tradeable_v1": {
+                        "judged": v1.get("judged"),
+                        "direction_accuracy_pct": v1.get("direction_accuracy_pct"),
+                        "ci_95_pct": v1.get("ci_95_pct"),
+                        "coverage_pct": v1.get("coverage_pct"),
+                    },
+                    "tradeable_v2": {
+                        "judged": v2.get("judged"),
+                        "direction_accuracy_pct": v2.get("direction_accuracy_pct"),
+                        "ci_95_pct": v2.get("ci_95_pct"),
+                        "coverage_pct": v2.get("coverage_pct"),
+                    },
+                    "v2_buckets": [
+                        {
+                            "signal": b.get("signal"),
+                            "count": b.get("count"),
+                            "judged": b.get("judged"),
+                            "direction_accuracy_pct": b.get("direction_accuracy_pct"),
+                            "ci_95_pct": b.get("ci_95_pct"),
+                            "production_ready": b.get("production_ready"),
+                        }
+                        for b in (agg_v3.get("v2_buckets") or [])
+                        if b.get("signal") in tradeable_signals
+                    ],
+                    "interpretation": agg_v3.get("interpretation"),
+                }
+        except Exception as e:
+            logger.info(f"chat _build_context aggregate_v3 failed: {e}")
+
+        try:
+            oos = await _oos_handler(signal_version="v2")
+            if oos:
+                ctx["backtest_oos"] = {
+                    "tradeable_total": oos.get("tradeable_total"),
+                    "evaluated": oos.get("evaluated"),
+                    "judged": oos.get("judged"),
+                    "direction_accuracy_pct": oos.get("direction_accuracy_pct"),
+                    "ci_95_pct": oos.get("ci_95_pct"),
+                    "days_of_oos_data": oos.get("days_of_oos_data"),
+                    "buckets": [
+                        {
+                            "signal": b.get("signal"),
+                            "judged": b.get("judged"),
+                            "direction_accuracy_pct": b.get("direction_accuracy_pct"),
+                        }
+                        for b in (oos.get("buckets") or [])
+                        if b.get("signal") in (
+                            "LONG_UNDERPRICED_POSITIVE",
+                            "SHORT_SELL_THE_NEWS",
+                            "SHORT_LOW_PROBABILITY",
+                            "LONG",
+                            "SHORT",
+                        )
+                    ],
+                }
+        except Exception as e:
+            logger.info(f"chat _build_context oos_aggregate failed: {e}")
+    except Exception as e:
+        logger.info(f"chat _build_context backtest scoreboard import failed: {e}")
+
     return ctx
 
 
@@ -328,7 +490,7 @@ async def chat_explain(req: ChatRequest):
     ticker = req.ticker.upper().strip()
 
     # Build context if not provided
-    ctx = req.context if req.context else _build_context(ticker)
+    ctx = req.context if req.context else await _build_context(ticker)
 
     # Prune context to keep system prompt under control
     context_json = json.dumps(ctx, default=str, indent=2)
