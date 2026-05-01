@@ -5005,6 +5005,8 @@ async def label_outcomes_batch(max_rows: int = 20, only_new: bool = True):
 # Background labeler — concurrent workers
 # ============================================================
 
+import threading as _threading  # noqa: E402 — keep near use site
+
 _label_state: dict = {
     "running": False,
     "labeled": 0,
