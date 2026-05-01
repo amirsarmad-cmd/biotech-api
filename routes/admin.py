@@ -5081,7 +5081,9 @@ async def label_all_start(claim_size: int = 5):
             try:
                 for outcome_id in ids:
                     try:
-                        labeled = await asyncio.to_thread(label_outcome_for_db_row, db, outcome_id)
+                        labeled = await asyncio.to_thread(
+                            lambda oid=outcome_id: label_outcome_for_db_row(db=db, outcome_id=oid)
+                        )
                         if labeled:
                             _label_state["labeled"] += 1
                             _label_state["estimated_cost_usd"] = round(_label_state["labeled"] * 0.0003, 4)
