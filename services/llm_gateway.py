@@ -49,17 +49,21 @@ _CIRCUIT_WINDOW = 100
 _CIRCUIT_MIN_SUCCESS = 5
 _CIRCUIT_COOLDOWN_SECONDS = 300
 
-# Default models per (provider, capability). Override per call via
-# model_overrides if needed.
-_DEFAULT_MODELS: Dict[Tuple[str, str], str] = {
-    ("anthropic", "text_json"):     "claude-sonnet-4-6",
-    ("anthropic", "text_freeform"): "claude-sonnet-4-6",
-    ("openai",    "text_json"):     "gpt-4o",
-    ("openai",    "text_freeform"): "gpt-4o",
-    ("openai",    "embeddings"):    "text-embedding-3-small",
-    ("google",    "text_json"):     "gemini-2.5-flash",
-    ("google",    "text_freeform"): "gemini-2.5-flash",
-    ("google",    "grounded_search"): "gemini-2.5-flash",
+# Default model fallback chains per (provider, capability). Order
+# matters — the first model is tried first; on rate-limit / quota /
+# timeout errors the gateway rotates to the next model on the same
+# key (Pro and Flash share keys but have separate per-minute RPM
+# buckets, so this absorbs bursts that would 429 a single model).
+# Override per call via model_overrides=str | List[str].
+_DEFAULT_MODEL_CHAINS: Dict[Tuple[str, str], List[str]] = {
+    ("anthropic", "text_json"):       ["claude-sonnet-4-6"],
+    ("anthropic", "text_freeform"):   ["claude-sonnet-4-6"],
+    ("openai",    "text_json"):       ["gpt-4o"],
+    ("openai",    "text_freeform"):   ["gpt-4o"],
+    ("openai",    "embeddings"):      ["text-embedding-3-small"],
+    ("google",    "text_json"):       ["gemini-2.5-flash", "gemini-2.5-pro"],
+    ("google",    "text_freeform"):   ["gemini-2.5-flash", "gemini-2.5-pro"],
+    ("google",    "grounded_search"): ["gemini-2.5-flash", "gemini-2.5-pro"],
 }
 
 # Default fallback chains per capability. Order matters — first
@@ -177,6 +181,11 @@ class ProviderPool:
                 "last_error_kind": None,
                 "last_error_text": None,
                 "cooling_until": None,
+                # Per-(key, model) cooldown for the Flash→Pro fallback
+                # pattern. Flash being capped on key_1 should NOT
+                # block Pro on key_1, since they have separate RPM
+                # buckets even though they share the same API key.
+                "model_cooling": {},   # model_name -> cooling_until_ts
                 "success_count": 0,
                 "error_count": 0,
             })
@@ -185,25 +194,46 @@ class ProviderPool:
     def size(self) -> int:
         return len(self._pool)
 
-    def select(self) -> Tuple[Optional[str], Optional[str]]:
-        """Return (label, api_key) for the LRU non-cooling key, or
-        (None, None) if every key is cooling."""
+    def select(
+        self, model_chain: Optional[List[str]] = None,
+    ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        """Return (label, api_key, model) for the LRU key whose first
+        non-cooling model in `model_chain` is available. Returns all
+        None if every (key, model) combination is cooling.
+
+        Backward-compatible: if model_chain is None or empty, the
+        returned model is None and the caller is responsible for
+        passing one to the adapter.
+        """
         with self._lock:
             if not self._pool:
-                return None, None
+                return None, None, None
             now = time.time()
-            available = [
-                (label, k) for label, k in self._pool
-                if (self._state[label]["cooling_until"] or 0) <= now
-            ]
-            if not available:
-                return None, None
-            available.sort(key=lambda lk: self._state[lk[0]]["last_used_at"] or 0)
-            label, key = available[0]
+            chain = model_chain or [None]
+            candidates: List[Tuple[str, str, Optional[str], float]] = []
+            for label, key in self._pool:
+                state = self._state[label]
+                # Skip key if its overall cooldown is set (legacy)
+                if (state.get("cooling_until") or 0) > now:
+                    continue
+                # First non-cooling model in chain wins for this key
+                for model in chain:
+                    cool_ts = (
+                        (state["model_cooling"].get(model) or 0)
+                        if model is not None else 0
+                    )
+                    if cool_ts <= now:
+                        candidates.append((label, key, model,
+                                           state["last_used_at"] or 0))
+                        break
+            if not candidates:
+                return None, None, None
+            candidates.sort(key=lambda c: c[3])
+            label, key, model, _ = candidates[0]
             self._state[label]["last_used_at"] = now
-            return label, key
+            return label, key, model
 
-    def mark_success(self, label: str) -> None:
+    def mark_success(self, label: str, model: Optional[str] = None) -> None:
         with self._lock:
             s = self._state.get(label)
             if not s:
@@ -212,8 +242,14 @@ class ProviderPool:
             s["last_success_at"] = time.time()
             if s.get("cooling_until"):
                 s["cooling_until"] = None  # key recovered
+            if model is not None:
+                # Clear per-(key, model) cooldown on success
+                s["model_cooling"].pop(model, None)
 
-    def mark_failed(self, label: str, kind: str, err_text: str) -> None:
+    def mark_failed(
+        self, label: str, kind: str, err_text: str,
+        model: Optional[str] = None,
+    ) -> None:
         with self._lock:
             s = self._state.get(label)
             if not s:
@@ -223,7 +259,13 @@ class ProviderPool:
             s["last_error_kind"] = kind
             s["last_error_text"] = (err_text or "")[:200]
             if kind in ("rate_limit", "quota", "timeout", "auth"):
-                s["cooling_until"] = time.time() + _KEY_COOLDOWN_SECONDS
+                if model is not None:
+                    # Cool only this (key, model) pair so the next
+                    # model in the chain can still try this key.
+                    s["model_cooling"][model] = time.time() + _KEY_COOLDOWN_SECONDS
+                else:
+                    # Legacy callers without a model: cool the whole key
+                    s["cooling_until"] = time.time() + _KEY_COOLDOWN_SECONDS
 
     def status(self) -> Dict[str, Any]:
         with self._lock:
@@ -251,6 +293,11 @@ class ProviderPool:
                             round(s["cooling_until"] - now, 1)
                             if (s.get("cooling_until") or 0) > now else 0
                         ),
+                        "model_cooling": {
+                            m: round(ts - now, 1)
+                            for m, ts in (s.get("model_cooling") or {}).items()
+                            if ts > now
+                        },
                     }
                     for s in (self._state[label] for label, _ in self._pool)
                 ],
@@ -507,18 +554,24 @@ def llm_call(
     system: Optional[str] = None,
     ticker: Optional[str] = None,
     fallback_chain: Optional[List[str]] = None,
-    model_overrides: Optional[Dict[str, str]] = None,
+    model_overrides: Optional[Dict[str, Any]] = None,  # {provider: str | List[str]}
     timeout_s: float = 50.0,
-    max_attempts_per_provider: int = 2,
+    max_attempts_per_provider: int = 4,
     max_tokens: int = 1500,
     temperature: float = 0.3,
 ) -> LLMResult:
-    """Universal LLM call. Rotates keys within a provider, falls
-    through to the next provider on persistent failure, records
-    every attempt to llm_usage.
+    """Universal LLM call. Within each provider, rotates keys AND
+    iterates through the configured model chain (e.g. Flash → Pro
+    for Google) so a per-minute rate-cap on one model doesn't fail
+    the call. Falls through to the next provider only after every
+    (key, model) combination is exhausted. Records every attempt
+    to llm_usage.
 
-    capability: one of "text_json", "text_freeform", "grounded_search".
-    feature:    short tag for telemetry, e.g. "chat_explain", "npv_research".
+    capability: "text_json", "text_freeform", or "grounded_search".
+    feature:    short tag for telemetry.
+    model_overrides: per-provider override of the default model
+                    chain — accepts either a single model string or
+                    a List[str] for explicit chain control.
     """
     if capability not in ("text_json", "text_freeform", "grounded_search"):
         raise ValueError(f"unknown capability: {capability}")
@@ -534,36 +587,44 @@ def llm_call(
             continue
         if _is_provider_paused(provider):
             attempts.append({
-                "provider": provider, "key_label": None,
+                "provider": provider, "key_label": None, "model": None,
                 "kind": "circuit_paused", "text": "provider on circuit-breaker cooldown",
             })
             continue
         pool = _get_pool(provider)
         if pool.size == 0:
             attempts.append({
-                "provider": provider, "key_label": None,
+                "provider": provider, "key_label": None, "model": None,
                 "kind": "no_keys", "text": f"no {provider} keys configured",
             })
             continue
-        model = overrides.get(provider) or _DEFAULT_MODELS.get((provider, capability))
-        if not model:
+
+        # Resolve model chain for this provider
+        override = overrides.get(provider)
+        if isinstance(override, list):
+            model_chain = override
+        elif isinstance(override, str):
+            model_chain = [override]
+        else:
+            model_chain = _DEFAULT_MODEL_CHAINS.get((provider, capability), [])
+        if not model_chain:
             attempts.append({
-                "provider": provider, "key_label": None,
+                "provider": provider, "key_label": None, "model": None,
                 "kind": "no_model",
-                "text": f"no default model for ({provider}, {capability})",
+                "text": f"no default model chain for ({provider}, {capability})",
             })
             continue
 
-        # Try keys within this provider until one succeeds, all are
-        # cooling, or we hit max_attempts_per_provider.
+        # Try (key, model) combinations within this provider until one
+        # succeeds, all are cooling, or we hit max_attempts_per_provider.
         provider_tries = 0
         while provider_tries < max_attempts_per_provider:
-            label, api_key = pool.select()
+            label, api_key, model = pool.select(model_chain)
             if not api_key:
                 attempts.append({
-                    "provider": provider, "key_label": None,
+                    "provider": provider, "key_label": None, "model": None,
                     "kind": "all_keys_cooling",
-                    "text": f"all {provider} keys on cooldown",
+                    "text": f"all ({provider}, model) combinations on cooldown",
                 })
                 break
             provider_tries += 1
@@ -591,15 +652,11 @@ def llm_call(
 
                 duration_ms = int((time.time() - t0) * 1000)
 
-                # text_json: also try to parse, but a parse failure
-                # is NOT a key/provider failure — the model said
-                # something, just not valid JSON. Return as-is and
-                # let the caller decide.
                 parsed: Optional[dict] = None
                 if capability == "text_json":
                     parsed = _parse_json(text)
 
-                pool.mark_success(label)
+                pool.mark_success(label, model=model)
                 _record_provider_attempt(provider, True)
                 _record_usage(
                     provider=provider, model=model, feature=feature, ticker=ticker,
@@ -617,7 +674,7 @@ def llm_call(
                 err_text = str(e)[:300]
                 kind = classify_error(err_text)
                 duration_ms = int((time.time() - t0) * 1000)
-                pool.mark_failed(label, kind, err_text)
+                pool.mark_failed(label, kind, err_text, model=model)
                 _record_provider_attempt(provider, False)
                 _record_usage(
                     provider=provider, model=model, feature=feature, ticker=ticker,
@@ -625,21 +682,23 @@ def llm_call(
                     duration_ms=duration_ms, err=err_text,
                 )
                 attempts.append({
-                    "provider": provider, "key_label": label,
+                    "provider": provider, "key_label": label, "model": model,
                     "kind": kind, "text": err_text,
                 })
                 logger.info(
                     f"[llm_gateway] {feature} provider={provider} key={label} "
-                    f"{kind}: {err_text[:120]}"
+                    f"model={model} {kind}: {err_text[:120]}"
                 )
                 # If the error is non-key-specific (e.g. "other" — bad
-                # request shape), don't waste more keys; fall through
-                # to next provider.
+                # request shape), don't waste more keys/models on this
+                # provider; fall through to next provider.
                 if kind == "other":
                     break
-                # Else loop to try next key within this provider.
+                # Else loop and let pool.select() pick the next
+                # (key, model) combination — this is what gives us the
+                # Flash→Pro fallback within the same key.
 
-        # Done with this provider's key budget; loop to next provider in chain.
+        # Done with this provider's budget; loop to next provider.
 
     raise LLMAllProvidersFailed(attempts)
 
@@ -671,22 +730,35 @@ def llm_embeddings(
             attempts.append({"provider": provider, "key_label": None,
                              "kind": "no_keys", "text": f"no {provider} keys"})
             continue
-        model = overrides.get(provider) or _DEFAULT_MODELS[(provider, "embeddings")]
+        # Embeddings model chain (single-element today; structurally
+        # ready for future fallback like text-embedding-3-large).
+        override = overrides.get(provider)
+        if isinstance(override, list):
+            model_chain = override
+        elif isinstance(override, str):
+            model_chain = [override]
+        else:
+            model_chain = _DEFAULT_MODEL_CHAINS.get((provider, "embeddings"), [])
+        if not model_chain:
+            attempts.append({"provider": provider, "key_label": None,
+                             "model": None, "kind": "no_model",
+                             "text": "no embeddings model configured"})
+            continue
 
         provider_tries = 0
         while provider_tries < max_attempts_per_provider:
-            label, api_key = pool.select()
+            label, api_key, model = pool.select(model_chain)
             if not api_key:
                 attempts.append({"provider": provider, "key_label": None,
-                                 "kind": "all_keys_cooling",
-                                 "text": "all keys cooling"})
+                                 "model": None, "kind": "all_keys_cooling",
+                                 "text": "all (key, model) combinations cooling"})
                 break
             provider_tries += 1
             t0 = time.time()
             try:
                 vectors, tin = _call_openai_embeddings(api_key, model, texts, timeout_s)
                 duration_ms = int((time.time() - t0) * 1000)
-                pool.mark_success(label)
+                pool.mark_success(label, model=model)
                 _record_provider_attempt(provider, True)
                 _record_usage(
                     provider=provider, model=model, feature=feature, ticker=None,
@@ -701,7 +773,7 @@ def llm_embeddings(
                 err_text = str(e)[:300]
                 kind = classify_error(err_text)
                 duration_ms = int((time.time() - t0) * 1000)
-                pool.mark_failed(label, kind, err_text)
+                pool.mark_failed(label, kind, err_text, model=model)
                 _record_provider_attempt(provider, False)
                 _record_usage(
                     provider=provider, model=model, feature=feature, ticker=None,
@@ -709,7 +781,7 @@ def llm_embeddings(
                     duration_ms=duration_ms, err=err_text,
                 )
                 attempts.append({"provider": provider, "key_label": label,
-                                 "kind": kind, "text": err_text})
+                                 "model": model, "kind": kind, "text": err_text})
                 if kind == "other":
                     break
 
@@ -718,7 +790,8 @@ def llm_embeddings(
 
 def get_status() -> Dict[str, Any]:
     """One-shot snapshot of the gateway state — every provider, every
-    key, circuit-breaker state. Surfaced via /admin/llm/status."""
+    key, per-(key, model) cooldowns, circuit-breaker state. Surfaced
+    via /admin/llm/status."""
     out: Dict[str, Any] = {
         "config": {
             "key_cooldown_seconds": _KEY_COOLDOWN_SECONDS,
@@ -728,7 +801,9 @@ def get_status() -> Dict[str, Any]:
             "circuit_cooldown_seconds": _CIRCUIT_COOLDOWN_SECONDS,
         },
         "default_chains": _DEFAULT_CHAINS,
-        "default_models": {f"{p}:{c}": m for (p, c), m in _DEFAULT_MODELS.items()},
+        "default_model_chains": {
+            f"{p}:{c}": chain for (p, c), chain in _DEFAULT_MODEL_CHAINS.items()
+        },
         "providers": {},
     }
     for provider in _ENV_PREFIX:

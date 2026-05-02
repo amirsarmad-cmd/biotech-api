@@ -34,16 +34,28 @@ logger = logging.getLogger(__name__)
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 LLM_MODEL = os.getenv("OUTCOME_LABELER_MODEL", "gemini-2.5-flash")
 
+# Model fallback chain — Flash first, Pro on Flash rate-limit.
+# Pro has its own per-minute RPM bucket on the same key so it absorbs
+# bursts that would 429 a single model. Cooldown is per-(key, model)
+# so cooling Flash on key_1 does NOT lock Pro on key_1. Override
+# whole chain with OUTCOME_LABELER_MODEL_CHAIN env (comma-separated).
+def _build_model_chain() -> List[str]:
+    raw = (os.getenv("OUTCOME_LABELER_MODEL_CHAIN") or "").strip()
+    if raw:
+        return [m.strip() for m in raw.split(",") if m.strip()]
+    return [LLM_MODEL, "gemini-2.5-pro"]
+
+MODEL_CHAIN: List[str] = _build_model_chain()
+
 
 # ────────────────────────────────────────────────────────────
-# Multi-key rotation
+# Multi-key + multi-model rotation
 # ────────────────────────────────────────────────────────────
-# Reads GOOGLE_API_KEY plus GOOGLE_API_KEY_1..N from env. Picks the
-# least-recently-used non-cooling key for each call. On rate-limit /
-# quota / timeout errors, the failing key is put on a 5-minute
-# cooldown and the call is retried against the next key. If every
-# key is cooling, the labeler returns None and the worker pool's
-# circuit breaker takes over (see routes/admin.py _label_state).
+# Reads GOOGLE_API_KEY plus GOOGLE_API_KEY_1..N from env. Each call
+# picks the LRU (key, model) combination whose cooldown has expired —
+# Flash is preferred, Pro is used when Flash is rate-capped on a key.
+# Cooldowns are per-(key, model) so the bigger/slower Pro doesn't get
+# locked when only Flash hits a per-minute RPM ceiling.
 _KEY_COOLDOWN_SECONDS = 300
 _MAX_KEY_SLOTS = 10  # supports GOOGLE_API_KEY_1..GOOGLE_API_KEY_10
 
@@ -87,30 +99,45 @@ def _ensure_key_pool() -> None:
                 "last_error_kind": None,
                 "last_error_text": None,
                 "cooling_until": None,
+                # Per-(key, model) cooldown — see MODEL_CHAIN comment.
+                "model_cooling": {},   # model_name -> cooling_until_ts
                 "success_count": 0,
                 "error_count": 0,
             })
 
 
-def _select_key() -> Tuple[Optional[str], Optional[str]]:
-    """Return (label, key) for the LRU non-cooling key, or (None, None)
-    if every key is on cooldown."""
+def _select_key_and_model() -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Return (label, api_key, model) for the LRU key whose first
+    non-cooling model in MODEL_CHAIN is available. (None, None, None)
+    if every (key, model) combination is cooling."""
     with _key_lock:
         _ensure_key_pool()
         if not _key_pool:
-            return None, None
+            return None, None, None
         now = time.time()
-        available = [
-            (label, k) for label, k in _key_pool
-            if (_key_state[label]["cooling_until"] or 0) <= now
-        ]
-        if not available:
-            return None, None
-        # LRU — least recently used wins
-        available.sort(key=lambda lk: _key_state[lk[0]]["last_used_at"] or 0)
-        label, key = available[0]
+        candidates: List[Tuple[str, str, str, float]] = []
+        for label, key in _key_pool:
+            state = _key_state[label]
+            if (state.get("cooling_until") or 0) > now:
+                continue
+            for model in MODEL_CHAIN:
+                if (state["model_cooling"].get(model) or 0) <= now:
+                    candidates.append((label, key, model,
+                                       state["last_used_at"] or 0))
+                    break
+        if not candidates:
+            return None, None, None
+        candidates.sort(key=lambda c: c[3])
+        label, key, model, _ = candidates[0]
         _key_state[label]["last_used_at"] = now
-        return label, key
+        return label, key, model
+
+
+def _select_key() -> Tuple[Optional[str], Optional[str]]:
+    """Backward-compat shim — returns (label, key) only. Use
+    _select_key_and_model() for the model-aware selection."""
+    label, key, _ = _select_key_and_model()
+    return label, key
 
 
 def _classify_error(err_text: str) -> str:
@@ -132,7 +159,8 @@ def _classify_error(err_text: str) -> str:
     return "other"
 
 
-def _mark_key_failed(label: str, kind: str, err_text: str) -> None:
+def _mark_key_failed(label: str, kind: str, err_text: str,
+                     model: Optional[str] = None) -> None:
     with _key_lock:
         s = _key_state.get(label)
         if not s:
@@ -142,19 +170,26 @@ def _mark_key_failed(label: str, kind: str, err_text: str) -> None:
         s["last_error_kind"] = kind
         s["last_error_text"] = (err_text or "")[:200]
         if kind in ("rate_limit", "quota", "timeout", "auth"):
-            s["cooling_until"] = time.time() + _KEY_COOLDOWN_SECONDS
+            if model is not None:
+                # Per-(key, model) cooldown so Pro can still try this
+                # key while Flash is cooling.
+                s["model_cooling"][model] = time.time() + _KEY_COOLDOWN_SECONDS
+            else:
+                # Legacy fallback: cool whole key
+                s["cooling_until"] = time.time() + _KEY_COOLDOWN_SECONDS
 
 
-def _mark_key_success(label: str) -> None:
+def _mark_key_success(label: str, model: Optional[str] = None) -> None:
     with _key_lock:
         s = _key_state.get(label)
         if not s:
             return
         s["success_count"] += 1
         s["last_success_at"] = time.time()
-        # Clear cooldown on first success — key is healthy again
         if s.get("cooling_until"):
             s["cooling_until"] = None
+        if model is not None:
+            s["model_cooling"].pop(model, None)
 
 
 def get_key_status() -> Dict[str, Any]:
@@ -166,6 +201,7 @@ def get_key_status() -> Dict[str, Any]:
         return {
             "pool_size": len(_key_pool or []),
             "cooldown_seconds": _KEY_COOLDOWN_SECONDS,
+            "model_chain": MODEL_CHAIN,
             "keys": [
                 {
                     "label": s["label"],
@@ -186,6 +222,11 @@ def get_key_status() -> Dict[str, Any]:
                         round(s["cooling_until"] - now, 1)
                         if (s.get("cooling_until") or 0) > now else 0
                     ),
+                    "model_cooling": {
+                        m: round(ts - now, 1)
+                        for m, ts in (s.get("model_cooling") or {}).items()
+                        if ts > now
+                    },
                 }
                 for s in (_key_state[label] for label, _ in (_key_pool or []))
             ],
@@ -283,16 +324,18 @@ def label_catalyst_outcome(
     tokens_out = 0
     text = ""
     used_label: Optional[str] = None
+    used_model: Optional[str] = None
 
-    # Rotate across the pool. We try every available key once before
-    # giving up, so a transient outage on one key doesn't fail the
-    # whole call. Per-key, we still do the legacy 2-attempt retry on
-    # 503 (transient backend hiccup).
-    max_key_attempts = max(1, len(_key_pool))
-    for key_attempt in range(max_key_attempts):
-        used_label, api_key = _select_key()
+    # Rotate across (key, model) pairs. The selector hands back the
+    # LRU key whose first non-cooling model in MODEL_CHAIN is
+    # available — i.e. Flash is preferred but Pro takes over when
+    # Flash is rate-capped on a key. We try up to (keys × models)
+    # combinations before giving up.
+    max_attempts = max(1, len(_key_pool) * len(MODEL_CHAIN))
+    for combo_attempt in range(max_attempts):
+        used_label, api_key, used_model = _select_key_and_model()
         if not api_key:
-            err_msg = "no Gemini keys available — all on cooldown"
+            err_msg = "no Gemini (key, model) combinations available — all cooling"
             status = "error"
             logger.warning(f"[outcome-labeler] {ticker}: {err_msg}")
             break
@@ -306,7 +349,7 @@ def label_catalyst_outcome(
         for attempt in (1, 2):
             try:
                 response = client.models.generate_content(
-                    model=LLM_MODEL,
+                    model=used_model,
                     contents=prompt,
                     config=config,
                 )
@@ -317,29 +360,32 @@ def label_catalyst_outcome(
                     tokens_out = getattr(usage, "candidates_token_count", 0) or 0
                 err_msg = None
                 status = "success"
-                _mark_key_success(used_label)
+                _mark_key_success(used_label, model=used_model)
                 last_kind = None
                 break
             except Exception as e:
                 err_msg = str(e)[:300]
                 last_kind = _classify_error(err_msg)
-                _mark_key_failed(used_label, last_kind, err_msg)
+                _mark_key_failed(used_label, last_kind, err_msg, model=used_model)
                 if last_kind == "transient" and attempt == 1:
                     logger.info(
-                        f"[outcome-labeler] {ticker} key={used_label} transient, retry in 3s"
+                        f"[outcome-labeler] {ticker} key={used_label} model={used_model} "
+                        f"transient, retry in 3s"
                     )
                     time.sleep(3.0)
                     continue
                 logger.warning(
-                    f"[outcome-labeler] {ticker} key={used_label} {last_kind}: {err_msg}"
+                    f"[outcome-labeler] {ticker} key={used_label} model={used_model} "
+                    f"{last_kind}: {err_msg}"
                 )
                 status = "error"
                 break
 
         if status == "success":
             break
-        # Only rotate keys for failures that look key-specific. For
-        # request-shape bugs ("other"), more keys won't help.
+        # Only rotate combinations for failures that look key/model-
+        # specific. For request-shape bugs ("other"), more attempts
+        # won't help.
         if last_kind not in ("rate_limit", "quota", "timeout", "auth", "transient"):
             break
 
@@ -347,7 +393,8 @@ def label_catalyst_outcome(
     try:
         from services.llm_usage import record_usage
         record_usage(
-            provider="google", model=LLM_MODEL,
+            provider="google",
+            model=used_model or MODEL_CHAIN[0],
             feature="outcome_labeler",
             ticker=ticker,
             tokens_input=tokens_in, tokens_output=tokens_out,
@@ -395,7 +442,7 @@ def label_catalyst_outcome(
     parsed["confidence"] = conf
 
     parsed["labeled_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    parsed["model"] = LLM_MODEL
+    parsed["model"] = used_model or MODEL_CHAIN[0]
     return parsed
 
 
