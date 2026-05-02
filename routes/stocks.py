@@ -76,17 +76,26 @@ def _is_drug_catalyst(catalyst_type: Optional[str]) -> bool:
 def _pick_npv_catalyst(catalysts: List[Dict]) -> Optional[Dict]:
     """
     Select the best catalyst for NPV computation.
-    Priority: FDA Decision > Phase 3 Readout > Clinical Trial > other drug catalysts.
-    Among drug catalysts, pick highest probability.
+
+    Ranking key: (has_drug_info, tier, probability) — drug-bearing catalysts
+    always rank above drug-less ones, regardless of tier. A bare 'FDA Decision'
+    row with no drug_name yields no useful rNPV (the LLM has nothing to
+    anchor on → 'no pricing data'), so it loses to a Phase 2 readout that
+    actually carries a drug + indication. Within each group, tier (FDA >
+    Phase 3 > Clinical) and probability tiebreak as before.
     Returns None if no drug catalyst exists.
     """
     drug_cats = [c for c in catalysts if _is_drug_catalyst(c.get("catalyst_type"))]
     if not drug_cats:
         return None
 
+    def _has_drug_info(c: Dict) -> int:
+        # 'null'/'None' string slips through scrapers occasionally — treat as missing.
+        name = (c.get("drug_name") or "").strip().lower()
+        return 1 if name and name not in ("null", "none") else 0
+
     def rank(c):
         t = (c.get("catalyst_type") or "").lower()
-        # Higher number = better priority
         if "fda" in t or "approval" in t or "pdufa" in t:
             tier = 4
         elif "phase 3" in t or "phase iii" in t:
@@ -95,7 +104,7 @@ def _pick_npv_catalyst(catalysts: List[Dict]) -> Optional[Dict]:
             tier = 2
         else:
             tier = 1
-        return (tier, c.get("probability") or 0)
+        return (_has_drug_info(c), tier, c.get("probability") or 0)
 
     drug_cats.sort(key=rank, reverse=True)
     return drug_cats[0]
@@ -450,11 +459,25 @@ async def get_stock_detail(ticker: str, with_npv: bool = Query(True)):
                 "reason": "No drug catalyst (FDA Decision / Phase 3 / Clinical Trial) found for this ticker.",
             }
         else:
+            # Normalize the literal-string 'null' that occasionally slips through
+            # from scrapers — the frontend forwards `description` as
+            # description_override to /analyze/npv, and a 'null' string poisons
+            # the LLM prompt vs. an actual missing field.
+            _desc = npv_catalyst.get("description")
+            if isinstance(_desc, str) and _desc.strip().lower() in ("null", "none"):
+                _desc = None
             npv_catalyst_summary = {
                 "type": npv_catalyst.get("catalyst_type"),
                 "date": npv_catalyst.get("catalyst_date"),
                 "probability": npv_catalyst.get("probability"),
-                "description": npv_catalyst.get("description"),
+                "description": _desc,
+                # Drug-level fields the rNPV V2 LLM needs to scope economics
+                # to the right molecule. Previously dropped — caused
+                # `rnpv.error: 'no pricing data'` whenever the picked catalyst
+                # had no drug attached on the row.
+                "drug_name": npv_catalyst.get("drug_name"),
+                "indication": npv_catalyst.get("indication"),
+                "phase": npv_catalyst.get("phase"),
             }
             try:
                 from services.npv_model import (
