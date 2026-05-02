@@ -23,9 +23,37 @@ import time
 from typing import List, Dict, Optional, Any
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+import redis as _redis_mod
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+# Cached Redis client. Used to memoize the context bundle so that follow-up
+# turns in the same conversation don't re-pay 10-15 s of yfinance + backtest
+# aggregation work on every message.
+_redis_client = None
+
+
+def _redis():
+    global _redis_client
+    if _redis_client is not None:
+        return _redis_client
+    url = os.getenv("REDIS_URL")
+    if not url:
+        return None
+    try:
+        _redis_client = _redis_mod.from_url(url, decode_responses=True)
+    except Exception as e:
+        logger.warning(f"chat: redis init failed: {e}")
+        _redis_client = None
+    return _redis_client
+
+
+# TTL covers a typical chat session's follow-up questions without forcing
+# yfinance + aggregate work on every turn. Short enough that price/IV
+# numbers don't go visibly stale.
+_CTX_CACHE_TTL_S = 300
 
 
 class ChatMessage(BaseModel):
@@ -193,21 +221,24 @@ async def _build_context(ticker: str) -> Dict[str, Any]:
     except Exception as e:
         logger.warning(f"chat _build_context db fetch failed for {ticker}: {e}")
 
-    # Live price + market cap
+    # Live price + market cap. yf_ticker / yf_info are reused by the
+    # setup_quality block below — previously we paid for `t.info` twice.
+    yf_ticker = None
+    yf_info: Dict[str, Any] = {}
     try:
         import yfinance as yf
-        t = yf.Ticker(ticker)
-        info = t.info or {}
-        ctx["current_price"] = info.get("currentPrice") or info.get("regularMarketPrice")
-        ctx["market_cap_m"] = (info.get("marketCap") or 0) / 1e6 if info.get("marketCap") else None
+        yf_ticker = yf.Ticker(ticker)
+        yf_info = yf_ticker.info or {}
+        ctx["current_price"] = yf_info.get("currentPrice") or yf_info.get("regularMarketPrice")
+        ctx["market_cap_m"] = (yf_info.get("marketCap") or 0) / 1e6 if yf_info.get("marketCap") else None
         ctx["fundamentals"] = {
-            "short_pct_of_float": info.get("shortPercentOfFloat"),
-            "insider_held_pct": info.get("heldPercentInsiders"),
-            "fifty_two_week_high": info.get("fiftyTwoWeekHigh"),
-            "fifty_two_week_low": info.get("fiftyTwoWeekLow"),
-            "shares_outstanding": info.get("sharesOutstanding"),
-            "cash": info.get("totalCash"),
-            "debt": info.get("totalDebt"),
+            "short_pct_of_float": yf_info.get("shortPercentOfFloat"),
+            "insider_held_pct": yf_info.get("heldPercentInsiders"),
+            "fifty_two_week_high": yf_info.get("fiftyTwoWeekHigh"),
+            "fifty_two_week_low": yf_info.get("fiftyTwoWeekLow"),
+            "shares_outstanding": yf_info.get("sharesOutstanding"),
+            "cash": yf_info.get("totalCash"),
+            "debt": yf_info.get("totalDebt"),
         }
     except Exception as e:
         logger.warning(f"chat _build_context yfinance fetch failed for {ticker}: {e}")
@@ -232,8 +263,7 @@ async def _build_context(ticker: str) -> Dict[str, Any]:
 
     # rNPV V2 — pull from cache if available
     try:
-        from services.cache import get_redis
-        r = get_redis()
+        r = _redis()
         if r:
             # The /analyze/npv route caches as "npv_v2:{ticker}:{cat_type}:{cat_date}:..."
             keys = r.keys(f"npv_v2:{ticker}:*") or []
@@ -257,13 +287,13 @@ async def _build_context(ticker: str) -> Dict[str, Any]:
     except Exception as e:
         logger.info(f"chat _build_context rnpv_v2 cache fetch failed for {ticker}: {e}")
 
-    # Setup quality
+    # Setup quality — reuses the yfinance handle/info fetched above instead
+    # of re-paying the ~2-4 s `.info` round-trip a second time.
     try:
         from services.setup_quality import compute_setup_quality
-        import yfinance as yf
-        t = yf.Ticker(ticker)
-        info = t.info or {}
-        h = t.history(period="3mo", auto_adjust=True)
+        if yf_ticker is None:
+            raise RuntimeError("yfinance unavailable (info fetch failed earlier)")
+        h = yf_ticker.history(period="3mo", auto_adjust=True)
         history_bars = []
         if not h.empty:
             for idx, row in h.iterrows():
@@ -281,7 +311,7 @@ async def _build_context(ticker: str) -> Dict[str, Any]:
         except Exception:
             pass
         ctx["setup_quality"] = compute_setup_quality(
-            info=info, history=history_bars, fundamentals=None,
+            info=yf_info, history=history_bars, fundamentals=None,
             options_implied=ctx.get("options_implied"),
             social_sentiment=ctx.get("primary_catalyst", {}).get("sentiment_score"),
             days_to_catalyst=days_to,
@@ -489,8 +519,27 @@ async def chat_explain(req: ChatRequest):
     t0 = time.time()
     ticker = req.ticker.upper().strip()
 
-    # Build context if not provided
-    ctx = req.context if req.context else await _build_context(ticker)
+    # Build context if not provided. The bundle is cached per-ticker so
+    # follow-up turns (which dominate a typical chat session) skip the
+    # ~10-15 s of yfinance + backtest aggregation work.
+    ctx: Optional[Dict[str, Any]] = req.context
+    if ctx is None:
+        r = _redis()
+        cache_key = f"chat_ctx:{ticker}"
+        if r is not None:
+            try:
+                cached = r.get(cache_key)
+                if cached:
+                    ctx = json.loads(cached)
+            except Exception as e:
+                logger.info(f"chat_explain ctx cache get failed for {ticker}: {e}")
+        if ctx is None:
+            ctx = await _build_context(ticker)
+            if r is not None:
+                try:
+                    r.setex(cache_key, _CTX_CACHE_TTL_S, json.dumps(ctx, default=str))
+                except Exception as e:
+                    logger.info(f"chat_explain ctx cache set failed for {ticker}: {e}")
 
     # Prune context to keep system prompt under control
     context_json = json.dumps(ctx, default=str, indent=2)
