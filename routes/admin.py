@@ -5238,8 +5238,9 @@ async def label_all_start(
     return {
         "ok": True,
         "status_url": "/admin/post-catalyst/label-all-status",
-        "workers": _LABEL_WORKERS,
+        "workers": workers,
         "claim_size": claim_size,
+        "call_interval_s": call_interval_s,
     }
 
 
