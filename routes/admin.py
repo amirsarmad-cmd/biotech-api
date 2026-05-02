@@ -5361,9 +5361,9 @@ async def outcome_label_stats():
         raise HTTPException(500, f"outcome_label_stats error: {e}")
 
 
-@router.post("/post-catalyst/apply-migration-018")
-async def apply_migration_018():
-    """One-shot for migration 018 — per-row attempt counter on the
+@router.post("/post-catalyst/apply-migration-019")
+async def apply_migration_019():
+    """One-shot for migration 019 — per-row attempt counter on the
     outcome labeler. Adds outcome_label_attempts (defaults 0),
     outcome_label_last_attempt_at, outcome_label_last_error. Index
     keeps the claim query fast.
@@ -5371,6 +5371,12 @@ async def apply_migration_018():
     Required by the Gemini-stall workaround: the labeler now skips
     rows with attempts >= _LABEL_MAX_ATTEMPTS so a single bad row or
     a global Gemini outage cannot loop forever.
+
+    Note: an earlier endpoint (apply-migration-018) was applied
+    against production before the alembic name collision with
+    018_lgbm_model was noticed. The DDL is idempotent so re-running
+    via this endpoint is safe; only the alembic version_num bump
+    differs.
     """
     try:
         from services.database import BiotechDatabase
@@ -5392,8 +5398,8 @@ async def apply_migration_018():
             """)
             cur.execute("""
                 UPDATE alembic_version_biotech
-                SET version_num = '018_label_attempts'
-                WHERE version_num = '017_backfill_staging'
+                SET version_num = '019_label_attempts'
+                WHERE version_num = '018_lgbm_model'
             """)
             stamped = cur.rowcount
             cur.execute("SELECT version_num FROM alembic_version_biotech")
@@ -5401,8 +5407,8 @@ async def apply_migration_018():
             conn.commit()
         return {"success": True, "new_alembic_version": new_v, "stamped_rows": stamped}
     except Exception as e:
-        logger.exception("apply_migration_018 failed")
-        raise HTTPException(500, f"apply_migration_018 error: {e}")
+        logger.exception("apply_migration_019 failed")
+        raise HTTPException(500, f"apply_migration_019 error: {e}")
 
 
 # ────────────────────────────────────────────────────────────
