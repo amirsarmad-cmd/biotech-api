@@ -5025,7 +5025,15 @@ _label_state: dict = {
 }
 _label_in_progress: set = set()
 _label_lock = _threading.Lock()
-_LABEL_WORKERS = 6
+# Default worker count — overridable per /label-all-start call. Free-tier
+# Gemini has ~10 RPM per project; with 5 rotating keys (each potentially
+# in a separate project, but we don't trust that) we keep concurrency low
+# and let the per-call sleep do the rate shaping.
+_LABEL_WORKERS_DEFAULT = 2
+# Default per-call sleep inside each worker. 6s × 2 workers = ~20 RPM
+# best case, but real grounded-search latency (5-15s) usually keeps us
+# well under free-tier 10 RPM.
+_LABEL_CALL_INTERVAL_S_DEFAULT = 6.0
 # After this many failed attempts on a single row, the row is locked
 # out of the claim queue. Prevents one bad row from being retried
 # forever and guarantees the queue eventually exhausts.
@@ -5122,13 +5130,26 @@ def _record_attempt_result(success: bool) -> None:
 
 
 @router.post("/post-catalyst/label-all-start")
-async def label_all_start(claim_size: int = 5):
+async def label_all_start(
+    claim_size: int = 3,
+    workers: int = _LABEL_WORKERS_DEFAULT,
+    call_interval_s: float = _LABEL_CALL_INTERVAL_S_DEFAULT,
+):
     """Start a background task that labels all unlabeled outcomes via Gemini.
-    Spawns _LABEL_WORKERS concurrent workers; each claims claim_size IDs at a time.
+
+    workers + call_interval_s shape the throughput. Free-tier Gemini Flash
+    is 10 RPM per project; if your N keys live in N projects the budget
+    is N × 10 RPM but we don't depend on that. Default 2 workers × 6s
+    interval ≈ 20 RPM theoretical, ~10-12 RPM realistic given grounded-
+    search latency. Bump workers to 4-6 only if you've confirmed each
+    key lives in its own project AND the project quota is generous.
+
     Cost ~$0.0003/event.
     """
     if _label_state["running"]:
         raise HTTPException(409, "label-all already running")
+    workers = max(1, min(workers, 12))
+    call_interval_s = max(0.0, min(call_interval_s, 60.0))
 
     import asyncio
     from services.database import BiotechDatabase
@@ -5146,6 +5167,9 @@ async def label_all_start(claim_size: int = 5):
         "class_distribution": {},
         "recent_attempts": [],
         "circuit_breaker_tripped": False,
+        "workers": workers,
+        "claim_size": claim_size,
+        "call_interval_s": call_interval_s,
     })
 
     async def _worker():
@@ -5189,13 +5213,17 @@ async def label_all_start(claim_size: int = 5):
                     _record_attempt_result(success)
                     if _label_state["circuit_breaker_tripped"]:
                         break
+                    # Throttle: stay under per-project Gemini RPM. The
+                    # per-key cooldown only catches keys that already 429'd;
+                    # this prevents the 429 in the first place.
+                    if call_interval_s > 0:
+                        await asyncio.sleep(call_interval_s)
             finally:
                 await asyncio.to_thread(_release_label_ids, ids)
-            await asyncio.sleep(0.05)
 
     async def _run():
         try:
-            await asyncio.gather(*[_worker() for _ in range(_LABEL_WORKERS)])
+            await asyncio.gather(*[_worker() for _ in range(workers)])
         except Exception as e:
             logger.exception(f"[label-all] error: {e}")
             _label_state["last_error"] = str(e)[:200]
