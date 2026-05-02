@@ -5012,17 +5012,40 @@ _label_state: dict = {
     "labeled": 0,
     "errors": 0,
     "started_at": None,
+    "stopped_at": None,
+    "stop_reason": None,
     "last_error": None,
     "estimated_cost_usd": 0.0,
     "class_distribution": {},
+    # Rolling window of last N attempts: True=success, False=failure.
+    # Used by the circuit breaker to detect "Gemini is broken, every
+    # call returns None" without operator intervention.
+    "recent_attempts": [],
+    "circuit_breaker_tripped": False,
 }
 _label_in_progress: set = set()
 _label_lock = _threading.Lock()
 _LABEL_WORKERS = 6
+# After this many failed attempts on a single row, the row is locked
+# out of the claim queue. Prevents one bad row from being retried
+# forever and guarantees the queue eventually exhausts.
+_LABEL_MAX_ATTEMPTS = 3
+# Circuit breaker: if fewer than this many of the last
+# _CIRCUIT_WINDOW attempts succeeded, the worker pool aborts. This
+# is what would have caught the 2026-05-02 stall — Gemini went into
+# instant-None mode and ran 400k+ wasted iterations before anyone
+# noticed. We'd rather stop after 100.
+_CIRCUIT_WINDOW = 100
+_CIRCUIT_MIN_SUCCESS = 5
 
 
 def _claim_unlabeled(limit: int) -> list:
-    """Atomically grab N unlabeled outcome IDs, marking them in-process."""
+    """Atomically grab N unlabeled outcome IDs, marking them in-process.
+
+    Skips rows that have already been attempted _LABEL_MAX_ATTEMPTS
+    times — those rows are dead-lettered until a future re-run
+    explicitly resets the counter.
+    """
     from services.database import BiotechDatabase
     with _label_lock:
         excluded = list(_label_in_progress)
@@ -5033,10 +5056,11 @@ def _claim_unlabeled(limit: int) -> list:
                 SELECT id FROM post_catalyst_outcomes
                 WHERE outcome_labeled_at IS NULL
                   AND catalyst_date IS NOT NULL
+                  AND COALESCE(outcome_label_attempts, 0) < %s
                   AND id != ALL(%s)
                 ORDER BY catalyst_date DESC
                 LIMIT %s
-            """, (excluded, limit))
+            """, (_LABEL_MAX_ATTEMPTS, excluded, limit))
             ids = [r[0] for r in cur.fetchall()]
         for i in ids:
             _label_in_progress.add(i)
@@ -5047,6 +5071,54 @@ def _release_label_ids(ids):
     with _label_lock:
         for i in ids:
             _label_in_progress.discard(i)
+
+
+def _bump_attempt(outcome_id: int, error_text: Optional[str] = None) -> None:
+    """Increment the per-row attempt counter and record last_attempt_at.
+
+    Called on EVERY attempt regardless of success — that is the
+    invariant that makes the queue exhaust. On success the labeler
+    itself also sets outcome_labeled_at, removing the row from the
+    claim queue immediately. On failure the row stays unlabeled and
+    will be re-claimed until attempts >= _LABEL_MAX_ATTEMPTS.
+    """
+    from services.database import BiotechDatabase
+    db = BiotechDatabase()
+    try:
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE post_catalyst_outcomes
+                SET outcome_label_attempts = COALESCE(outcome_label_attempts, 0) + 1,
+                    outcome_label_last_attempt_at = now(),
+                    outcome_label_last_error = %s
+                WHERE id = %s
+            """, (error_text[:500] if error_text else None, outcome_id))
+            conn.commit()
+    except Exception as e:
+        logger.warning(f"_bump_attempt id={outcome_id}: {e}")
+
+
+def _record_attempt_result(success: bool) -> None:
+    """Append to the rolling attempt window and trip the circuit
+    breaker if the success rate falls below the threshold."""
+    window = _label_state["recent_attempts"]
+    window.append(success)
+    if len(window) > _CIRCUIT_WINDOW:
+        del window[: len(window) - _CIRCUIT_WINDOW]
+    if (
+        len(window) >= _CIRCUIT_WINDOW
+        and sum(window) < _CIRCUIT_MIN_SUCCESS
+        and not _label_state["circuit_breaker_tripped"]
+    ):
+        _label_state["circuit_breaker_tripped"] = True
+        _label_state["running"] = False
+        _label_state["stop_reason"] = (
+            f"circuit breaker: only {sum(window)}/{_CIRCUIT_WINDOW} "
+            "recent attempts succeeded — Gemini is likely rate-limited "
+            "or the API key is exhausted"
+        )
+        _label_state["stopped_at"] = datetime.utcnow().isoformat()
 
 
 @router.post("/post-catalyst/label-all-start")
@@ -5067,33 +5139,56 @@ async def label_all_start(claim_size: int = 5):
         "labeled": 0,
         "errors": 0,
         "started_at": datetime.utcnow().isoformat(),
+        "stopped_at": None,
+        "stop_reason": None,
         "last_error": None,
         "estimated_cost_usd": 0.0,
         "class_distribution": {},
+        "recent_attempts": [],
+        "circuit_breaker_tripped": False,
     })
 
     async def _worker():
         db = BiotechDatabase()
-        while True:
+        while _label_state["running"]:
             ids = await asyncio.to_thread(_claim_unlabeled, claim_size)
             if not ids:
+                # Queue exhausted (no rows under the attempt cap). Worker
+                # exits; the last worker out flips running=False in _run.
                 break
             try:
                 for outcome_id in ids:
+                    if not _label_state["running"]:
+                        break
+                    err_text: Optional[str] = None
+                    success = False
                     try:
                         labeled = await asyncio.to_thread(
                             lambda oid=outcome_id: label_outcome_for_db_row(db=db, outcome_id=oid)
                         )
                         if labeled:
+                            success = True
                             _label_state["labeled"] += 1
                             _label_state["estimated_cost_usd"] = round(_label_state["labeled"] * 0.0003, 4)
                             cls = labeled.get("outcome_class", "UNKNOWN")
                             _label_state["class_distribution"][cls] = _label_state["class_distribution"].get(cls, 0) + 1
                         else:
+                            err_text = "labeler returned None (no source found or transient API failure)"
                             _label_state["errors"] += 1
                     except Exception as e:
+                        err_text = f"{type(e).__name__}: {e}"
                         _label_state["errors"] += 1
+                        _label_state["last_error"] = err_text[:200]
                         logger.warning(f"label-all row {outcome_id}: {e}")
+                    # Always bump the attempt counter — guarantees every
+                    # row eventually drops out of the claim queue. On
+                    # success the labeler also sets outcome_labeled_at
+                    # which removes the row independently.
+                    if not success:
+                        await asyncio.to_thread(_bump_attempt, outcome_id, err_text)
+                    _record_attempt_result(success)
+                    if _label_state["circuit_breaker_tripped"]:
+                        break
             finally:
                 await asyncio.to_thread(_release_label_ids, ids)
             await asyncio.sleep(0.05)
@@ -5105,6 +5200,10 @@ async def label_all_start(claim_size: int = 5):
             logger.exception(f"[label-all] error: {e}")
             _label_state["last_error"] = str(e)[:200]
         finally:
+            if _label_state["running"]:
+                # Natural completion (queue exhausted, no breaker, no stop call)
+                _label_state["stop_reason"] = "queue exhausted"
+                _label_state["stopped_at"] = datetime.utcnow().isoformat()
             _label_state["running"] = False
 
     asyncio.create_task(_run())
@@ -5118,15 +5217,90 @@ async def label_all_start(claim_size: int = 5):
 
 @router.get("/post-catalyst/label-all-status")
 async def label_all_status():
-    """Live progress for background label-all task."""
+    """Live progress for background label-all task.
+
+    Surfaces the rolling success ratio used by the circuit breaker so
+    the operator can see "Gemini is degraded" before the breaker
+    actually trips.
+    """
     state = _label_state.copy()
     state["in_progress_count"] = len(_label_in_progress)
+    window = state.pop("recent_attempts", [])
+    state["recent_window_size"] = len(window)
+    state["recent_success_pct"] = (
+        round(100.0 * sum(window) / len(window), 1) if window else None
+    )
+    state["circuit_window"] = _CIRCUIT_WINDOW
+    state["circuit_min_success"] = _CIRCUIT_MIN_SUCCESS
+    state["max_attempts_per_row"] = _LABEL_MAX_ATTEMPTS
     return state
+
+
+@router.post("/post-catalyst/label-all-stop")
+async def label_all_stop():
+    """Cooperative stop for the background labeler. Sets running=False;
+    workers exit at their next loop check. Use when you need to halt
+    a runaway labeler without redeploying the service.
+    """
+    if not _label_state["running"]:
+        return {
+            "ok": True,
+            "already_stopped": True,
+            "stop_reason": _label_state.get("stop_reason"),
+        }
+    _label_state["running"] = False
+    _label_state["stop_reason"] = "stopped by /label-all-stop"
+    _label_state["stopped_at"] = datetime.utcnow().isoformat()
+    return {
+        "ok": True,
+        "stopped_at": _label_state["stopped_at"],
+        "labeled": _label_state["labeled"],
+        "errors": _label_state["errors"],
+    }
+
+
+@router.post("/post-catalyst/label-reset-attempts")
+async def label_reset_attempts(only_errored: bool = True):
+    """Zero out the per-row attempt counter so dead-lettered rows can
+    be re-tried. Use this after a Gemini outage to give failed rows
+    another shot — typically with `only_errored=true` to leave
+    successfully-labeled rows alone.
+    """
+    try:
+        from services.database import BiotechDatabase
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            if only_errored:
+                cur.execute("""
+                    UPDATE post_catalyst_outcomes
+                    SET outcome_label_attempts = 0,
+                        outcome_label_last_error = NULL
+                    WHERE outcome_labeled_at IS NULL
+                      AND COALESCE(outcome_label_attempts, 0) > 0
+                """)
+            else:
+                cur.execute("""
+                    UPDATE post_catalyst_outcomes
+                    SET outcome_label_attempts = 0,
+                        outcome_label_last_error = NULL
+                """)
+            reset_n = cur.rowcount
+            conn.commit()
+        return {"ok": True, "rows_reset": reset_n, "only_errored": only_errored}
+    except Exception as e:
+        logger.exception("label_reset_attempts failed")
+        raise HTTPException(500, f"label_reset_attempts error: {e}")
 
 
 @router.get("/post-catalyst/outcome-label-stats")
 async def outcome_label_stats():
-    """Coverage + class distribution of labeled outcomes."""
+    """Coverage + class distribution of labeled outcomes, plus the
+    per-row attempt-counter histogram (which rows have been tried 0,
+    1, 2, 3+ times). The 3+ bucket is the dead-letter queue —
+    rows that hit _LABEL_MAX_ATTEMPTS and won't be re-claimed until
+    the operator calls /label-reset-attempts.
+    """
     try:
         from services.database import BiotechDatabase
         db = BiotechDatabase()
@@ -5145,7 +5319,19 @@ async def outcome_label_stats():
                     COUNT(*) FILTER (WHERE outcome_label_class = 'MIXED') AS mixed,
                     COUNT(*) FILTER (WHERE outcome_label_class = 'UNKNOWN') AS unknown,
                     AVG(outcome_label_confidence) FILTER (WHERE outcome_labeled_at IS NOT NULL) AS avg_conf,
-                    AVG(outcome_label_confidence) FILTER (WHERE outcome_label_class != 'UNKNOWN') AS avg_conf_known
+                    AVG(outcome_label_confidence) FILTER (WHERE outcome_label_class != 'UNKNOWN') AS avg_conf_known,
+                    COUNT(*) FILTER (
+                        WHERE outcome_labeled_at IS NULL
+                          AND COALESCE(outcome_label_attempts, 0) = 0
+                    ) AS pending_untried,
+                    COUNT(*) FILTER (
+                        WHERE outcome_labeled_at IS NULL
+                          AND outcome_label_attempts BETWEEN 1 AND 2
+                    ) AS pending_retryable,
+                    COUNT(*) FILTER (
+                        WHERE outcome_labeled_at IS NULL
+                          AND outcome_label_attempts >= 3
+                    ) AS dead_lettered
                 FROM post_catalyst_outcomes
             """)
             r = cur.fetchone()
@@ -5164,10 +5350,59 @@ async def outcome_label_stats():
             "avg_confidence": round(float(r[10]), 2) if r[10] is not None else None,
             "avg_confidence_known": round(float(r[11]), 2) if r[11] is not None else None,
             "estimated_full_backfill_cost_usd": round((total - labeled) * 0.0003, 4),
+            "attempt_buckets": {
+                "pending_untried": r[12] or 0,
+                "pending_retryable": r[13] or 0,
+                "dead_lettered": r[14] or 0,
+            },
         }
     except Exception as e:
         logger.exception("outcome_label_stats failed")
         raise HTTPException(500, f"outcome_label_stats error: {e}")
+
+
+@router.post("/post-catalyst/apply-migration-018")
+async def apply_migration_018():
+    """One-shot for migration 018 — per-row attempt counter on the
+    outcome labeler. Adds outcome_label_attempts (defaults 0),
+    outcome_label_last_attempt_at, outcome_label_last_error. Index
+    keeps the claim query fast.
+
+    Required by the Gemini-stall workaround: the labeler now skips
+    rows with attempts >= _LABEL_MAX_ATTEMPTS so a single bad row or
+    a global Gemini outage cannot loop forever.
+    """
+    try:
+        from services.database import BiotechDatabase
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                ALTER TABLE post_catalyst_outcomes
+                ADD COLUMN IF NOT EXISTS outcome_label_attempts INTEGER NOT NULL DEFAULT 0,
+                ADD COLUMN IF NOT EXISTS outcome_label_last_attempt_at TIMESTAMP WITH TIME ZONE,
+                ADD COLUMN IF NOT EXISTS outcome_label_last_error TEXT
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_pco_label_pending_attempts
+                ON post_catalyst_outcomes(catalyst_date)
+                WHERE outcome_labeled_at IS NULL
+                  AND outcome_label_attempts < 3
+                  AND catalyst_date IS NOT NULL
+            """)
+            cur.execute("""
+                UPDATE alembic_version_biotech
+                SET version_num = '018_label_attempts'
+                WHERE version_num = '017_backfill_staging'
+            """)
+            stamped = cur.rowcount
+            cur.execute("SELECT version_num FROM alembic_version_biotech")
+            new_v = cur.fetchone()[0]
+            conn.commit()
+        return {"success": True, "new_alembic_version": new_v, "stamped_rows": stamped}
+    except Exception as e:
+        logger.exception("apply_migration_018 failed")
+        raise HTTPException(500, f"apply_migration_018 error: {e}")
 
 
 # ────────────────────────────────────────────────────────────
