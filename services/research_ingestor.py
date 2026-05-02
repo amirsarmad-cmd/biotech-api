@@ -290,24 +290,20 @@ Rules:
 # ────────────────────────────────────────────────────────────
 
 def _embed_text(text: str) -> Optional[List[float]]:
-    """Return a 1536-dim embedding via OpenAI text-embedding-3-small.
-    Returns None on failure (caller should handle gracefully).
-    """
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        return None
+    """Return a 1536-dim embedding via the LLM gateway (OpenAI
+    text-embedding-3-small under the hood, with key rotation +
+    circuit breaker). Returns None on failure (caller handles)."""
     try:
-        resp = requests.post(
-            "https://api.openai.com/v1/embeddings",
-            headers={"Authorization": f"Bearer {api_key}",
-                     "Content-Type": "application/json"},
-            json={"model": "text-embedding-3-small",
-                  "input": text[:8000]},  # ~8k chars ~ 2k tokens, well within limit
-            timeout=15,
+        from services.llm_gateway import llm_embeddings, LLMAllProvidersFailed
+        result = llm_embeddings(
+            texts=[text[:8000]],  # ~2k tokens, well within limit
+            feature="research_corpus",
+            timeout_s=15.0,
         )
-        resp.raise_for_status()
-        data = resp.json()
-        return data["data"][0]["embedding"]
+        return result.vectors[0] if result.vectors else None
+    except LLMAllProvidersFailed as e:
+        logger.warning(f"embedding failed: {len(e.attempts)} provider attempts failed")
+        return None
     except Exception as e:
         logger.warning(f"embedding failed: {e}")
         return None

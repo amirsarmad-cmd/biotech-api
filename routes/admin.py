@@ -5215,6 +5215,21 @@ async def label_all_start(claim_size: int = 5):
     }
 
 
+@router.get("/llm/status")
+async def llm_status():
+    """Universal LLM gateway health — every provider, every key,
+    circuit-breaker state. The 'never stalls again' single source of
+    truth: if this endpoint shows everything green, no LLM call in
+    biotech-api should hang.
+    """
+    try:
+        from services.llm_gateway import get_status
+        return get_status()
+    except Exception as e:
+        logger.exception("llm_status failed")
+        raise HTTPException(500, f"llm_status error: {e}")
+
+
 @router.get("/labeler/key-status")
 async def labeler_key_status():
     """Per-Gemini-key health for the outcome labeler. Surfaces success

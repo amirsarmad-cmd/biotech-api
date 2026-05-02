@@ -1120,70 +1120,42 @@ Return ONLY a JSON object: {{"catalysts": [...]}}. If no high-confidence catalys
 
 
 def _call_openai_extract(ticker: str, company_name: str) -> List[Dict]:
-    """Call OpenAI to extract upcoming catalysts. Returns parsed list of dicts.
-
-    Records usage to llm_usage table so we can see fallback activity in the
-    /admin/llm/usage/recent view (previously OpenAI calls were invisible to
-    the dashboard, so when Gemini failed we couldn't tell whether OpenAI
-    was actually saving us).
+    """OpenAI fallback for upcoming-catalyst extraction. Routes through
+    the LLM gateway — by default the gateway tries Anthropic → OpenAI
+    → Google, but for this Tier-2-after-Gemini path we pin OpenAI
+    first so the seeder doesn't end up calling Google twice in a row
+    when Gemini already failed.
     """
-    import time as _t
     prompt = _build_extraction_prompt(ticker, company_name)
-
-    body = {
-        "model": LLM_MODEL_OPENAI,
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 1500,
-        "response_format": {"type": "json_object"},
-    }
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    t0 = _t.time()
-    status = "success"
-    err_msg = None
-    tokens_in = 0
-    tokens_out = 0
-    text = ""
     try:
-        r = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            json=body, headers=headers, timeout=45,
+        from services.llm_gateway import llm_call, LLMAllProvidersFailed
+        result = llm_call(
+            capability="text_json",
+            feature="universe_seeder",
+            ticker=ticker,
+            prompt=prompt,
+            fallback_chain=["openai", "anthropic"],  # skip Google here
+            max_tokens=1500,
+            temperature=0.3,
+            timeout_s=45.0,
         )
-        r.raise_for_status()
-        resp = r.json()
-        text = resp["choices"][0]["message"]["content"]
-        usage = resp.get("usage") or {}
-        tokens_in = int(usage.get("prompt_tokens") or 0)
-        tokens_out = int(usage.get("completion_tokens") or 0)
+        text = result.text
+        parsed_json = result.parsed_json
+    except LLMAllProvidersFailed as e:
+        logger.warning(f"[seeder] {ticker} all providers failed: {len(e.attempts)} attempts")
+        return []
     except Exception as e:
-        status = "error"
-        err_msg = str(e)[:300]
-        logger.warning(f"[openai] {ticker} call failed: {err_msg}")
-    finally:
+        logger.warning(f"[seeder] {ticker} unexpected: {e}")
+        return []
+
+    if parsed_json is not None:
+        parsed = parsed_json
+    else:
         try:
-            from services.llm_usage import record_usage
-            record_usage(
-                provider="openai", model=LLM_MODEL_OPENAI,
-                feature="universe_seeder", ticker=ticker,
-                tokens_input=tokens_in, tokens_output=tokens_out,
-                duration_ms=int((_t.time() - t0) * 1000),
-                status=status, error_message=err_msg,
-            )
-        except Exception:
-            pass
-
-    if status == "error" or not text:
-        return []
-
-    # Parse JSON — model may return {"catalysts": [...]} or [...]
-    try:
-        parsed = json.loads(text)
-    except Exception as e:
-        logger.warning(f"[openai] {ticker} JSON parse failed: {e}")
-        return []
+            parsed = json.loads(text)
+        except Exception as e:
+            logger.warning(f"[seeder] {ticker} JSON parse failed: {e}")
+            return []
     if isinstance(parsed, dict):
         for k in ("catalysts", "results", "data", "items"):
             if k in parsed and isinstance(parsed[k], list):

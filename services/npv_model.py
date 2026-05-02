@@ -954,59 +954,23 @@ Return a 200-400 word summary in plain text (no JSON, no markdown headers). Cite
 Be factual. If you can't find a number, omit it rather than guess."""
     
     try:
-        from google import genai as google_genai
-        from google.genai import types
-        from services.llm_usage import record_usage
-    except Exception as e:
-        logger.warning(f"grounded_research import failed: {e}")
-        return None
-    
-    google_key = os.getenv("GOOGLE_API_KEY", "")
-    if not google_key:
-        return None
-    
-    t0 = _t.time()
-    try:
-        client = google_genai.Client(
-            api_key=google_key,
-            http_options=types.HttpOptions(timeout=50000),  # 50s
-        )
-        config = types.GenerateContentConfig(
-            max_output_tokens=1500,
+        from services.llm_gateway import llm_call, LLMAllProvidersFailed
+        result = llm_call(
+            capability="grounded_search",
+            feature="npv_research",
+            ticker=ticker,
+            prompt=prompt,
+            max_tokens=1500,
             temperature=0.1,
-            tools=[types.Tool(google_search=types.GoogleSearch())],
+            timeout_s=50.0,
         )
-        resp = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-            config=config,
+        return result.text.strip() if result.text else None
+    except LLMAllProvidersFailed as e:
+        logger.warning(
+            f"_fetch_grounded_research all providers failed: {len(e.attempts)} attempts"
         )
-        text = (resp.text or "").strip()
-        usage = getattr(resp, "usage_metadata", None)
-        try:
-            record_usage(
-                provider="google", model="gemini-2.5-flash",
-                feature="npv_research", ticker=ticker,
-                tokens_input=getattr(usage, "prompt_token_count", 0) or 0 if usage else 0,
-                tokens_output=getattr(usage, "candidates_token_count", 0) or 0 if usage else 0,
-                duration_ms=int((_t.time() - t0) * 1000),
-                status="success" if text else "error",
-                error_message=None if text else "empty response",
-            )
-        except Exception:
-            pass
-        return text if text else None
+        return None
     except Exception as e:
-        try:
-            record_usage(
-                provider="google", model="gemini-2.5-flash",
-                feature="npv_research", ticker=ticker,
-                tokens_input=0, tokens_output=0,
-                duration_ms=int((_t.time() - t0) * 1000),
-                status="error", error_message=str(e)[:300],
-            )
-        except Exception:
-            pass
         logger.warning(f"_fetch_grounded_research failed: {e}")
         return None
 

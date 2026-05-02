@@ -514,37 +514,31 @@ async def chat_explain(req: ChatRequest):
             messages.append({"role": m.role, "content": m.content})
     messages.append({"role": "user", "content": req.question})
 
-    # Call Claude (using anthropic SDK directly so we can pass a system prompt)
+    # Route through the universal LLM gateway: rotates keys within
+    # Anthropic, falls through to OpenAI then Google if Anthropic is
+    # rate-limited or down. Telemetry recorded automatically.
     try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY", ""), timeout=60.0)
-        msg = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=1500,
+        from services.llm_gateway import llm_call, LLMAllProvidersFailed
+        result = llm_call(
+            capability="text_freeform",
+            feature="chat_explain",
+            ticker=ticker,
             system=system,
             messages=messages,
+            max_tokens=1500,
+            temperature=0.3,
+            timeout_s=60.0,
         )
-        text = msg.content[0].text if msg.content else ""
-        prose, proposal = _parse_improvement_proposal(text)
-        duration_ms = int((time.time() - t0) * 1000)
-        # Log usage
-        try:
-            from services.llm_usage import record_call
-            record_call(
-                provider="anthropic", model="claude-sonnet-4-6",
-                feature="chat_explain", ticker=ticker, status="success",
-                tokens_input=getattr(msg.usage, "input_tokens", 0) if hasattr(msg, "usage") else 0,
-                tokens_output=getattr(msg.usage, "output_tokens", 0) if hasattr(msg, "usage") else 0,
-                duration_ms=duration_ms,
-            )
-        except Exception:
-            pass
+        prose, proposal = _parse_improvement_proposal(result.text)
         return ChatResponse(
             reply=prose,
             improvement_proposal=proposal,
-            duration_ms=duration_ms,
-            model="claude-sonnet-4-6",
+            duration_ms=result.duration_ms,
+            model=f"{result.provider}:{result.model}",
         )
+    except LLMAllProvidersFailed as e:
+        logger.warning(f"chat_explain all providers failed: {e.attempts}")
+        raise HTTPException(503, "AI service temporarily unavailable — please retry")
     except Exception as e:
         logger.exception("chat_explain failed")
         raise HTTPException(500, f"chat_explain error: {e}")

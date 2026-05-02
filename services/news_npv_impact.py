@@ -95,96 +95,30 @@ Output JSON only."""
 
 def _call_llm_json(prompt: str, max_tokens: int = 2500, temperature: float = 0.3,
                    feature: str = "news_impact", ticker: Optional[str] = None):
-    """Try Claude → OpenAI → Google for JSON output. Returns (dict, err_str).
-    Records every attempt to llm_usage table."""
-    import time as _t
-    
-    def _record(provider, model, status, tokens_in, tokens_out, dur, err=None):
-        try:
-            from services.llm_usage import record_usage
-            record_usage(provider=provider, model=model, feature=feature, ticker=ticker,
-                         tokens_input=tokens_in, tokens_output=tokens_out,
-                         duration_ms=dur, status=status, error_message=err)
-        except Exception:
-            pass
-    
-    # Try Claude
+    """Multi-provider JSON call. Routes through services.llm_gateway —
+    Anthropic → OpenAI → Google fallback chain with key rotation +
+    circuit breaker. Returns (dict, err_str)."""
     try:
-        if os.getenv("ANTHROPIC_API_KEY"):
-            import anthropic
-            client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"), timeout=55.0)
-            t0 = _t.time()
-            resp = client.messages.create(
-                model="claude-sonnet-4-5", max_tokens=max_tokens, temperature=temperature,
-                messages=[{"role":"user","content":prompt}])
-            usage = getattr(resp, "usage", None)
-            tin = getattr(usage, "input_tokens", 0) or 0 if usage else 0
-            tout = getattr(usage, "output_tokens", 0) or 0 if usage else 0
-            dur = int((_t.time() - t0) * 1000)
-            txt = resp.content[0].text
-            data = _parse_json(txt)
-            if data:
-                _record("anthropic", "claude-sonnet-4-5", "success", tin, tout, dur)
-                return data, None
-            _record("anthropic", "claude-sonnet-4-5", "parse_error", tin, tout, dur, "JSON parse failed")
+        from services.llm_gateway import llm_call, LLMAllProvidersFailed
+        result = llm_call(
+            capability="text_json",
+            feature=feature,
+            ticker=ticker,
+            prompt=prompt,
+            system="You are a biotech equity analyst. Respond with JSON only.",
+            max_tokens=max_tokens,
+            temperature=temperature,
+            timeout_s=55.0,
+        )
+        if result.parsed_json is not None:
+            return result.parsed_json, None
+        return None, f"JSON parse failed (provider={result.provider})"
+    except LLMAllProvidersFailed as e:
+        logger.info(f"news_npv all providers failed: {len(e.attempts)} attempts")
+        return None, "All 3 LLM providers failed"
     except Exception as e:
-        logger.info(f"news_npv Claude: {e}")
-        _record("anthropic", "claude-sonnet-4-5", "error", 0, 0, None, str(e)[:300])
-    
-    # Try OpenAI
-    try:
-        if os.getenv("OPENAI_API_KEY"):
-            from openai import OpenAI
-            client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=55.0)
-            t0 = _t.time()
-            resp = client.chat.completions.create(
-                model="gpt-4o", max_tokens=max_tokens, temperature=temperature,
-                response_format={"type":"json_object"},
-                messages=[
-                    {"role":"system","content":"You are a biotech equity analyst. Respond with JSON only."},
-                    {"role":"user","content":prompt}])
-            usage = getattr(resp, "usage", None)
-            tin = getattr(usage, "prompt_tokens", 0) or 0 if usage else 0
-            tout = getattr(usage, "completion_tokens", 0) or 0 if usage else 0
-            dur = int((_t.time() - t0) * 1000)
-            txt = resp.choices[0].message.content
-            data = _parse_json(txt)
-            if data:
-                _record("openai", "gpt-4o", "success", tin, tout, dur)
-                return data, None
-            _record("openai", "gpt-4o", "parse_error", tin, tout, dur, "JSON parse failed")
-    except Exception as e:
-        logger.info(f"news_npv OpenAI: {e}")
-        _record("openai", "gpt-4o", "error", 0, 0, None, str(e)[:300])
-    
-    # Try Google Gemini
-    try:
-        if os.getenv("GOOGLE_API_KEY"):
-            from google import genai as google_genai
-            from google.genai import types as _gtypes
-            client = google_genai.Client(
-                api_key=os.getenv("GOOGLE_API_KEY"),
-                http_options=_gtypes.HttpOptions(timeout=50000),  # 50s, matches OAI/Anthropic
-            )
-            t0 = _t.time()
-            resp = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=f"{prompt}\n\nReturn ONLY valid JSON, no markdown, no preamble.")
-            usage = getattr(resp, "usage_metadata", None)
-            tin = getattr(usage, "prompt_token_count", 0) or 0 if usage else 0
-            tout = getattr(usage, "candidates_token_count", 0) or 0 if usage else 0
-            dur = int((_t.time() - t0) * 1000)
-            txt = resp.text
-            data = _parse_json(txt)
-            if data:
-                _record("google", "gemini-2.5-flash", "success", tin, tout, dur)
-                return data, None
-            _record("google", "gemini-2.5-flash", "parse_error", tin, tout, dur, "JSON parse failed")
-    except Exception as e:
-        logger.info(f"news_npv Gemini: {e}")
-        _record("google", "gemini-2.5-flash", "error", 0, 0, None, str(e)[:300])
-    
-    return None, "All 3 LLM providers failed"
+        logger.warning(f"news_npv unexpected error: {e}")
+        return None, str(e)[:200]
 
 
 def _parse_json(txt: str) -> Optional[dict]:
