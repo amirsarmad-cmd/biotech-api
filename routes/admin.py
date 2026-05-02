@@ -5215,6 +5215,21 @@ async def label_all_start(claim_size: int = 5):
     }
 
 
+@router.get("/labeler/key-status")
+async def labeler_key_status():
+    """Per-Gemini-key health for the outcome labeler. Surfaces success
+    counts, last error, and whether a key is currently on cooldown
+    (rate-limited / quota-exhausted / timeout / auth-failed). The
+    labeler picks the LRU non-cooling key on every call.
+    """
+    try:
+        from services.outcome_labeler import get_key_status
+        return get_key_status()
+    except Exception as e:
+        logger.exception("labeler_key_status failed")
+        raise HTTPException(500, f"labeler_key_status error: {e}")
+
+
 @router.get("/post-catalyst/label-all-status")
 async def label_all_status():
     """Live progress for background label-all task.
