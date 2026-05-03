@@ -672,20 +672,22 @@ def _fill_finviz(
         #     <div class="snapshot-td-content"><b>VALUE</b></div>
         #   </td>
         # Match each label-div followed by the next content-div.
+        # Allow nested HTML in BOTH label and value (analyst-linked fields
+        # like Recom / Target Price wrap the label in an <a href> tag).
         pairs = re.findall(
-            r'<div class="snapshot-td-label[^"]*">([^<]+)</div>'
+            r'<div class="snapshot-td-label[^"]*">(.*?)</div>'
             r'.*?<div class="snapshot-td-content[^"]*">(.*?)</div>',
             html, flags=re.DOTALL,
         )
 
-        # Strip nested HTML tags (<b>, <span class="color-text...">, <small>, links)
-        # from values, decode common entities.
+        # Strip nested HTML tags (<a>, <b>, <span class="color-text...">,
+        # <small>, links) from BOTH labels and values, decode common entities.
         def _clean(s):
             s = re.sub(r"<[^>]+>", "", s).strip()
             s = s.replace("&nbsp;", " ").replace("&amp;", "&")
             return s
 
-        snap = {label.strip(): _clean(val) for label, val in pairs}
+        snap = {_clean(label): _clean(val) for label, val in pairs}
         if not snap:
             return {"_status": "finviz_snapshot_empty (regex matched 0 pairs)"}
 
