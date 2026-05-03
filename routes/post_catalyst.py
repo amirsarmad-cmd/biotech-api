@@ -215,3 +215,33 @@ async def admin_features_coverage():
     except Exception as e:
         logger.exception("coverage report failed")
         raise HTTPException(500, f"coverage error: {e}")
+
+
+@router.get("/admin/features/polygon-debug")
+async def admin_polygon_debug():
+    """Probe the Polygon key inside the running container — confirms whether
+    the env var the worker sees matches the value in Railway's variables UI.
+    Tests the three endpoints used by the feature_store backfiller. Returns
+    masked key + per-endpoint status. Temporary diagnostic; remove after
+    Polygon coverage is healthy."""
+    import os, requests
+    key = os.getenv("POLYGON_API_KEY")
+    if not key:
+        return {"error": "POLYGON_API_KEY not in env"}
+    masked = f"{key[:6]}...{key[-4:]}" if len(key) > 12 else "<short>"
+    results = {"key_masked": masked, "key_len": len(key), "tests": {}}
+    try:
+        r = requests.get("https://api.polygon.io/v3/snapshot/options/NTLA",
+                         params={"limit": 3, "apiKey": key}, timeout=15)
+        results["tests"]["current_snapshot"] = {"status": r.status_code, "body_head": r.text[:200]}
+    except Exception as e:
+        results["tests"]["current_snapshot"] = {"error": f"{type(e).__name__}: {str(e)[:100]}"}
+    try:
+        r = requests.get("https://api.polygon.io/v3/reference/options/contracts",
+                         params={"underlying_ticker": "NTLA", "as_of": "2025-01-15",
+                                 "limit": 3, "apiKey": key},
+                         timeout=15)
+        results["tests"]["historical_contracts"] = {"status": r.status_code, "body_head": r.text[:200]}
+    except Exception as e:
+        results["tests"]["historical_contracts"] = {"error": f"{type(e).__name__}: {str(e)[:100]}"}
+    return results
