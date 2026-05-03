@@ -502,47 +502,67 @@ def _fill_openfda_faers(
 ) -> Dict[str, Any]:
     """OpenFDA FAERS adverse event report counts in 90d / 365d windows
     pre-catalyst. Free REST API at https://api.fda.gov/drug/event.json.
-    Searches `patient.drug.medicinalproduct=DRUG_NAME` (case-insensitive)
-    + `receivedate:[start TO end]`.
+
+    FAERS uses several drug-name fields (drugs report under brand, generic,
+    or substance names depending on the reporter). We OR-query across
+    medicinalproduct, openfda.brand_name, openfda.generic_name, and
+    openfda.substance_name in a single call so we don't miss reports just
+    because the name field varies.
+
+    Raw URL string (not requests' params dict) to avoid `+` getting
+    URL-encoded as %2B which would break Lucene's syntax.
     """
     if not drug_name:
         return {"_status": "no_drug_name", "faers_data_source": None}
     try:
         import requests
+        from urllib.parse import quote
         cd = datetime.fromisoformat(catalyst_date[:10])
         d90_start = (cd - timedelta(days=90)).strftime("%Y%m%d")
         d365_start = (cd - timedelta(days=365)).strftime("%Y%m%d")
         end = cd.strftime("%Y%m%d")
-        # Sanitize drug name — FAERS uses uppercase + escaping for spaces
-        clean = (drug_name or "").upper().split("(")[0].strip().replace(" ", "+")
-        if not clean:
+        # Take the first parenthesized name — for "nexiguran ziclumeran (NTLA-2001)"
+        # we keep "nexiguran ziclumeran" which is the generic INN. Drop
+        # plus signs, quote-escape for Lucene exact-phrase match.
+        base = (drug_name or "").split("(")[0].strip()
+        if not base:
             return {"_status": "drug_name_unusable", "faers_data_source": None}
+        # Lucene exact-phrase match — quoted + URL-encoded
+        # FAERS is case-insensitive but most fields are stored uppercase
+        phrase = quote(f'"{base}"')
         out: Dict[str, Any] = {"faers_data_source": "openfda"}
-        # 90d count (results.count = total report count via meta.results.total)
-        url = "https://api.fda.gov/drug/event.json"
+        notes: List[str] = []
         for window_label, start in (("90d", d90_start), ("365d", d365_start)):
-            params = {
-                "search": f'patient.drug.medicinalproduct:"{clean}"+AND+receivedate:[{start}+TO+{end}]',
-                "limit": 1,
-            }
-            r = requests.get(url, params=params, timeout=15)
+            # OR across drug-name fields — single API call, broader match
+            search = (
+                f"(patient.drug.medicinalproduct:{phrase}"
+                f"+patient.drug.openfda.brand_name:{phrase}"
+                f"+patient.drug.openfda.generic_name:{phrase}"
+                f"+patient.drug.openfda.substance_name:{phrase})"
+                f"+AND+receivedate:[{start}+TO+{end}]"
+            )
+            url = f"https://api.fda.gov/drug/event.json?search={search}&limit=1"
+            r = requests.get(url, timeout=15)
             if r.status_code == 404:
                 count = 0
-            elif r.status_code != 200:
-                continue
-            else:
+                notes.append(f"{window_label}:404=no_matches")
+            elif r.status_code == 200:
                 meta = (r.json() or {}).get("meta", {}) or {}
-                count = (meta.get("results") or {}).get("total", 0)
+                count = (meta.get("results") or {}).get("total", 0) or 0
+                notes.append(f"{window_label}:{count}")
+            else:
+                # Non-200/404 — record the status but don't drop the row
+                notes.append(f"{window_label}:status_{r.status_code}")
+                count = None
             if window_label == "90d":
                 out["adverse_event_count_90d_pre"] = count
             else:
                 out["adverse_event_count_365d_pre"] = count
-        # Serious AE % requires a second query with seriousness filter — skip
-        # for v1 to keep the call budget low. Section chat can add it.
-        out["_status"] = "ok"
+        out["_status"] = f"ok ({', '.join(notes)})"
         return out
     except Exception as e:
-        return {"_status": f"faers_error:{type(e).__name__}", "faers_data_source": None}
+        return {"_status": f"faers_error:{type(e).__name__}:{str(e)[:60]}",
+                "faers_data_source": None}
 
 
 def _fill_clinicaltrials_gov(
@@ -607,41 +627,38 @@ def _fill_clinicaltrials_gov(
 def _fill_finviz(
     *, ticker: str,
 ) -> Dict[str, Any]:
-    """Finviz Elite snapshot via `export.ashx` with explicit column codes.
+    """Finviz Elite snapshot via `export.ashx?v=111` (Custom screener view).
 
-    The previous attempt used `quote_export.ashx` which returns historical
-    OHLC CSV — wrong endpoint for snapshot data. The correct Elite endpoint
-    is `https://elite.finviz.com/export.ashx?v=151&t=TICKER&c=CODES&auth=KEY`
-    where CODES is a comma-separated list of column numbers from Finviz's
-    snapshot screener.
+    Column codes are well-documented for v=111 (NOT v=151 which uses
+    different numbering — that was the prior bug). Reference:
+    https://github.com/lit26/finvizfinance — Finviz screener overview/options/...
 
-    Column codes (Finviz Elite snapshot view v=151):
-      1   Ticker             68  Price
-      11  Insider Own        69  Change
-      12  Insider Trans      70  Volume
-      13  Inst Own           65  Recom (1=Strong Buy ... 5=Strong Sell)
-      14  Inst Trans         44  52W Range / 52W High / 52W Low
-      30  Float              57  Beta
-      31  Short Float        66  Average Volume
-      32  Short Ratio        50  Perf YTD
-      67  Target Price       49  Perf Year
+    v=111 column codes (subset we care about):
+      1   Ticker          26  Insider Own       46  Perf Year
+      6   Market Cap      27  Insider Trans     47  Perf YTD
+      25  Float           28  Inst Own          48  Beta
+                          29  Inst Trans        50  Volatility (Week)
+                          30  Float Short       60  Earnings Date
+                          31  Short Ratio       61  Price
+                                                64  Recom (1=Strong Buy ... 5=Strong Sell)
+                                                65  Target Price
 
-    Insider-transactions backfill uses a separate `insider_export.ashx`
-    endpoint and stays deferred (column shells reserved).
+    Returned in order requested. We parse the CSV by column NAME
+    (case-insensitive) so we're resilient to Finviz reordering columns
+    in their response.
     """
     api_key = (os.getenv("FINVIZ_API_KEY") or "").strip()
     if not api_key:
         return {"_status": "no_finviz_key"}
     try:
         import requests
-        # Columns we want:
-        #   1=Ticker, 65=Recom, 67=Target Price, 68=Price, 50=Perf YTD,
-        #   31=Short Float, 32=Short Ratio, 30=Float, 13=Inst Own,
-        #   12=Insider Trans
-        cols = "1,65,67,68,50,31,32,30,13,12"
+        # Snapshot columns: ticker, market cap, float, insider/inst own,
+        # short interest, perf, volatility, earnings date, price, recom,
+        # target price.
+        cols = "1,6,25,26,27,28,29,30,31,47,48,50,60,61,64,65"
         url = (
             "https://elite.finviz.com/export.ashx"
-            f"?v=151&t={ticker}&c={cols}&auth={api_key}"
+            f"?v=111&t={ticker}&c={cols}&auth={api_key}"
         )
         r = requests.get(url, timeout=20)
         if r.status_code != 200:
