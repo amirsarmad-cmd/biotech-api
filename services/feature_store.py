@@ -627,53 +627,60 @@ def _fill_clinicaltrials_gov(
 def _fill_finviz(
     *, ticker: str,
 ) -> Dict[str, Any]:
-    """Finviz Elite snapshot via `export.ashx?v=111` (Custom screener view).
+    """Finviz snapshot via the public quote.ashx HTML page.
 
-    Column codes are well-documented for v=111 (NOT v=151 which uses
-    different numbering — that was the prior bug). Reference:
-    https://github.com/lit26/finvizfinance — Finviz screener overview/options/...
+    Why scrape instead of API: Finviz Elite's `export.ashx?c=` parameter
+    only respects column codes for certain views (v=151 returns 10 fixed
+    fields; v=111 ignores c= and returns its default basic columns).
+    Recom + Target Price aren't in the snapshot/performance views' code
+    space at all. The public quote.ashx page DOES surface every snapshot
+    field (incl. Recom, Target Price, Insider Trans, Inst Own, Short Float,
+    Perf YTD) in a stable HTML table — this is the same approach the
+    finvizfinance Python library takes. No API key needed for the page.
 
-    v=111 column codes (subset we care about):
-      1   Ticker          26  Insider Own       46  Perf Year
-      6   Market Cap      27  Insider Trans     47  Perf YTD
-      25  Float           28  Inst Own          48  Beta
-                          29  Inst Trans        50  Volatility (Week)
-                          30  Float Short       60  Earnings Date
-                          31  Short Ratio       61  Price
-                                                64  Recom (1=Strong Buy ... 5=Strong Sell)
-                                                65  Target Price
-
-    Returned in order requested. We parse the CSV by column NAME
-    (case-insensitive) so we're resilient to Finviz reordering columns
-    in their response.
+    Insider-transactions backfill (Form 4 detail) uses a separate
+    insider_export.ashx Elite endpoint and stays deferred.
     """
-    api_key = (os.getenv("FINVIZ_API_KEY") or "").strip()
-    if not api_key:
-        return {"_status": "no_finviz_key"}
     try:
-        import requests
-        # Snapshot columns: ticker, market cap, float, insider/inst own,
-        # short interest, perf, volatility, earnings date, price, recom,
-        # target price.
-        cols = "1,6,25,26,27,28,29,30,31,47,48,50,60,61,64,65"
+        import requests, re
+        # User-Agent needed; Finviz blocks the default python-requests UA.
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+            ),
+        }
+        # Try Elite first (slightly fresher data + auth-respected on the page),
+        # fall back to public if no key.
+        api_key = (os.getenv("FINVIZ_API_KEY") or "").strip()
         url = (
-            "https://elite.finviz.com/export.ashx"
-            f"?v=111&t={ticker}&c={cols}&auth={api_key}"
+            f"https://elite.finviz.com/quote.ashx?t={ticker}&auth={api_key}"
+            if api_key else f"https://finviz.com/quote.ashx?t={ticker}"
         )
-        r = requests.get(url, timeout=20)
+        r = requests.get(url, headers=headers, timeout=20)
         if r.status_code != 200:
-            return {"_status": f"finviz_status_{r.status_code}"}
-        body = r.text or ""
-        if not body or "<html" in body[:200].lower() or "login" in body[:200].lower():
-            return {"_status": "finviz_auth_returned_html (check FINVIZ_API_KEY)"}
-        # CSV — header row + one data row for our single-ticker filter.
-        # Parse by NAME (case-insensitive) — Finviz column codes are
-        # quirky and depend on the v= view; reading by name is resilient.
-        import csv, io
-        reader = csv.DictReader(io.StringIO(body))
-        row = next(reader, None) or {}
-        if not row:
-            return {"_status": "finviz_empty_response"}
+            return {"_status": f"finviz_quote_status_{r.status_code}"}
+        html = r.text or ""
+        if "snapshot-td" not in html:
+            return {"_status": "finviz_no_snapshot_table (page format may have changed)"}
+
+        # The snapshot table is structured: <td class="snapshot-td2-cp">Label</td>
+        # immediately followed by <td class="snapshot-td2 ..."><b>Value</b></td>.
+        # Cheap regex pair extraction:
+        pairs = re.findall(
+            r'class="snapshot-td2-cp[^"]*"[^>]*>([^<]+)</td>'
+            r'\s*<td[^>]*class="snapshot-td2[^"]*"[^>]*>(.*?)</td>',
+            html, flags=re.DOTALL,
+        )
+        # Strip HTML tags from values (some have <b>, <span>, links)
+        def _clean(s):
+            s = re.sub(r"<[^>]+>", "", s).strip()
+            s = s.replace("&nbsp;", " ")
+            return s
+
+        snap = {label.strip(): _clean(val) for label, val in pairs}
+        if not snap:
+            return {"_status": "finviz_snapshot_empty (regex matched 0 pairs)"}
 
         def _to_float(s):
             if s is None or s in ("", "-", "N/A"):
@@ -683,29 +690,20 @@ def _fill_finviz(
             except Exception:
                 return None
 
-        # Build a case-insensitive lookup of header → value
-        norm = {(k or "").strip().lower(): v for k, v in row.items()}
-        def _get(*candidates):
-            for name in candidates:
-                v = norm.get(name.lower())
-                if v not in (None, "", "-", "N/A"):
-                    return v
-            return None
-
-        recom  = _to_float(_get("Recom", "Analyst Recom", "Recommendation"))
-        target = _to_float(_get("Target Price", "Target", "Price Target"))
-        price  = _to_float(_get("Price"))
+        recom  = _to_float(snap.get("Recom"))
+        target = _to_float(snap.get("Target Price"))
+        price  = _to_float(snap.get("Price"))
         out = {
             "analyst_recommendation_avg": recom,
             "analyst_target_price_usd": target,
             "analyst_target_upside_pct": ((target - price) / price * 100) if (target and price) else None,
-            "finviz_perf_ytd_pct": _to_float(_get("Perf YTD", "Performance YTD")),
-            "finviz_data_source": "finviz_elite_export_v151",
+            "finviz_perf_ytd_pct": _to_float(snap.get("Perf YTD")),
+            "finviz_data_source": "finviz_quote_html_scrape",
             "_status": (
-                "ok" if (recom or target or price) else
-                f"finviz_returned_{len(norm)}_cols_but_no_recom_target_price"
+                "ok" if (recom is not None or target is not None) else
+                f"finviz_no_recom_target (snapshot had {len(snap)} fields)"
             ),
-            "_extra_columns_seen": list(norm.keys()),  # surfaces what we DID get
+            "_snapshot_field_count": len(snap),
         }
         return out
     except Exception as e:
