@@ -11,6 +11,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Chromium for Playwright-based paywalled-news fetchers (SA, STAT+).
+# --with-deps installs the OS libs Chromium needs (libnss3, libasound2, etc).
+# Adds ~250MB to the image but is required for fetch_sa_logged_in / news_stat_plus.
+RUN playwright install --with-deps chromium
+
 COPY . .
 
 ENV PYTHONUNBUFFERED=1 \
