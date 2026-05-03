@@ -343,20 +343,34 @@ async def admin_data_feed_debug():
     except Exception as e:
         out["massive"]["tests"]["historical_contracts"] = {"error": str(e)[:120]}
 
-    # Finviz Elite
+    # Finviz Elite — probe quote.ashx HTML scrape (matches _fill_finviz).
     fv_raw = os.getenv("FINVIZ_API_KEY", "")
     fv_key = fv_raw.strip()
     out["finviz"] = {"raw_repr": repr(fv_raw), "stripped_len": len(fv_key)}
     try:
-        # Match _fill_finviz: v=111 with the documented column codes that
-        # actually return Recom (64) and Target Price (65).
-        url = (
-            "https://elite.finviz.com/export.ashx"
-            f"?v=111&t=NTLA&c=1,6,25,26,27,28,29,30,31,47,48,50,60,61,64,65&auth={fv_key}"
-        )
-        r = requests.get(url, timeout=20)
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+            ),
+        }
+        url = (f"https://elite.finviz.com/quote.ashx?t=NTLA&auth={fv_key}"
+               if fv_key else "https://finviz.com/quote.ashx?t=NTLA")
+        r = requests.get(url, headers=headers, timeout=20)
         out["finviz"]["status"] = r.status_code
-        out["finviz"]["body_head"] = r.text[:800]
+        # Surface enough of the snapshot table region so we can see the
+        # actual class names + structure to fix the regex.
+        body = r.text or ""
+        idx = body.find("snapshot-table")
+        if idx == -1:
+            idx = body.find("snapshot-td")
+        if idx == -1:
+            out["finviz"]["body_head"] = body[:500]
+            out["finviz"]["snapshot_marker"] = "NOT_FOUND"
+        else:
+            out["finviz"]["snapshot_marker_at"] = idx
+            out["finviz"]["snapshot_window"] = body[idx:idx + 1500]
+        out["finviz"]["body_total_len"] = len(body)
     except Exception as e:
-        out["finviz"]["error"] = str(e)[:120]
+        out["finviz"]["error"] = str(e)[:200]
     return out
