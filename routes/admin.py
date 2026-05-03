@@ -51,6 +51,12 @@ async def sa_probe(ticker: str = "MRNA"):
         if not user or not pwd:
             return {"error": "SA_USER/SA_PASS not set"}
 
+        report: Dict = {"steps": []}
+
+        def _safe(name, fn):
+            try: report[name] = fn()
+            except Exception as e: report[f"{name}_err"] = str(e)[:200]
+
         try:
             with sync_playwright() as p:
                 browser = p.chromium.launch(
@@ -62,73 +68,96 @@ async def sa_probe(ticker: str = "MRNA"):
                     "Chrome/120.0.0.0 Safari/537.36"))
                 page = ctx.new_page()
 
-                report: Dict = {"steps": []}
+                # ── Step 1 — login page ──
+                step1: Dict = {"step": "login_page_loaded"}
+                try:
+                    page.goto("https://seekingalpha.com/login", timeout=25000)
+                    step1["url"] = page.url
+                    step1["title"] = (page.title() or "")[:120]
+                    step1["email_inputs"] = len(page.query_selector_all(
+                        "input[type=email], input[name=email]"))
+                    step1["password_inputs"] = len(page.query_selector_all(
+                        "input[type=password], input[name=password]"))
+                    step1["submit_buttons"] = len(page.query_selector_all(
+                        "button[type=submit]"))
+                    step1["body_first_300_chars"] = ((page.content() or "")[:300])
+                except Exception as e:
+                    step1["error"] = str(e)[:200]
+                report["steps"].append(step1)
 
-                # Step 1 — login page
-                page.goto("https://seekingalpha.com/login", timeout=25000)
-                report["steps"].append({
-                    "step": "login_page_loaded",
-                    "url": page.url, "title": page.title()[:120],
-                    "email_inputs": len(page.query_selector_all(
-                        "input[type=email], input[name=email]")),
-                    "password_inputs": len(page.query_selector_all(
-                        "input[type=password], input[name=password]")),
-                    "submit_buttons": len(page.query_selector_all(
-                        "button[type=submit]")),
-                })
-
-                # Step 2 — submit credentials
+                # ── Step 2 — submit credentials ──
+                step2: Dict = {"step": "after_login_submit"}
                 try:
                     page.fill("input[type=email], input[name=email]", user)
                     page.fill("input[type=password], input[name=password]", pwd)
                     page.click("button[type=submit]")
-                    page.wait_for_load_state("networkidle", timeout=20000)
+                    # Don't wait for networkidle (SA never settles); short DOM-load
+                    try:
+                        page.wait_for_load_state("domcontentloaded", timeout=10000)
+                    except Exception:
+                        pass
+                    import time as _t; _t.sleep(4)
                 except Exception as e:
-                    report["login_submit_error"] = str(e)[:200]
+                    step2["submit_error"] = str(e)[:200]
+                step2["url"] = page.url
+                try: step2["title"] = (page.title() or "")[:120]
+                except Exception as e: step2["title_err"] = str(e)[:120]
+                step2["cookies_set"] = len(ctx.cookies())
+                step2["cookie_names"] = [c["name"] for c in ctx.cookies()][:20]
+                # SA-specific auth-cookie sniff
+                step2["sa_session_cookie_present"] = any(
+                    c["name"].lower() in ("machine_cookie", "sapu", "sa_user", "user-token", "_sasource", "user_id")
+                    for c in ctx.cookies()
+                )
+                report["steps"].append(step2)
 
-                report["steps"].append({
-                    "step": "after_login_submit",
-                    "url": page.url, "title": page.title()[:120],
-                    "cookies_set": len(ctx.cookies()),
-                    "cookie_names": [c["name"] for c in ctx.cookies()][:20],
-                })
+                # ── Step 3 — ticker news page ──
+                step3: Dict = {"step": "ticker_news_page"}
+                try:
+                    page.goto(f"https://seekingalpha.com/symbol/{ticker}/news",
+                              timeout=25000)
+                    try:
+                        page.wait_for_load_state("domcontentloaded", timeout=10000)
+                    except Exception:
+                        pass
+                    import time as _t; _t.sleep(5)
+                except Exception as e:
+                    step3["nav_error"] = str(e)[:200]
+                step3["url"] = page.url
+                try: step3["title"] = (page.title() or "")[:120]
+                except Exception as e: step3["title_err"] = str(e)[:120]
+                try:
+                    body_snippet = (page.content() or "")[:3000]
+                    step3["body_first_500_chars"] = body_snippet[:500]
+                    bl = body_snippet.lower()
+                    step3["page_indicators"] = {
+                        "has_paywall_word": "paywall" in bl,
+                        "has_subscribe_word": "subscribe" in bl,
+                        "has_login_word": "log in" in bl or "sign in" in bl,
+                        "has_captcha_word": "captcha" in bl or "recaptcha" in bl,
+                        "has_cloudflare": "cloudflare" in bl,
+                        "has_just_a_moment": "just a moment" in bl,
+                        "has_403_or_blocked": "403" in body_snippet or "blocked" in bl or "access denied" in bl,
+                    }
+                    step3["selector_counts"] = {
+                        "article": len(page.query_selector_all("article")),
+                        "[class*='news']": len(page.query_selector_all("[class*='news']")),
+                        "[data-test-id='post-list-item']": len(page.query_selector_all("[data-test-id='post-list-item']")),
+                        "h2": len(page.query_selector_all("h2")),
+                        "h3": len(page.query_selector_all("h3")),
+                        "a[href*='/article/']": len(page.query_selector_all("a[href*='/article/']")),
+                        "a[href*='/news/']": len(page.query_selector_all("a[href*='/news/']")),
+                    }
+                except Exception as e:
+                    step3["selector_err"] = str(e)[:200]
+                report["steps"].append(step3)
 
-                # Step 3 — go to a ticker news page
-                page.goto(f"https://seekingalpha.com/symbol/{ticker}/news",
-                          timeout=25000)
-                page.wait_for_load_state("networkidle", timeout=15000)
-
-                # Page state diagnostics
-                body_snippet = (page.content() or "")[:2000]
-                indicators = {
-                    "has_paywall_word": "paywall" in body_snippet.lower(),
-                    "has_subscribe_word": "subscribe" in body_snippet.lower(),
-                    "has_login_word": "log in" in body_snippet.lower() or "sign in" in body_snippet.lower(),
-                    "has_captcha_word": "captcha" in body_snippet.lower() or "recaptcha" in body_snippet.lower(),
-                    "has_cloudflare": "cloudflare" in body_snippet.lower(),
-                    "has_403_or_blocked": "403" in body_snippet or "blocked" in body_snippet.lower(),
-                }
-                selectors = {
-                    "article": len(page.query_selector_all("article")),
-                    "[class*='news']": len(page.query_selector_all("[class*='news']")),
-                    "[data-test-id='post-list-item']": len(page.query_selector_all("[data-test-id='post-list-item']")),
-                    "h2": len(page.query_selector_all("h2")),
-                    "h3": len(page.query_selector_all("h3")),
-                    "a[href*='/article/']": len(page.query_selector_all("a[href*='/article/']")),
-                    "a[href*='/news/']": len(page.query_selector_all("a[href*='/news/']")),
-                }
-                report["steps"].append({
-                    "step": "ticker_news_page",
-                    "url": page.url, "title": page.title()[:120],
-                    "body_first_400_chars": body_snippet[:400],
-                    "page_indicators": indicators,
-                    "selector_counts": selectors,
-                })
-
-                browser.close()
+                try: browser.close()
+                except Exception: pass
                 return report
         except Exception as e:
-            return {"error": "playwright probe raised", "detail": str(e)[:300]}
+            report["fatal"] = str(e)[:300]
+            return report
 
     with ThreadPoolExecutor(max_workers=1) as ex:
         return ex.submit(_probe).result(timeout=120)
