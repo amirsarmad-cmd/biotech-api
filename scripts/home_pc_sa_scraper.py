@@ -293,80 +293,80 @@ def main():
         log.error(f"SA sanity check failed: {e}")
         sys.exit(3)
 
-    all_articles: List[Dict] = []
     summary_per_ticker: Dict[str, Dict] = {}
+    grand_totals = {"received": 0, "inserted": 0, "enriched": 0,
+                    "untouched": 0, "errors_count": 0}
 
     for idx, ticker in enumerate(tickers, 1):
         log.info(f"[{idx}/{len(tickers)}] {ticker}")
-        items = fetch_sa_xml(session, ticker)
-        log.info(f"  XML: {len(items)} items")
-        article_urls = [it for it in items if is_premium_article_url(it["url"])]
-        log.info(f"  /article/ URLs: {len(article_urls)} (capped to {args.max_bodies})")
-
+        articles_for_ticker: List[Dict] = []
         bodies_fetched = 0
         bodies_blocked = 0
-        articles_for_ticker: List[Dict] = []
+        items: List[Dict] = []
+        article_urls: List[Dict] = []
+        try:
+            items = fetch_sa_xml(session, ticker)
+            log.info(f"  XML: {len(items)} items")
+            article_urls = [it for it in items if is_premium_article_url(it["url"])]
+            log.info(f"  /article/ URLs: {len(article_urls)} (capped to {args.max_bodies})")
 
-        # Always submit headlines (with empty body) — Railway already has these from
-        # the SA-XML collector, but ON CONFLICT DO NOTHING dedupes on (ticker, url_hash)
-        for it in items:
-            articles_for_ticker.append({
-                "ticker": ticker,
-                "source": "seeking_alpha_xml",
-                "url": it["url"],
-                "headline": it["headline"],
-                "summary": it["summary"],
-                "body": None,
-                "published_at": it["published_at"],
-                "discovery_path": "home_pc_scraper",
-                "ticker_mention_method": "sa_xml_ticker",
-            })
-
-        # Fetch bodies for the top N /article/ URLs
-        for it in article_urls[:args.max_bodies]:
-            body = fetch_sa_article_body(session, it["url"])
-            if body is None:
-                bodies_blocked += 1
-            else:
-                bodies_fetched += 1
-                # Insert as `seeking_alpha_premium` (different source so we
-                # can distinguish "headline-only XML" from "body-fetched")
+            for it in items:
                 articles_for_ticker.append({
-                    "ticker": ticker,
-                    "source": "seeking_alpha_premium",
-                    "url": it["url"],
-                    "headline": it["headline"],
-                    "summary": it["summary"],
-                    "body": body,
+                    "ticker": ticker, "source": "seeking_alpha_xml",
+                    "url": it["url"], "headline": it["headline"],
+                    "summary": it["summary"], "body": None,
                     "published_at": it["published_at"],
                     "discovery_path": "home_pc_scraper",
                     "ticker_mention_method": "sa_xml_ticker",
                 })
-            if args.body_sleep > 0:
-                time.sleep(args.body_sleep)
+            for it in article_urls[:args.max_bodies]:
+                body = None
+                try:
+                    body = fetch_sa_article_body(session, it["url"])
+                except Exception as e:
+                    log.warning(f"  body fetch raised on {it['url'][:80]}: {e}")
+                if body is None:
+                    bodies_blocked += 1
+                else:
+                    bodies_fetched += 1
+                    articles_for_ticker.append({
+                        "ticker": ticker, "source": "seeking_alpha_premium",
+                        "url": it["url"], "headline": it["headline"],
+                        "summary": it["summary"], "body": body,
+                        "published_at": it["published_at"],
+                        "discovery_path": "home_pc_scraper",
+                        "ticker_mention_method": "sa_xml_ticker",
+                    })
+                if args.body_sleep > 0:
+                    time.sleep(args.body_sleep)
+        except Exception as e:
+            log.warning(f"  ticker {ticker} failed mid-flow: {type(e).__name__}: {e}")
 
         log.info(f"  bodies: {bodies_fetched} fetched, {bodies_blocked} blocked")
-        all_articles.extend(articles_for_ticker)
         summary_per_ticker[ticker] = {
             "xml_items": len(items),
             "article_urls": len(article_urls),
             "bodies_fetched": bodies_fetched,
             "bodies_blocked": bodies_blocked,
         }
+
+        # POST per-ticker so a mid-run crash doesn't lose all progress
+        if articles_for_ticker and not args.dry_run:
+            try:
+                t = post_to_ingest(args.api_base, token, articles_for_ticker)
+                for k in grand_totals:
+                    grand_totals[k] += t.get(k, 0)
+                log.info(f"  POST: rec={t['received']} ins={t['inserted']} enr={t['enriched']} unt={t['untouched']}")
+            except Exception as e:
+                log.warning(f"  POST failed for {ticker}: {e}")
+
         if args.ticker_sleep > 0 and idx < len(tickers):
             time.sleep(args.ticker_sleep)
 
-    log.info(f"total articles to ingest: {len(all_articles)}")
-
-    if args.dry_run:
-        log.info("DRY RUN — skipping ingest POST")
-        log.info(f"summary: {json.dumps(summary_per_ticker, indent=2)}")
-        return
-
-    log.info("posting to Railway /admin/news/ingest …")
-    totals = post_to_ingest(args.api_base, token, all_articles)
-    log.info(f"INGEST done: {json.dumps(totals)}")
+    log.info(f"DONE — totals: {json.dumps(grand_totals)}")
     log.info(f"per-ticker summary: {json.dumps(summary_per_ticker)}")
+    if args.dry_run:
+        log.info("(dry-run; no POST)")
 
 
 if __name__ == "__main__":
