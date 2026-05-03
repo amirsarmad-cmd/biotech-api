@@ -149,32 +149,79 @@ def fetch_tipranks_public(ticker, cap=8):
     except Exception as e:
         logger.warning(f"TipRanks {ticker}: {e}"); return []
 
+def _decode_cookies_b64(env_name: str):
+    """Decode the SA_COOKIES_B64 / STAT_PLUS_COOKIES_B64 env var into a
+    Playwright-ready list of cookie dicts. Returns None if not set or
+    malformed (caller falls back to user/pass flow).
+    """
+    import base64, json as _json
+    raw = (os.getenv(env_name) or "").strip()
+    if not raw:
+        return None
+    try:
+        decoded = base64.b64decode(raw).decode("utf-8")
+        cookies = _json.loads(decoded)
+        if isinstance(cookies, list) and cookies:
+            return cookies
+    except Exception as e:
+        logger.warning(f"{env_name} decode failed: {e}")
+    return None
+
+
 def _run_playwright_login(ticker, site):
-    """Common Playwright login routine. site = 'tipranks' or 'sa'."""
+    """Common Playwright login routine. site = 'tipranks' or 'sa'.
+
+    For SA: prefers cookie-based auth via SA_COOKIES_B64 (set by exporting
+    cookies from a logged-in residential-IP browser). PerimeterX blocks
+    the username/password login form on Railway IPs, so cookie replay is
+    the only viable path. Falls back to user/pass if cookies not set.
+    """
     if site == "tipranks":
         user, pwd = os.getenv("TIPRANKS_USER"), os.getenv("TIPRANKS_PASS")
-        if not user or not pwd: return []
-        login_url, news_url = "https://www.tipranks.com/login", f"https://www.tipranks.com/stocks/{ticker}/stock-news"
+        cookies_b64_env = "TIPRANKS_COOKIES_B64"
+        if not user or not pwd:
+            cookies = _decode_cookies_b64(cookies_b64_env)
+            if not cookies: return []
+        news_url = f"https://www.tipranks.com/stocks/{ticker}/stock-news"
+        login_url = "https://www.tipranks.com/login"
         label = "TipRanks (Premium)"
         provider = "TipRanks-Login"
+        use_cookies = bool(_decode_cookies_b64(cookies_b64_env))
     else:
         user, pwd = os.getenv("SA_USER"), os.getenv("SA_PASS")
-        if not user or not pwd: return []
-        login_url, news_url = "https://seekingalpha.com/login", f"https://seekingalpha.com/symbol/{ticker}/news"
+        cookies_b64_env = "SA_COOKIES_B64"
+        cookies_present = bool(_decode_cookies_b64(cookies_b64_env))
+        if not cookies_present and (not user or not pwd): return []
+        news_url = f"https://seekingalpha.com/symbol/{ticker}/news"
+        login_url = "https://seekingalpha.com/login"
         label = "Seeking Alpha (Premium)"
         provider = "SA-Login"
+        use_cookies = cookies_present
+
     try:
         from playwright.sync_api import sync_playwright
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage"])
             ctx = browser.new_context(user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36")
-            page = ctx.new_page()
-            page.goto(login_url, timeout=20000); time.sleep(3)
-            try:
-                page.fill("input[type=email], input[name=email]", user); time.sleep(1)
-                page.fill("input[type=password], input[name=password]", pwd); time.sleep(1)
-                page.click("button[type=submit]"); time.sleep(5)
-            except: pass
+
+            if use_cookies:
+                # Cookie-replay path: skip login form, go straight to news page.
+                cookies = _decode_cookies_b64(cookies_b64_env)
+                try:
+                    ctx.add_cookies(cookies)
+                except Exception as e:
+                    logger.warning(f"{site} cookie add failed: {e}")
+                page = ctx.new_page()
+            else:
+                # Legacy user/pass path (likely fails on Railway IP for SA due to PerimeterX)
+                page = ctx.new_page()
+                page.goto(login_url, timeout=20000); time.sleep(3)
+                try:
+                    page.fill("input[type=email], input[name=email]", user); time.sleep(1)
+                    page.fill("input[type=password], input[name=password]", pwd); time.sleep(1)
+                    page.click("button[type=submit]"); time.sleep(5)
+                except: pass
+
             page.goto(news_url, timeout=20000); time.sleep(3)
             articles = page.evaluate('''() => {
                 const sel = 'article, [class*="news"], [data-test-id="post-list-item"]';

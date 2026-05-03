@@ -47,11 +47,15 @@ async def sa_probe(ticker: str = "MRNA"):
         except ImportError as e:
             return {"error": "playwright not installed", "detail": str(e)}
 
+        # Cookies-first; user/pass as fallback (mostly dead due to PerimeterX)
+        from services.fetcher_news import _decode_cookies_b64
+        cookies = _decode_cookies_b64("SA_COOKIES_B64")
         user, pwd = os.getenv("SA_USER"), os.getenv("SA_PASS")
-        if not user or not pwd:
-            return {"error": "SA_USER/SA_PASS not set"}
+        if not cookies and (not user or not pwd):
+            return {"error": "neither SA_COOKIES_B64 nor SA_USER/SA_PASS set"}
+        use_cookies = bool(cookies)
 
-        report: Dict = {"steps": []}
+        report: Dict = {"mode": "cookies" if use_cookies else "user_pass", "steps": []}
 
         def _safe(name, fn):
             try: report[name] = fn()
@@ -68,48 +72,40 @@ async def sa_probe(ticker: str = "MRNA"):
                     "Chrome/120.0.0.0 Safari/537.36"))
                 page = ctx.new_page()
 
-                # ── Step 1 — login page ──
-                step1: Dict = {"step": "login_page_loaded"}
-                try:
-                    page.goto("https://seekingalpha.com/login", timeout=25000)
-                    step1["url"] = page.url
-                    step1["title"] = (page.title() or "")[:120]
-                    step1["email_inputs"] = len(page.query_selector_all(
-                        "input[type=email], input[name=email]"))
-                    step1["password_inputs"] = len(page.query_selector_all(
-                        "input[type=password], input[name=password]"))
-                    step1["submit_buttons"] = len(page.query_selector_all(
-                        "button[type=submit]"))
-                    step1["body_first_300_chars"] = ((page.content() or "")[:300])
-                except Exception as e:
-                    step1["error"] = str(e)[:200]
-                report["steps"].append(step1)
-
-                # ── Step 2 — submit credentials ──
-                step2: Dict = {"step": "after_login_submit"}
-                try:
-                    page.fill("input[type=email], input[name=email]", user)
-                    page.fill("input[type=password], input[name=password]", pwd)
-                    page.click("button[type=submit]")
-                    # Don't wait for networkidle (SA never settles); short DOM-load
+                # ── Auth setup (cookies vs user/pass) ──
+                if use_cookies:
+                    step_auth: Dict = {"step": "cookies_loaded"}
                     try:
-                        page.wait_for_load_state("domcontentloaded", timeout=10000)
-                    except Exception:
-                        pass
-                    import time as _t; _t.sleep(4)
-                except Exception as e:
-                    step2["submit_error"] = str(e)[:200]
-                step2["url"] = page.url
-                try: step2["title"] = (page.title() or "")[:120]
-                except Exception as e: step2["title_err"] = str(e)[:120]
-                step2["cookies_set"] = len(ctx.cookies())
-                step2["cookie_names"] = [c["name"] for c in ctx.cookies()][:20]
-                # SA-specific auth-cookie sniff
-                step2["sa_session_cookie_present"] = any(
-                    c["name"].lower() in ("machine_cookie", "sapu", "sa_user", "user-token", "_sasource", "user_id")
-                    for c in ctx.cookies()
-                )
-                report["steps"].append(step2)
+                        ctx.add_cookies(cookies)
+                        step_auth["cookies_added"] = len(cookies)
+                        step_auth["auth_cookie_names_present"] = sorted([
+                            c["name"] for c in ctx.cookies() if c["name"] in
+                            ("user_remember_token", "_sapi_session_id", "user_id",
+                             "user_nick", "has_paid_subscription", "gk_user_access",
+                             "sapu", "machine_cookie")
+                        ])
+                    except Exception as e:
+                        step_auth["error"] = str(e)[:200]
+                    report["steps"].append(step_auth)
+                else:
+                    # Legacy user/pass path (PerimeterX usually blocks this)
+                    step1: Dict = {"step": "login_page_loaded"}
+                    try:
+                        page.goto("https://seekingalpha.com/login", timeout=25000)
+                        step1["url"] = page.url
+                        step1["title"] = (page.title() or "")[:120]
+                        step1["email_inputs"] = len(page.query_selector_all(
+                            "input[type=email], input[name=email]"))
+                    except Exception as e:
+                        step1["error"] = str(e)[:200]
+                    report["steps"].append(step1)
+                    try:
+                        page.fill("input[type=email], input[name=email]", user)
+                        page.fill("input[type=password], input[name=password]", pwd)
+                        page.click("button[type=submit]")
+                        import time as _t; _t.sleep(4)
+                    except Exception as e:
+                        report["steps"].append({"step": "submit_error", "error": str(e)[:200]})
 
                 # ── Step 3 — ticker news page ──
                 step3: Dict = {"step": "ticker_news_page"}
@@ -171,7 +167,8 @@ async def news_auth_status():
     Lets us confirm Railway env upserts actually reached the running
     process without exposing secrets.
     """
-    keys = ["SA_USER", "SA_PASS", "TIPRANKS_USER", "TIPRANKS_PASS",
+    keys = ["SA_USER", "SA_PASS", "SA_COOKIES_B64",
+            "TIPRANKS_USER", "TIPRANKS_PASS", "TIPRANKS_COOKIES_B64",
             "STAT_PLUS_USER", "STAT_PLUS_PASS", "STAT_PLUS_COOKIES_B64"]
     return {k.lower() + "_set": bool(os.getenv(k)) for k in keys}
 
