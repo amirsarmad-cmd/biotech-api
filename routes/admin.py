@@ -4,7 +4,7 @@
 import logging, os, json
 from datetime import datetime
 from typing import Optional, Dict
-from fastapi import APIRouter, HTTPException, BackgroundTasks
+from fastapi import APIRouter, HTTPException, BackgroundTasks, Request
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
@@ -304,6 +304,211 @@ async def news_auth_status():
             "TIPRANKS_USER", "TIPRANKS_PASS", "TIPRANKS_COOKIES_B64",
             "STAT_PLUS_USER", "STAT_PLUS_PASS", "STAT_PLUS_COOKIES_B64"]
     return {k.lower() + "_set": bool(os.getenv(k)) for k in keys}
+
+
+# ─── News library + ingest endpoints ──────────────────────────────────────
+
+@router.post("/migrations/apply-025")
+async def apply_migration_025():
+    """One-shot apply of migration 025 (catalyst_event_news +
+    per-LLM consensus columns). Idempotent — uses CREATE TABLE IF NOT
+    EXISTS / ADD COLUMN IF NOT EXISTS / CREATE INDEX IF NOT EXISTS,
+    so safe to call repeatedly. Bumps alembic_version on success.
+    """
+    try:
+        from alembic.config import Config
+        from alembic import command
+        cfg = Config("alembic.ini")
+        command.upgrade(cfg, "025_news_library_and_consensus")
+        return {"ok": True, "applied": "025_news_library_and_consensus"}
+    except Exception as e:
+        logger.exception("apply-025 failed")
+        # Fall back to direct SQL apply if alembic fails (e.g. env mismatch)
+        try:
+            from alembic.script import ScriptDirectory
+            from alembic.config import Config as _Cfg
+            mig_path = ScriptDirectory.from_config(_Cfg("alembic.ini")).get_revision(
+                "025_news_library_and_consensus").path
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("mig025", mig_path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            with _pg_conn() as conn:
+                conn.autocommit = True
+                with conn.cursor() as cur:
+                    # Replicate mod.upgrade() statements via raw cursor.
+                    # Since op.execute() under alembic uses the cursor too,
+                    # we monkey-patch a tiny shim that just executes SQL.
+                    class _ShimOp:
+                        @staticmethod
+                        def execute(sql): cur.execute(sql)
+                    import alembic.op as alembic_op
+                    orig_execute = alembic_op.execute
+                    alembic_op.execute = _ShimOp.execute
+                    try:
+                        mod.upgrade()
+                    finally:
+                        alembic_op.execute = orig_execute
+                    cur.execute("""
+                        UPDATE alembic_version
+                        SET version_num = '025_news_library_and_consensus'
+                        WHERE TRUE
+                    """)
+            return {"ok": True, "applied_via": "raw-sql-fallback"}
+        except Exception as e2:
+            raise HTTPException(500, f"apply-025 failed: alembic={e}; fallback={e2}")
+
+
+@router.get("/news/library-status")
+async def news_library_status():
+    """Coverage stats for the catalyst_event_news library."""
+    try:
+        with _pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM catalyst_event_news")
+                total = cur.fetchone()[0]
+                cur.execute("""
+                    SELECT source, COUNT(*) AS n
+                    FROM catalyst_event_news
+                    GROUP BY source
+                    ORDER BY n DESC
+                """)
+                by_source = [{"source": r[0], "count": r[1]} for r in cur.fetchall()]
+                cur.execute("SELECT COUNT(DISTINCT ticker) FROM catalyst_event_news")
+                tickers_covered = cur.fetchone()[0]
+                cur.execute("""
+                    SELECT MIN(published_at), MAX(published_at)
+                    FROM catalyst_event_news
+                    WHERE published_at IS NOT NULL
+                """)
+                ranges = cur.fetchone()
+                cur.execute("""
+                    SELECT COUNT(*) FROM catalyst_event_news WHERE body IS NOT NULL
+                """)
+                with_body = cur.fetchone()[0]
+        return {
+            "total_articles": total,
+            "tickers_covered": tickers_covered,
+            "by_source": by_source,
+            "articles_with_body": with_body,
+            "oldest_published": ranges[0].isoformat() if ranges and ranges[0] else None,
+            "newest_published": ranges[1].isoformat() if ranges and ranges[1] else None,
+        }
+    except Exception as e:
+        raise HTTPException(500, f"library-status: {e}")
+
+
+@router.post("/news/sa-xml-collect")
+async def sa_xml_collect_for_tickers(tickers: Optional[str] = None, limit: int = 50):
+    """Fetch SA XML feeds for a comma-separated list of tickers, or for
+    `limit` distinct tickers from post_catalyst_outcomes if no list given.
+
+    Persists to catalyst_event_news via news_library.insert_news_row.
+    Uses the public XML endpoint that bypasses PerimeterX (works from
+    Railway). Returns per-ticker insertion stats.
+    """
+    from services.news_sa_xml import collect_to_library
+    if tickers:
+        ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+    else:
+        with _pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT DISTINCT ticker FROM post_catalyst_outcomes
+                    WHERE catalyst_date IS NOT NULL
+                    ORDER BY ticker
+                    LIMIT %s
+                """, (limit,))
+                ticker_list = [r[0] for r in cur.fetchall()]
+    results: Dict[str, Dict] = {}
+    total_inserted = 0
+    with _pg_conn() as conn:
+        for t in ticker_list:
+            stats = collect_to_library(conn, t)
+            results[t] = stats
+            total_inserted += stats.get("inserted", 0)
+            conn.commit()
+    return {
+        "tickers_processed": len(ticker_list),
+        "total_inserted": total_inserted,
+        "per_ticker": results,
+    }
+
+
+# Auth-protected ingest for the home-PC scraper that fetches
+# SA-Premium / paywalled bodies using user's residential IP + Chrome
+# cookies. Rejects requests without a matching X-Ingest-Token header.
+class IngestArticle(BaseModel):
+    ticker: str
+    source: str  # 'seeking_alpha_premium' | 'stat_plus' | etc.
+    url: str
+    headline: str
+    summary: Optional[str] = None
+    body: Optional[str] = None
+    published_at: Optional[str] = None  # ISO 8601 string
+    discovery_path: Optional[str] = None
+    ticker_mention_method: Optional[str] = None
+
+
+class IngestPayload(BaseModel):
+    articles: list[IngestArticle]
+
+
+@router.post("/news/ingest")
+async def news_ingest(payload: IngestPayload, request: Request):
+    """Auth-protected POST endpoint for external (home-PC) scrapers.
+
+    Requires header `X-Ingest-Token: <NEWS_INGEST_TOKEN env value>`.
+    Body: {articles: [{ticker, source, url, headline, ...}, ...]}.
+    Returns counts of inserted vs skipped (dedup via ON CONFLICT).
+    """
+    expected = os.getenv("NEWS_INGEST_TOKEN")
+    if not expected:
+        raise HTTPException(503, "NEWS_INGEST_TOKEN not configured on server")
+    supplied = request.headers.get("x-ingest-token", "")
+    if supplied != expected:
+        raise HTTPException(401, "invalid X-Ingest-Token")
+
+    from services.news_library import insert_news_row
+
+    inserted = 0
+    skipped = 0
+    errors: list[str] = []
+    with _pg_conn() as conn:
+        for art in payload.articles:
+            try:
+                pub_dt = None
+                if art.published_at:
+                    try:
+                        from datetime import datetime as _dt
+                        pub_dt = _dt.fromisoformat(art.published_at.replace("Z", "+00:00"))
+                    except Exception:
+                        pub_dt = None
+                new_id = insert_news_row(
+                    conn,
+                    ticker=art.ticker,
+                    source=art.source,
+                    url=art.url,
+                    headline=art.headline,
+                    summary=art.summary,
+                    body=art.body,
+                    published_at=pub_dt,
+                    discovery_path=art.discovery_path or "external_scraper",
+                    ticker_mention_method=art.ticker_mention_method,
+                )
+                if new_id is not None:
+                    inserted += 1
+                else:
+                    skipped += 1
+            except Exception as e:
+                errors.append(f"{art.ticker}/{art.url[:60]}: {str(e)[:120]}")
+        conn.commit()
+    return {
+        "received": len(payload.articles),
+        "inserted": inserted,
+        "skipped": skipped,
+        "errors": errors[:5],
+    }
 
 
 @router.get("/db/stats")
