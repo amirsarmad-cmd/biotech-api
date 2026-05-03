@@ -70,43 +70,29 @@ def _outcome_label_price_proxy(actual_move_pct_7d: Optional[float]) -> Optional[
 def _fill_price_action(
     *, ticker: str, catalyst_date: str, db: BiotechDatabase,
 ) -> Dict[str, Any]:
-    """Runup, realized vol, max drawdown — from yfinance history we already
-    cache in `price_history_daily` (or compute on demand).
+    """Runup, realized vol, max drawdown — fetched from yfinance (the
+    `price_history_daily` cache table referenced earlier doesn't exist
+    in this DB, so we go straight to yfinance live).
     """
     out: Dict[str, Any] = {}
     status = "ok"
     try:
-        # Try the cached price_history_daily table first; fall back to yfinance fetch.
-        with db.get_conn() as conn:
-            cur = conn.cursor()
-            cur.execute(
-                """
-                SELECT date, close
-                FROM price_history_daily
-                WHERE ticker = %s
-                  AND date <= %s::date
-                  AND date >= (%s::date - INTERVAL '200 days')
-                ORDER BY date ASC
-                """,
-                (ticker, catalyst_date, catalyst_date),
-            )
-            rows = cur.fetchall()
+        try:
+            import yfinance as yf
+        except ImportError:
+            return {"_status": "yfinance_unavailable"}
+        cd = datetime.fromisoformat(catalyst_date[:10])
+        start = cd - timedelta(days=210)
+        try:
+            hist = yf.Ticker(ticker).history(start=start.strftime("%Y-%m-%d"),
+                                              end=cd.strftime("%Y-%m-%d"))
+            rows = [(idx.date(), float(close))
+                    for idx, close in zip(hist.index, hist["Close"])
+                    if not math.isnan(close)]
+        except Exception as e:
+            return {"_status": f"yfinance_fetch_failed:{type(e).__name__}"}
         if not rows or len(rows) < 30:
-            # Try yfinance live fetch as fallback (slower but works for any ticker).
-            try:
-                import yfinance as yf
-                from datetime import datetime
-                cd = datetime.fromisoformat(catalyst_date[:10])
-                start = cd - timedelta(days=210)
-                hist = yf.Ticker(ticker).history(start=start.strftime("%Y-%m-%d"),
-                                                  end=cd.strftime("%Y-%m-%d"))
-                rows = [(idx.date(), float(close))
-                        for idx, close in zip(hist.index, hist["Close"])
-                        if not math.isnan(close)]
-            except Exception as e:
-                return {"_status": f"yfinance_fallback_failed:{type(e).__name__}"}
-        if not rows or len(rows) < 30:
-            return {"_status": "insufficient_history"}
+            return {"_status": f"insufficient_history:n={len(rows)}"}
 
         closes = [float(r[1]) for r in rows]
         last = closes[-1]
@@ -207,15 +193,14 @@ def _fill_peer_relative(
 def _fill_polygon_options(
     *, ticker: str, catalyst_date: str,
 ) -> Dict[str, Any]:
-    """Historical options chain at the day before catalyst — Polygon's
-    options aggregates endpoint. Polygon API key is in Railway env as
-    POLYGON_API_KEY. Polygon Stocks Starter ($30/mo) gives 2y historical
-    options aggs; Options Starter ($100/mo) gives 5y including chain snapshots.
+    """Options chain via Polygon's `/v3/snapshot/options/{ticker}` endpoint.
 
-    This fill is best-effort — if the Polygon plan doesn't include the
-    needed endpoint or the chain isn't available for the date, returns
-    NULL columns + a status string. Intentionally kept short — the priced-in
-    calculator can be retrofitted later to read from these columns.
+    Strategy: for upcoming or recent events (catalyst_date within ±14 days
+    of today), use the CURRENT snapshot (no `as_of`) — works on Stocks
+    Starter+ plans. For older historical events, use `as_of=YYYY-MM-DD`
+    which requires Options Advanced plan; if the response is 401/403, we
+    accept NULL columns and report the status so the operator knows to
+    upgrade the plan if they want backfill of historical options chains.
     """
     api_key = os.getenv("POLYGON_API_KEY")
     if not api_key:
@@ -223,23 +208,27 @@ def _fill_polygon_options(
     out: Dict[str, Any] = {}
     try:
         import requests
-        # Day before catalyst (best proxy for "into the event")
         cd = datetime.fromisoformat(catalyst_date[:10])
-        target = (cd - timedelta(days=1)).strftime("%Y-%m-%d")
-
-        # Step 1: get the underlying close price at target (cheap, free tier)
-        # Step 2: pull the options chain snapshot at target — Polygon endpoint:
-        #   /v3/snapshot/options/{underlying}?as_of={date}
-        # NOTE: snapshot 'as_of' is a paid feature on Options Starter+. If the
-        # account is on the free tier, this returns a 403 and we fall back
-        # to setting `options_source=null`.
+        days_from_today = abs((cd - datetime.now()).days)
         url = f"https://api.polygon.io/v3/snapshot/options/{ticker}"
-        params = {"limit": 250, "as_of": target, "apiKey": api_key}
+        params: Dict[str, Any] = {"limit": 250, "apiKey": api_key}
+        if days_from_today > 14:
+            # Historical snapshot — requires Options Advanced plan
+            params["as_of"] = (cd - timedelta(days=1)).strftime("%Y-%m-%d")
+            mode = "historical_snapshot"
+        else:
+            mode = "current_snapshot"
         r = requests.get(url, params=params, timeout=20)
-        if r.status_code == 403:
-            return {"_status": "polygon_plan_does_not_include_historical_chain"}
+        if r.status_code in (401, 403):
+            return {
+                "_status": (
+                    f"polygon_{r.status_code}_{mode}: "
+                    "current snapshot needs Stocks Starter+; historical (as_of=) needs Options Advanced. "
+                    "Upgrade plan or accept NULL options columns for these dates."
+                ),
+            }
         if r.status_code != 200:
-            return {"_status": f"polygon_status_{r.status_code}"}
+            return {"_status": f"polygon_status_{r.status_code}_{mode}"}
         data = r.json()
         results = data.get("results", []) or []
         if not results:
@@ -308,23 +297,18 @@ def _fill_capital_structure(
     *, ticker: str, catalyst_date: str,
 ) -> Dict[str, Any]:
     """Cash, debt, runway from SEC EDGAR via existing services/sec_financials.
-    Picks the most recent 10-Q/K filed BEFORE catalyst_date (point-in-time)
-    rather than the always-current snapshot.
+    The existing function `fetch_capital_structure(ticker)` returns the
+    LATEST filing — accepts the lookback bias for now (point-in-time
+    filtering deferred to a later iteration that traverses _filings).
     """
     try:
         from services import sec_financials  # type: ignore[attr-defined]
     except ImportError:
         return {"_status": "sec_financials_module_unavailable"}
     try:
-        # The existing module exposes get_capital_structure(ticker) which
-        # returns the latest filing — adapt to point-in-time by filtering
-        # filings <= catalyst_date.
-        if hasattr(sec_financials, "get_capital_structure_at"):
-            cs = sec_financials.get_capital_structure_at(ticker, catalyst_date)
-        elif hasattr(sec_financials, "get_capital_structure"):
-            cs = sec_financials.get_capital_structure(ticker)
-        else:
-            return {"_status": "no_capital_structure_function"}
+        if not hasattr(sec_financials, "fetch_capital_structure"):
+            return {"_status": "no_fetch_capital_structure_function"}
+        cs = sec_financials.fetch_capital_structure(ticker)
         if not cs:
             return {"_status": "no_filing_found"}
         out = {
@@ -332,51 +316,69 @@ def _fill_capital_structure(
             "debt_at_date_m": (cs.get("total_debt") or 0) / 1e6 if cs.get("total_debt") else None,
             "runway_months_at_date": cs.get("cash_runway_months"),
             "sec_filing_date_used": cs.get("as_of_filing"),
-            "_status": "ok",
+            "_status": "ok_latest_filing_lookback_bias",
         }
         if out["cash_at_date_m"] is not None and out["debt_at_date_m"] is not None:
             out["net_cash_at_date_m"] = out["cash_at_date_m"] - out["debt_at_date_m"]
         return out
     except Exception as e:
-        return {"_status": f"sec_error:{type(e).__name__}"}
+        return {"_status": f"sec_error:{type(e).__name__}:{str(e)[:60]}"}
 
 
 def _fill_microstructure(
     *, ticker: str, db: BiotechDatabase,
 ) -> Dict[str, Any]:
-    """Short interest + avg volume from screener_stocks (current snapshot —
-    point-in-time short interest deferred to a later iteration that joins
-    historical FINRA data).
+    """Market cap from screener_stocks (only column it actually has);
+    short interest + avg volume + shares outstanding from yfinance live
+    (current snapshot — lookback bias accepted for v1; FINRA historical
+    short interest backfill deferred to a later iteration).
     """
+    out: Dict[str, Any] = {}
+    # 1. Market cap from screener_stocks (only column it actually stores)
     try:
         with db.get_conn() as conn:
             cur = conn.cursor()
             cur.execute(
-                """
-                SELECT short_pct_of_float, avg_volume_3m, market_cap, shares_outstanding
-                FROM screener_stocks
-                WHERE ticker = %s
-                """,
+                "SELECT market_cap FROM screener_stocks WHERE ticker = %s LIMIT 1",
                 (ticker,),
             )
             row = cur.fetchone()
-        if not row:
-            return {"_status": "ticker_not_in_screener"}
-        short_pct, avg_vol_3m, mcap, shares_out = row
-        out = {
-            "short_interest_pct_at_date": float(short_pct) if short_pct is not None else None,
-            "avg_volume_30d": float(avg_vol_3m) if avg_vol_3m is not None else None,
-            "market_cap_at_date_m": float(mcap) if mcap is not None else None,
-            "shares_out_at_date_m": (float(shares_out) / 1e6) if shares_out else None,
-            "_status": "ok_current_snapshot",  # signals lookback bias
-        }
-        # Short ratio = short_int_shares / avg_daily_volume; need short_int in shares
-        if short_pct is not None and shares_out and avg_vol_3m:
-            short_shares = float(short_pct) / 100 * float(shares_out)
-            out["short_ratio_days_at_date"] = short_shares / float(avg_vol_3m) if avg_vol_3m else None
-        return out
+        if row and row[0] is not None:
+            # screener_stocks.market_cap is in MILLIONS USD (per memory note)
+            out["market_cap_at_date_m"] = float(row[0])
     except Exception as e:
-        return {"_status": f"error:{type(e).__name__}"}
+        out["_screener_err"] = f"{type(e).__name__}"
+
+    # 2. yfinance for short interest + shares outstanding + avg volume
+    try:
+        import yfinance as yf
+        info = yf.Ticker(ticker).info or {}
+        short_pct = info.get("shortPercentOfFloat")  # already decimal (0.05 = 5%)
+        if short_pct is not None:
+            out["short_interest_pct_at_date"] = float(short_pct) * 100
+        shares_out = info.get("sharesOutstanding")
+        if shares_out:
+            out["shares_out_at_date_m"] = float(shares_out) / 1e6
+        avg_vol = info.get("averageVolume") or info.get("averageVolume10days")
+        if avg_vol:
+            out["avg_volume_30d"] = float(avg_vol)
+        # Fallback for market cap if screener missed it
+        if "market_cap_at_date_m" not in out and info.get("marketCap"):
+            out["market_cap_at_date_m"] = float(info["marketCap"]) / 1e6
+        # Short ratio = short_int_shares / avg_daily_volume
+        if shares_out and short_pct and avg_vol:
+            short_shares = float(short_pct) * float(shares_out)
+            out["short_ratio_days_at_date"] = short_shares / float(avg_vol) if avg_vol else None
+    except Exception as e:
+        out["_yfinance_err"] = f"{type(e).__name__}"
+
+    if "market_cap_at_date_m" not in out and "shares_out_at_date_m" not in out:
+        out["_status"] = f"all_sources_failed (screener:{out.get('_screener_err','')} yf:{out.get('_yfinance_err','')})"
+    else:
+        out["_status"] = "ok_current_snapshot"
+    out.pop("_screener_err", None)
+    out.pop("_yfinance_err", None)
+    return out
 
 
 def _fill_sec_insider(
