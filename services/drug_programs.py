@@ -144,8 +144,36 @@ def classify_product(
     blob = " ".join((drug_aliases or [])).lower() + " " + (indication or "").lower()
     types_blob = " ".join((catalyst_types or [])).lower()
 
+    # Known commercial-product overrides — heuristic blob misses brand-only
+    # names that don't carry their modality in the string. These are the
+    # widely-traded biotech brands; keep this list tight and only extend
+    # when a misclassification shows up in practice.
+    if any(k in blob for k in (
+        "casgevy", "exagamglogene", "exa-cel",   # CRISPR-edited HSC cell therapy
+        "lyfgenia", "bb305",                     # bluebird BCL11A lentiviral cell therapy
+        "skysona", "elivaldogene",               # bluebird ALD lentiviral cell therapy
+        "kymriah", "yescarta", "tecartus", "breyanzi", "abecma", "carvykti",  # CAR-T
+    )):
+        return "cell_therapy"
+    if any(k in blob for k in (
+        "comirnaty", "spikevax", "mrna-1273", "bnt162",   # COVID mRNA vaccines
+        "shingrix", "fluzone", "fluarix", "gardasil",     # other commercial vaccines
+        "mresvia", "mnexspike", "arexvy",
+    )):
+        return "vaccine"
+    if any(k in blob for k in (
+        "luxturna", "zolgensma", "elevidys", "hemgenix", "roctavian", "beqvez",
+    )):
+        return "gene_therapy_aav"
+
     # Modality keywords in name / indication
     if any(k in blob for k in ("crispr", "cas9", "base edit", "prime edit", "zinc finger", "talen")):
+        # CRISPR-edited cell therapies (ex-vivo) are cell_therapy; in-vivo
+        # editing (LNP-delivered) is gene_editing_invivo. Heuristic: ex-vivo
+        # CRISPR usually pairs with sickle/beta-thal/transplant context.
+        if any(k in blob for k in ("sickle", "beta-thal", "thalassemi",
+                                    "ex-vivo", "ex vivo", "autologous")):
+            return "cell_therapy"
         return "gene_editing_invivo"
     if any(k in blob for k in ("aav", "lentiviral", "adeno-associated", "viral vector", "gene therapy")):
         return "gene_therapy_aav"
