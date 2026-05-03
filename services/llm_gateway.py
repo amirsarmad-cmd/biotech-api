@@ -444,7 +444,17 @@ def _call_anthropic(api_key, model, prompt, messages, system,
     }
     if system:
         kwargs["system"] = system
-    resp = client.messages.create(**kwargs)
+    try:
+        resp = client.messages.create(**kwargs)
+    except Exception as e:
+        # Newer Anthropic models (Opus 4.7+) deprecate `temperature`.
+        # Retry without it on the specific 400.
+        msg = str(e)
+        if "temperature" in msg and "deprecated" in msg.lower() and "temperature" in kwargs:
+            kwargs.pop("temperature", None)
+            resp = client.messages.create(**kwargs)
+        else:
+            raise
     text = resp.content[0].text if resp.content else ""
     usage = getattr(resp, "usage", None)
     tin = (getattr(usage, "input_tokens", 0) or 0) if usage else 0
