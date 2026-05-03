@@ -196,6 +196,12 @@ def backtest_scenario_algo(
     actual move magnitude, the formula does not beat baseline. Move to Phase 2
     (empirical capture rates fit per catalyst_type) before shipping.
     """
+    # post_catalyst_outcomes only sparsely populates predicted_npv_b /
+    # priced_in_fraction (those columns were added but the tracker doesn't
+    # always fill them). For backtest coverage, fall back to:
+    #   - drug_npv_b: latest catalyst_npv_cache row for the ticker (lookback bias)
+    #   - priced_in_fraction: NULL → algo defaults to 0.5 (with flag in inputs_missing)
+    #   - predicted_prob: catalyst_universe.confidence_score if pco column NULL
     db = BiotechDatabase()
     rows: List[Dict[str, Any]] = []
     with db.get_conn() as conn:
@@ -205,15 +211,26 @@ def backtest_scenario_algo(
             SELECT
               pco.catalyst_type, pco.ticker, pco.catalyst_date,
               pco.pre_event_price, pco.actual_move_pct_7d, pco.actual_move_pct_1d,
-              pco.predicted_npv_b, pco.predicted_prob,
+              COALESCE(pco.predicted_npv_b, npc.drug_npv_b)         AS drug_npv_b,
+              COALESCE(pco.predicted_prob, cu.confidence_score)     AS p_approval,
               pco.priced_in_fraction,
               pco.outcome_label_class,
-              s.market_cap as market_cap_m
+              s.market_cap as market_cap_m,
+              (pco.predicted_npv_b IS NOT NULL)  AS npv_from_pco,
+              (npc.drug_npv_b IS NOT NULL)        AS npv_from_cache
             FROM post_catalyst_outcomes pco
             LEFT JOIN screener_stocks s ON s.ticker = pco.ticker
+            LEFT JOIN catalyst_universe cu ON cu.id = pco.catalyst_id
+            LEFT JOIN LATERAL (
+              SELECT drug_npv_b
+              FROM catalyst_npv_cache
+              WHERE ticker = pco.ticker
+                AND drug_npv_b IS NOT NULL
+                AND drug_npv_b > 0
+              ORDER BY computed_at DESC
+              LIMIT 1
+            ) npc ON true
             WHERE pco.actual_move_pct_7d IS NOT NULL
-              AND pco.predicted_npv_b IS NOT NULL
-              AND pco.predicted_prob IS NOT NULL
               AND ((NOT %s) OR pco.outcome_label_class IS NOT NULL)
             ORDER BY pco.catalyst_date DESC
             LIMIT %s
@@ -226,10 +243,19 @@ def backtest_scenario_algo(
 
     scored: List[Dict[str, Any]] = []
     skipped_no_inputs = 0
+    skipped_breakdown = {"no_drug_npv": 0, "no_p_approval": 0, "no_market_cap": 0}
+    npv_source_counts = {"pco": 0, "cache": 0, "missing": 0}
     for r in rows:
+        if r.get("npv_from_pco"):
+            npv_source_counts["pco"] += 1
+        elif r.get("npv_from_cache"):
+            npv_source_counts["cache"] += 1
+        else:
+            npv_source_counts["missing"] += 1
+
         scenario = compute_scenario_range_v2(
-            drug_npv_b_at_p_now=float(r["predicted_npv_b"]) if r.get("predicted_npv_b") else None,
-            p_approval_now=float(r["predicted_prob"]) if r.get("predicted_prob") else None,
+            drug_npv_b_at_p_now=float(r["drug_npv_b"]) if r.get("drug_npv_b") else None,
+            p_approval_now=float(r["p_approval"]) if r.get("p_approval") else None,
             market_cap_m=float(r["market_cap_m"]) if r.get("market_cap_m") else None,
             cash_m=None,
             priced_in_fraction=float(r["priced_in_fraction"]) if r.get("priced_in_fraction") else None,
@@ -237,6 +263,13 @@ def backtest_scenario_algo(
         )
         if scenario.upside_pct is None or scenario.downside_pct is None:
             skipped_no_inputs += 1
+            for missing_input in scenario.inputs_missing:
+                if "drug_npv" in missing_input:
+                    skipped_breakdown["no_drug_npv"] += 1
+                elif "p_approval" in missing_input:
+                    skipped_breakdown["no_p_approval"] += 1
+                elif "market_cap" in missing_input:
+                    skipped_breakdown["no_market_cap"] += 1
             continue
         actual = float(r["actual_move_pct_7d"])
         label = r.get("outcome_label_class")
@@ -340,6 +373,8 @@ def backtest_scenario_algo(
             "rows_eligible": len(rows),
             "rows_scored": total_n,
             "rows_skipped_missing_inputs": skipped_no_inputs,
+            "skipped_breakdown": skipped_breakdown,
+            "drug_npv_source": npv_source_counts,
             "direction_hits": total_hits,
             "direction_judged": total_judged,
             "direction_accuracy_pct": overall_acc,
