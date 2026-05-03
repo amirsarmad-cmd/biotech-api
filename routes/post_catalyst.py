@@ -370,17 +370,29 @@ async def admin_data_feed_debug():
         # actual class names + structure to fix the regex.
         body = r.text or ""
         out["finviz"]["body_total_len"] = len(body)
-        # Show 200-char window around every occurrence of "Recom" /
-        # "Target Price" so we can see EXACTLY how those labels are
-        # rendered (different HTML structure than the snapshot table?).
+        # Section inventory — find every <table> / major class so we can see
+        # what else is on the page besides the snapshot table.
         import re as _re
-        for needle in ("Recom", "Target Price", "Price Target", "Recommendation"):
-            for m in _re.finditer(_re.escape(needle), body):
-                start = max(0, m.start() - 50)
-                end = min(len(body), m.end() + 200)
-                out["finviz"].setdefault(f"context_{needle.replace(' ','_')}", []).append(body[start:end])
-                if len(out["finviz"][f"context_{needle.replace(' ','_')}"]) >= 2:
-                    break  # limit to 2 per needle
+        # Look for table classes / section markers
+        table_classes = sorted(set(_re.findall(r'<table[^>]*class="([^"]+)"', body)))
+        out["finviz"]["table_classes"] = table_classes[:30]
+        # Find counts of common section markers
+        markers = {
+            "insider_table": len(_re.findall(r'class="[^"]*body-table[^"]*"', body)),
+            "ratings_outer_table": body.count("ratings_table"),
+            "news_table_id": body.count("news-table"),
+            "insider_section_id": body.count('id="insider"'),
+            "owner_table": body.count("ownership"),
+            "snapshot_label_divs": body.count('class="snapshot-td-label"'),
+        }
+        out["finviz"]["section_marker_counts"] = markers
+        # Sample first 800 chars around each interesting section
+        for needle in ("body-table", "ratings_table", "news-table", "insider"):
+            m = _re.search(_re.escape(needle), body)
+            if m:
+                start = max(0, m.start() - 30)
+                end = min(len(body), m.end() + 800)
+                out["finviz"][f"snippet_{needle.replace('-','_')}"] = body[start:end]
     except Exception as e:
         out["finviz"]["error"] = str(e)[:200]
     return out
