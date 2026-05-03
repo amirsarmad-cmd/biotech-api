@@ -105,7 +105,9 @@ def upgrade():
           ADD COLUMN IF NOT EXISTS outcome_label_pass1_grounding_json JSONB,
 
           -- Final consensus columns (mirrors of Opus's verdict + derived
-          -- confidence)
+          -- confidence). consensus_json is the full vote-stack with
+          -- per-LLM details, persisted alongside the projected class.
+          ADD COLUMN IF NOT EXISTS outcome_label_consensus_json        JSONB,
           ADD COLUMN IF NOT EXISTS outcome_label_consensus_class       TEXT,
           ADD COLUMN IF NOT EXISTS outcome_label_consensus_confidence  NUMERIC,
           ADD COLUMN IF NOT EXISTS outcome_label_consensus_at          TIMESTAMPTZ,

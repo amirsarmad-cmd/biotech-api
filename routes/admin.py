@@ -309,12 +309,44 @@ async def news_auth_status():
 # ─── News library + ingest endpoints ──────────────────────────────────────
 
 @router.post("/migrations/apply-025")
-async def apply_migration_025():
+async def apply_migration_025(force: bool = False):
     """One-shot apply of migration 025 (catalyst_event_news +
     per-LLM consensus columns). Idempotent — uses CREATE TABLE IF NOT
     EXISTS / ADD COLUMN IF NOT EXISTS / CREATE INDEX IF NOT EXISTS,
-    so safe to call repeatedly. Bumps alembic_version on success.
+    so safe to call repeatedly.
+
+    force=True bypasses alembic's "already applied" check and re-runs
+    the migration's upgrade() via raw SQL. Useful when the migration
+    file gets new ADD-COLUMN entries after the version was already
+    stamped 025.
     """
+    if force:
+        # Skip the alembic optimization and go straight to raw-SQL apply
+        try:
+            from alembic.script import ScriptDirectory
+            from alembic.config import Config as _Cfg
+            mig_path = ScriptDirectory.from_config(_Cfg("alembic.ini")).get_revision(
+                "025_news_library_and_consensus").path
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("mig025", mig_path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            with _pg_conn() as conn:
+                conn.autocommit = True
+                with conn.cursor() as cur:
+                    class _ShimOp:
+                        @staticmethod
+                        def execute(sql): cur.execute(sql)
+                    import alembic.op as alembic_op
+                    orig_execute = alembic_op.execute
+                    alembic_op.execute = _ShimOp.execute
+                    try:
+                        mod.upgrade()
+                    finally:
+                        alembic_op.execute = orig_execute
+            return {"ok": True, "applied_via": "force-raw-sql"}
+        except Exception as e:
+            raise HTTPException(500, f"apply-025 force failed: {e}")
     try:
         from alembic.config import Config
         from alembic import command
