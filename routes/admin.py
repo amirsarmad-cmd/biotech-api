@@ -292,6 +292,35 @@ async def sa_xml_inspect(ticker: str = "MRNA", with_cookies: bool = True):
     return out
 
 
+@router.post("/news/stat-collect-once")
+async def stat_collect_once(feed: str = "biotech", fetch_bodies: bool = True,
+                              max_articles: int = 30):
+    """Pull the STAT public RSS feed (default biotech), optionally fetch
+    Premium article bodies via STAT_PLUS_COOKIES_B64 cookies, extract
+    ticker mentions, persist to catalyst_event_news.
+    """
+    from services.news_stat_plus import collect_to_library, DEFAULT_FEED
+    feed_map = {
+        "biotech": DEFAULT_FEED,
+        "pharma": "https://www.statnews.com/category/pharma/feed/",
+        "health-tech": "https://www.statnews.com/category/health-tech/feed/",
+        "fda": "https://www.statnews.com/category/fda/feed/",
+    }
+    feed_url = feed_map.get(feed, feed)  # allow direct URL too
+    try:
+        with _pg_conn() as conn:
+            stats = collect_to_library(
+                conn, feed_url=feed_url,
+                fetch_bodies=fetch_bodies,
+                max_articles=max_articles,
+            )
+            conn.commit()
+        return {"feed": feed, "stats": stats}
+    except Exception as e:
+        logger.exception("stat-collect-once")
+        raise HTTPException(500, f"stat-collect-once: {e}")
+
+
 @router.get("/news/stat-direct-test")
 async def stat_direct_test(slug: Optional[str] = None):
     """Test direct STAT+ paywalled-body fetch from Railway with cookies.
