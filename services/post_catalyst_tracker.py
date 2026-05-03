@@ -68,6 +68,129 @@ REF_MOVES = {
 }
 
 
+# ============================================================
+# prediction_v2 shadow-write helpers
+# ============================================================
+# Used by the backfill INSERT path. The legacy formula keeps writing
+# `predicted_move_pct`. These helpers populate the v2 columns added
+# in migration 020 — `_v1_archive` is always written; the full v2
+# prediction is written only when PREDICTION_V2_ENABLED=1.
+
+def _shadow_write_predicted_v1_archive(
+    ticker: str, cat_type: str, cat_date: str, predicted_move: float,
+) -> None:
+    """Always-on: copy the legacy predicted_move_pct into the
+    `_v1_archive` column so we have a clean rollback source after
+    Phase 4 of the rollout deletes the legacy formula."""
+    try:
+        with _db().get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE post_catalyst_outcomes
+                SET predicted_move_pct_v1_archive = %s
+                WHERE ticker = %s AND catalyst_type = %s AND catalyst_date = %s
+                  AND predicted_move_pct_v1_archive IS NULL
+            """, (predicted_move, ticker, cat_type, cat_date))
+            conn.commit()
+    except Exception as e:
+        logger.info(f"v1_archive write failed for {ticker}@{cat_date}: {e}")
+
+
+def _fetch_market_cap_for_ticker(ticker: str) -> Optional[float]:
+    """Pull market_cap from screener_stocks. screener_stocks.market_cap
+    is in thousands per existing convention."""
+    try:
+        with _db().get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT market_cap FROM screener_stocks WHERE ticker = %s",
+                (ticker,),
+            )
+            row = cur.fetchone()
+            return float(row[0]) if row and row[0] is not None else None
+    except Exception:
+        return None
+
+
+def _shadow_write_prediction_v2(
+    *, ticker: str, catalyst_id: Optional[int],
+    catalyst_type: str, catalyst_date: str,
+    drug_name: Optional[str], indication: Optional[str],
+    company_name: Optional[str],
+) -> None:
+    """Compute the v2 prediction and persist all v2 columns. Called
+    only when PREDICTION_V2_ENABLED=1."""
+    from services.prediction_v2 import compute_prediction
+    market_cap = _fetch_market_cap_for_ticker(ticker)
+    pred = compute_prediction(
+        ticker=ticker,
+        catalyst_id=catalyst_id,
+        catalyst_type=catalyst_type,
+        catalyst_date=catalyst_date,
+        drug_name=drug_name,
+        indication=indication,
+        market_cap=market_cap,
+        company_name=company_name,
+    )
+    try:
+        with _db().get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE post_catalyst_outcomes
+                SET predicted_move_npv_pct = %s,
+                    predicted_move_statistical_pct = %s,
+                    predicted_low_pct = %s,
+                    predicted_high_pct = %s,
+                    predicted_p_source = %s,
+                    predicted_p_confidence = %s,
+                    magnitude_n = %s,
+                    magnitude_fallback_level = %s,
+                    regime = %s,
+                    cap_bucket_at_prediction = %s,
+                    priced_in_fraction = %s,
+                    priced_in_method = %s,
+                    priced_in_ratio_value = %s,
+                    priced_in_options_value = %s,
+                    disagreement_pp = %s,
+                    disagreement_verdict = %s,
+                    disagreement_reasoning = %s,
+                    prediction_source_v2 = %s,
+                    abstained = %s,
+                    abstain_reason = %s
+                WHERE ticker = %s AND catalyst_type = %s AND catalyst_date = %s
+            """, (
+                pred.npv_move,
+                pred.statistical_move,
+                pred.low,
+                pred.high,
+                pred.p_source,
+                pred.p_confidence,
+                pred.magnitude_n,
+                pred.magnitude_fallback_level,
+                pred.regime,
+                pred.cap_bucket,
+                pred.priced_in_fraction,
+                pred.priced_in_method,
+                pred.priced_in_ratio_value,
+                pred.priced_in_options_value,
+                pred.disagreement_pp,
+                pred.disagreement_verdict,
+                pred.disagreement_reasoning,
+                pred.primary_source,
+                pred.abstained,
+                pred.abstain_reason,
+                ticker, catalyst_type, catalyst_date,
+            ))
+            conn.commit()
+        logger.info(
+            f"[prediction_v2] {ticker}@{catalyst_date} "
+            f"primary={pred.primary_source} move={pred.move} "
+            f"abstained={pred.abstained} reason={pred.abstain_reason}"
+        )
+    except Exception as e:
+        logger.warning(f"prediction_v2 UPDATE failed for {ticker}@{catalyst_date}: {e}")
+
+
 def compute_move_estimates(
     catalyst_type: str,
     p_approval: float,
@@ -1094,7 +1217,26 @@ def backfill_one(catalyst: Dict) -> Dict:
                     conn.commit()
             except Exception as e:
                 logger.info(f"options_implied UPDATE failed for {ticker}@{cat_date}: {e}")
-        
+
+        # ── prediction_v2 shadow write ───────────────────────────────
+        # Always archive the legacy value (cheap, used as the rollback
+        # source). Compute v2 only when the feature flag is on, so the
+        # default deploy carries zero behavior change.
+        try:
+            _shadow_write_predicted_v1_archive(
+                ticker, cat_type, cat_date, predicted_move,
+            )
+            if os.getenv("PREDICTION_V2_ENABLED", "0") == "1":
+                _shadow_write_prediction_v2(
+                    ticker=ticker, catalyst_id=cat_id,
+                    catalyst_type=cat_type, catalyst_date=cat_date,
+                    drug_name=catalyst.get("drug_name"),
+                    indication=catalyst.get("indication"),
+                    company_name=catalyst.get("company_name"),
+                )
+        except Exception as e:
+            logger.info(f"prediction_v2 shadow write failed for {ticker}@{cat_date}: {e}")
+
         return {
             "status": "created", "ticker": ticker, "date": cat_date,
             "outcome": outcome, "actual_1d_pct": round(move_1d, 2) if move_1d is not None else None,

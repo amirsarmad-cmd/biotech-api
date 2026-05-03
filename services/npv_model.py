@@ -1489,3 +1489,97 @@ def write_npv_cached(ticker: str, catalyst_id: Optional[int], params_hash: str,
     except Exception as e:
         logger.warning(f"write_npv_cached failed: {e}")
         return False
+
+
+# ============================================================
+# Public NPV-scenarios reader for prediction_v2
+# ============================================================
+
+def get_npv_scenarios(
+    ticker: str, catalyst_id: Optional[int],
+) -> Optional[Dict]:
+    """Read the most recent (any params_hash, TTL-non-expired)
+    catalyst_npv_cache row for a (ticker, catalyst_id) and return the
+    full payload, augmented with the headline scenario fields the
+    NPV-driven prediction needs.
+
+    Returns None if no cache row exists or all rows are expired.
+    Does NOT trigger an LLM compute — that's the lazy-npv-refresh
+    endpoint's job. compute_prediction_v2 calls this; if None, falls
+    back to the statistical model.
+
+    Returns shape (subset of full_payload, plus normalized fields):
+      {
+        "approval_price": float,         # current_price × (1 + remaining_upside_pct/100)
+        "rejection_price": float,        # max(0.01, current_price × (1 + rejection_pct/100))
+        "current_price": float,
+        "p_approval_used": float,
+        "expected_pct": float,
+        "drug_npv_b": float,             # risked NPV in $B
+        "drug_npv_unrisked_b": float,    # before risk
+        "computed_at": datetime,
+        "params_hash": str,
+        "_full": dict,                   # the original full payload
+      }
+    """
+    if not ticker:
+        return None
+    try:
+        from services.database import BiotechDatabase
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            # Most recent row, regardless of params_hash, that hasn't TTL'd.
+            cur.execute("""
+                SELECT full_payload, computed_at, ttl, drug_npv_b, params_hash
+                FROM catalyst_npv_cache
+                WHERE ticker = %s
+                  AND (catalyst_id = %s OR (%s IS NULL AND catalyst_id IS NULL))
+                  AND (ttl IS NULL OR ttl > NOW())
+                ORDER BY computed_at DESC
+                LIMIT 1
+            """, (ticker, catalyst_id, catalyst_id))
+            row = cur.fetchone()
+            if not row:
+                return None
+            payload, computed_at, _ttl, drug_npv_b, params_hash = row
+
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                return None
+        if not isinstance(payload, dict):
+            return None
+
+        # The legacy compute_npv_estimate writes these subkeys:
+        # payload['approval_price'], payload['rejection_price'],
+        # payload['current_price'], payload['p_approval_used'],
+        # payload['expected_pct'].
+        # Some older payloads may not have them — return None so the
+        # caller falls back to statistical instead of returning bogus
+        # numbers.
+        approval_price = payload.get("approval_price")
+        rejection_price = payload.get("rejection_price")
+        current_price = payload.get("current_price")
+        if approval_price is None or rejection_price is None or current_price is None:
+            return None
+
+        rnpv = payload.get("rnpv", {}) if isinstance(payload, dict) else {}
+        unrisked = (rnpv.get("unrisked_rnpv_m") or 0) / 1000.0
+
+        return {
+            "approval_price": float(approval_price),
+            "rejection_price": float(rejection_price),
+            "current_price": float(current_price),
+            "p_approval_used": float(payload.get("p_approval_used") or 0.5),
+            "expected_pct": float(payload.get("expected_pct") or 0.0),
+            "drug_npv_b": float(drug_npv_b or 0.0),
+            "drug_npv_unrisked_b": float(unrisked),
+            "computed_at": computed_at,
+            "params_hash": params_hash,
+            "_full": payload,
+        }
+    except Exception as e:
+        logger.warning(f"get_npv_scenarios({ticker}, {catalyst_id}) failed: {e}")
+        return None

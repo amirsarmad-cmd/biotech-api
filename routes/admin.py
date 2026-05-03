@@ -5470,6 +5470,371 @@ async def apply_migration_019():
         raise HTTPException(500, f"apply_migration_019 error: {e}")
 
 
+# ============================================================
+# prediction_v2 — migration, populator, refresh, compare, calibration
+# ============================================================
+# Implements the user-approved hybrid NPV+statistical prediction
+# wiring (see C:/Users/itsup/.claude/plans/what-do-you-think-linked-sunbeam.md
+# and docs/spec-03-prediction.md). Endpoints below are the operator
+# control surface; the prediction itself runs inside
+# services/post_catalyst_tracker.py behind PREDICTION_V2_ENABLED.
+
+@router.post("/post-catalyst/apply-migration-020")
+async def apply_migration_020():
+    """One-shot for migration 020 — adds the 21 prediction_v2 columns
+    plus the historical_catalyst_moves lookup index. Idempotent."""
+    try:
+        from services.database import BiotechDatabase
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                ALTER TABLE post_catalyst_outcomes
+                ADD COLUMN IF NOT EXISTS predicted_move_pct_v1_archive NUMERIC,
+                ADD COLUMN IF NOT EXISTS predicted_move_npv_pct NUMERIC,
+                ADD COLUMN IF NOT EXISTS predicted_move_statistical_pct NUMERIC,
+                ADD COLUMN IF NOT EXISTS predicted_low_pct NUMERIC,
+                ADD COLUMN IF NOT EXISTS predicted_high_pct NUMERIC,
+                ADD COLUMN IF NOT EXISTS predicted_p_source TEXT,
+                ADD COLUMN IF NOT EXISTS predicted_p_confidence TEXT,
+                ADD COLUMN IF NOT EXISTS magnitude_n INTEGER,
+                ADD COLUMN IF NOT EXISTS magnitude_fallback_level TEXT,
+                ADD COLUMN IF NOT EXISTS regime TEXT,
+                ADD COLUMN IF NOT EXISTS cap_bucket_at_prediction TEXT,
+                ADD COLUMN IF NOT EXISTS priced_in_fraction NUMERIC,
+                ADD COLUMN IF NOT EXISTS priced_in_method TEXT,
+                ADD COLUMN IF NOT EXISTS priced_in_ratio_value NUMERIC,
+                ADD COLUMN IF NOT EXISTS priced_in_options_value NUMERIC,
+                ADD COLUMN IF NOT EXISTS disagreement_pp NUMERIC,
+                ADD COLUMN IF NOT EXISTS disagreement_verdict TEXT,
+                ADD COLUMN IF NOT EXISTS disagreement_reasoning TEXT,
+                ADD COLUMN IF NOT EXISTS prediction_source_v2 TEXT,
+                ADD COLUMN IF NOT EXISTS abstained BOOLEAN DEFAULT FALSE,
+                ADD COLUMN IF NOT EXISTS abstain_reason TEXT
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_hcm_lookup
+                ON historical_catalyst_moves (catalyst_type, market_cap_bucket, source)
+            """)
+            cur.execute("""
+                UPDATE alembic_version_biotech
+                SET version_num = '020_prediction_v2_columns'
+                WHERE version_num = '019_label_attempts'
+            """)
+            stamped = cur.rowcount
+            cur.execute("SELECT version_num FROM alembic_version_biotech")
+            new_v = cur.fetchone()[0]
+            conn.commit()
+        return {"success": True, "new_alembic_version": new_v, "stamped_rows": stamped}
+    except Exception as e:
+        logger.exception("apply_migration_020 failed")
+        raise HTTPException(500, f"apply_migration_020 error: {e}")
+
+
+@router.post("/post-catalyst/refresh-historical-moves")
+async def refresh_historical_moves():
+    """Populate historical_catalyst_moves from labeled outcomes.
+
+    Three tiers (all-time, no decay; see spec § Time-decay):
+      tier1 — type x indication x cap x outcome  (n>=10)
+      tier2 — type x cap x outcome               (n>=30)
+      tier3 — type x outcome                     (n>=20)
+
+    Idempotent: TRUNCATE + INSERT pattern. Wired into APScheduler at
+    04:00 UTC daily.
+    """
+    try:
+        from services.database import BiotechDatabase
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("TRUNCATE TABLE historical_catalyst_moves")
+            cur.execute("""
+                WITH labeled AS (
+                  SELECT pco.catalyst_type,
+                         LOWER(TRIM(pco.indication)) AS indication,
+                         CASE
+                           WHEN s.market_cap IS NULL OR s.market_cap = 0 THEN 'unknown'
+                           WHEN s.market_cap < 500000 THEN 'micro_lt500m'
+                           WHEN s.market_cap < 2000000 THEN 'small_500m_2b'
+                           ELSE 'mid_or_above'
+                         END AS market_cap_bucket,
+                         CASE
+                           WHEN pco.outcome_label_class IN ('APPROVED','MET_ENDPOINT') THEN 'positive'
+                           WHEN pco.outcome_label_class IN ('REJECTED','MISSED_ENDPOINT') THEN 'negative'
+                         END AS outcome_class,
+                         pco.actual_move_pct_30d
+                  FROM post_catalyst_outcomes pco
+                  LEFT JOIN screener_stocks s ON s.ticker = pco.ticker
+                  WHERE pco.outcome_label_class IN
+                        ('APPROVED','REJECTED','MET_ENDPOINT','MISSED_ENDPOINT')
+                    AND pco.actual_move_pct_30d IS NOT NULL
+                    AND pco.outcome_label_confidence >= 0.7
+                )
+                INSERT INTO historical_catalyst_moves (
+                    catalyst_type, indication, market_cap_bucket,
+                    mean_move_pct, p25_move_pct, p75_move_pct, std_dev_pct,
+                    n_observations, source, last_updated
+                )
+                SELECT catalyst_type, indication, market_cap_bucket,
+                       ROUND(AVG(actual_move_pct_30d)::numeric, 2),
+                       ROUND(percentile_cont(0.25) WITHIN GROUP (ORDER BY actual_move_pct_30d)::numeric, 2),
+                       ROUND(percentile_cont(0.75) WITHIN GROUP (ORDER BY actual_move_pct_30d)::numeric, 2),
+                       ROUND(STDDEV(actual_move_pct_30d)::numeric, 2),
+                       COUNT(*),
+                       'tier1_type_indication_cap_outcome:' || outcome_class,
+                       NOW()
+                FROM labeled
+                WHERE indication IS NOT NULL AND outcome_class IS NOT NULL
+                GROUP BY catalyst_type, indication, market_cap_bucket, outcome_class
+                HAVING COUNT(*) >= 10
+                UNION ALL
+                SELECT catalyst_type, NULL, market_cap_bucket,
+                       ROUND(AVG(actual_move_pct_30d)::numeric, 2),
+                       ROUND(percentile_cont(0.25) WITHIN GROUP (ORDER BY actual_move_pct_30d)::numeric, 2),
+                       ROUND(percentile_cont(0.75) WITHIN GROUP (ORDER BY actual_move_pct_30d)::numeric, 2),
+                       ROUND(STDDEV(actual_move_pct_30d)::numeric, 2),
+                       COUNT(*),
+                       'tier2_type_cap_outcome:' || outcome_class,
+                       NOW()
+                FROM labeled
+                WHERE outcome_class IS NOT NULL
+                GROUP BY catalyst_type, market_cap_bucket, outcome_class
+                HAVING COUNT(*) >= 30
+                UNION ALL
+                SELECT catalyst_type, NULL, NULL,
+                       ROUND(AVG(actual_move_pct_30d)::numeric, 2),
+                       ROUND(percentile_cont(0.25) WITHIN GROUP (ORDER BY actual_move_pct_30d)::numeric, 2),
+                       ROUND(percentile_cont(0.75) WITHIN GROUP (ORDER BY actual_move_pct_30d)::numeric, 2),
+                       ROUND(STDDEV(actual_move_pct_30d)::numeric, 2),
+                       COUNT(*),
+                       'tier3_type_outcome:' || outcome_class,
+                       NOW()
+                FROM labeled
+                WHERE outcome_class IS NOT NULL
+                GROUP BY catalyst_type, outcome_class
+                HAVING COUNT(*) >= 20
+            """)
+            cur.execute("""
+                SELECT
+                  COUNT(*) FILTER (WHERE source LIKE 'tier1%') AS tier1,
+                  COUNT(*) FILTER (WHERE source LIKE 'tier2%') AS tier2,
+                  COUNT(*) FILTER (WHERE source LIKE 'tier3%') AS tier3,
+                  COUNT(*) AS total
+                FROM historical_catalyst_moves
+            """)
+            t1, t2, t3, total = cur.fetchone()
+            conn.commit()
+        return {
+            "ok": True,
+            "cells_inserted_tier1": int(t1 or 0),
+            "cells_inserted_tier2": int(t2 or 0),
+            "cells_inserted_tier3": int(t3 or 0),
+            "total_cells": int(total or 0),
+        }
+    except Exception as e:
+        logger.exception("refresh_historical_moves failed")
+        raise HTTPException(500, f"refresh_historical_moves error: {e}")
+
+
+@router.post("/post-catalyst/lazy-npv-refresh")
+async def lazy_npv_refresh(max_n: int = 50):
+    """Compute NPV for upcoming catalysts that don't have a fresh
+    cache row. Rate-limited by max_n to keep total runtime bounded.
+
+    Targets the NPV-primary catalyst types (PDUFA + Phase 3 + Phase 2
+    Readout) within the next 90 days. Skips events whose
+    catalyst_npv_cache row is < 30 days old.
+    """
+    try:
+        from services.database import BiotechDatabase
+        from services.npv_model import (
+            compute_npv_estimate,
+            stable_params_hash,
+            write_npv_cached,
+        )
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT cu.id, cu.ticker, cu.catalyst_type, cu.catalyst_date,
+                       cu.drug_name, cu.indication, cu.confidence_score,
+                       s.market_cap, s.company_name
+                FROM catalyst_universe cu
+                LEFT JOIN screener_stocks s ON s.ticker = cu.ticker
+                LEFT JOIN catalyst_npv_cache c
+                  ON c.ticker = cu.ticker AND c.catalyst_id = cu.id
+                  AND c.computed_at > NOW() - INTERVAL '30 days'
+                WHERE cu.status = 'active'
+                  AND cu.catalyst_date IS NOT NULL
+                  AND cu.catalyst_date BETWEEN CURRENT_DATE
+                                           AND CURRENT_DATE + INTERVAL '90 days'
+                  AND cu.catalyst_type IN
+                      ('FDA Decision','PDUFA Decision','Regulatory Decision',
+                       'Phase 3 Readout','Phase 3','Phase 2 Readout','Phase 2')
+                  AND c.id IS NULL
+                ORDER BY cu.catalyst_date ASC
+                LIMIT %s
+            """, (max_n,))
+            candidates = cur.fetchall()
+
+        checked = computed = errors = 0
+        for r in candidates:
+            checked += 1
+            cat_id, ticker, cat_type, cat_date, drug, indication, conf, mcap, company = r
+            try:
+                # Build a minimal payload spec; npv_model fills the rest
+                payload = compute_npv_estimate(
+                    ticker=ticker,
+                    catalyst_id=cat_id,
+                    catalyst_type=cat_type,
+                    catalyst_date=str(cat_date),
+                    drug_name=drug,
+                    indication=indication,
+                    p_approval=float(conf) if conf is not None else None,
+                    market_cap_m=(float(mcap) / 1000.0) if mcap else None,
+                    company_name=company,
+                )
+                if payload:
+                    h = stable_params_hash(payload)
+                    write_npv_cached(ticker, cat_id, h, payload, ttl_days=30)
+                    computed += 1
+            except Exception as e:
+                errors += 1
+                logger.warning(f"lazy-npv-refresh {ticker}@{cat_date}: {e}")
+
+        return {
+            "ok": True, "checked": checked, "computed": computed,
+            "errors": errors, "max_n": max_n,
+        }
+    except Exception as e:
+        logger.exception("lazy_npv_refresh failed")
+        raise HTTPException(500, f"lazy_npv_refresh error: {e}")
+
+
+@router.get("/post-catalyst/v1-vs-v2-vs-npv-prediction-compare")
+async def v1_vs_v2_vs_npv_compare(days: int = 90):
+    """Per-catalyst-type direction accuracy + abs error for v1, v2
+    statistical, v2 NPV on the labeled set within the last N days.
+
+    Used as the release gate for promoting from Shadow → A/B → Switch
+    UI. Per the plan: v2_npv direction accuracy on the negative-outcome
+    subset (REJECTED + MISSED_ENDPOINT) must be >= 25 pp better than v1.
+    """
+    try:
+        from services.database import BiotechDatabase
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT
+                  catalyst_type,
+                  COUNT(*) FILTER (WHERE predicted_move_pct IS NOT NULL) AS n_v1,
+                  COUNT(*) FILTER (WHERE predicted_move_statistical_pct IS NOT NULL) AS n_v2_stat,
+                  COUNT(*) FILTER (WHERE predicted_move_npv_pct IS NOT NULL) AS n_v2_npv,
+                  ROUND((100.0 * COUNT(*) FILTER (
+                      WHERE predicted_move_pct IS NOT NULL
+                        AND actual_move_pct_30d IS NOT NULL
+                        AND ((predicted_move_pct > 0 AND actual_move_pct_30d > 0)
+                          OR (predicted_move_pct < 0 AND actual_move_pct_30d < 0))
+                  ))::numeric / NULLIF(COUNT(*) FILTER (
+                      WHERE predicted_move_pct IS NOT NULL
+                        AND actual_move_pct_30d IS NOT NULL
+                  ), 0), 1) AS v1_dir_acc,
+                  ROUND((100.0 * COUNT(*) FILTER (
+                      WHERE predicted_move_statistical_pct IS NOT NULL
+                        AND actual_move_pct_30d IS NOT NULL
+                        AND ((predicted_move_statistical_pct > 0 AND actual_move_pct_30d > 0)
+                          OR (predicted_move_statistical_pct < 0 AND actual_move_pct_30d < 0))
+                  ))::numeric / NULLIF(COUNT(*) FILTER (
+                      WHERE predicted_move_statistical_pct IS NOT NULL
+                        AND actual_move_pct_30d IS NOT NULL
+                  ), 0), 1) AS v2_stat_dir_acc,
+                  ROUND((100.0 * COUNT(*) FILTER (
+                      WHERE predicted_move_npv_pct IS NOT NULL
+                        AND actual_move_pct_30d IS NOT NULL
+                        AND ((predicted_move_npv_pct > 0 AND actual_move_pct_30d > 0)
+                          OR (predicted_move_npv_pct < 0 AND actual_move_pct_30d < 0))
+                  ))::numeric / NULLIF(COUNT(*) FILTER (
+                      WHERE predicted_move_npv_pct IS NOT NULL
+                        AND actual_move_pct_30d IS NOT NULL
+                  ), 0), 1) AS v2_npv_dir_acc,
+                  ROUND(AVG(ABS(predicted_move_pct - actual_move_pct_30d))::numeric, 2) AS v1_abs_err,
+                  ROUND(AVG(ABS(predicted_move_statistical_pct - actual_move_pct_30d))::numeric, 2) AS v2_stat_abs_err,
+                  ROUND(AVG(ABS(predicted_move_npv_pct - actual_move_pct_30d))::numeric, 2) AS v2_npv_abs_err,
+                  COUNT(*) FILTER (WHERE abstained = TRUE) AS n_abstained
+                FROM post_catalyst_outcomes
+                WHERE catalyst_date::date >= CURRENT_DATE - %s::int
+                  AND outcome_label_class IS NOT NULL
+                GROUP BY catalyst_type
+                HAVING COUNT(*) >= 5
+                ORDER BY n_v1 DESC
+            """, (days,))
+            cols = [d[0] for d in cur.description]
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+        return {"days": days, "rows": rows}
+    except Exception as e:
+        logger.exception("v1_vs_v2_vs_npv_compare failed")
+        raise HTTPException(500, f"v1_vs_v2_vs_npv_compare error: {e}")
+
+
+@router.get("/llm/prediction-calibration")
+async def prediction_calibration(catalyst_type: Optional[str] = None,
+                                 cap_bucket: Optional[str] = None):
+    """Per-bucket reliability — Brier score + reliability bins +
+    release-gate flag for the v2 prediction.
+
+    Caller can filter by catalyst_type and/or cap_bucket. Without
+    filters, returns one row per (catalyst_type × cap_bucket × p_source)
+    combination that has at least one resolved event.
+    """
+    try:
+        from services.database import BiotechDatabase
+        db = BiotechDatabase()
+        where = ["actual_move_pct_30d IS NOT NULL",
+                 "predicted_p_source IS NOT NULL",
+                 "predicted_move_statistical_pct IS NOT NULL"]
+        params = []
+        if catalyst_type:
+            where.append("catalyst_type = %s"); params.append(catalyst_type)
+        if cap_bucket:
+            where.append("cap_bucket_at_prediction = %s"); params.append(cap_bucket)
+        where_sql = " AND ".join(where)
+
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(f"""
+                SELECT
+                  catalyst_type, cap_bucket_at_prediction, predicted_p_source,
+                  COUNT(*) AS n,
+                  ROUND(AVG(predicted_p_source IS NOT NULL)::numeric, 3) AS coverage,
+                  -- Brier score using NPV-or-statistical primary value
+                  ROUND(AVG(POWER((COALESCE(predicted_move_npv_pct, predicted_move_statistical_pct, 0)/100.0)
+                                  - SIGN(actual_move_pct_30d), 2))::numeric, 4) AS brier_proxy,
+                  -- Direction acc on primary
+                  ROUND((100.0 * COUNT(*) FILTER (
+                      WHERE ((COALESCE(predicted_move_npv_pct, predicted_move_statistical_pct, 0) > 0
+                              AND actual_move_pct_30d > 0)
+                          OR (COALESCE(predicted_move_npv_pct, predicted_move_statistical_pct, 0) < 0
+                              AND actual_move_pct_30d < 0))
+                  ))::numeric / NULLIF(COUNT(*), 0), 1) AS dir_acc_pct,
+                  -- gate: n >= 50 and dir_acc > 55
+                  (COUNT(*) >= 50) AS gate_sample_size_passed,
+                  COUNT(*) FILTER (WHERE abstained = TRUE) AS n_abstained
+                FROM post_catalyst_outcomes
+                WHERE {where_sql}
+                GROUP BY catalyst_type, cap_bucket_at_prediction, predicted_p_source
+                ORDER BY n DESC
+            """, params)
+            cols = [d[0] for d in cur.description]
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+        return {"rows": rows, "filters": {"catalyst_type": catalyst_type,
+                                          "cap_bucket": cap_bucket}}
+    except Exception as e:
+        logger.exception("prediction_calibration failed")
+        raise HTTPException(500, f"prediction_calibration error: {e}")
+
+
 # ────────────────────────────────────────────────────────────
 # EDGAR 8-K backfill (historical catalyst scraping)
 # ────────────────────────────────────────────────────────────
