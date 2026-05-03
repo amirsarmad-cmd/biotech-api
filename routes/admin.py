@@ -29,6 +29,19 @@ async def refresh_universe():
         raise HTTPException(500, f"universe refresh error: {e}")
 
 
+@router.get("/news/auth-status")
+async def news_auth_status():
+    """Boolean-only presence check for paywalled-news scraper credentials.
+
+    No values returned — just whether each env var is set at runtime.
+    Lets us confirm Railway env upserts actually reached the running
+    process without exposing secrets.
+    """
+    keys = ["SA_USER", "SA_PASS", "TIPRANKS_USER", "TIPRANKS_PASS",
+            "STAT_PLUS_USER", "STAT_PLUS_PASS", "STAT_PLUS_COOKIES_B64"]
+    return {k.lower() + "_set": bool(os.getenv(k)) for k in keys}
+
+
 @router.get("/db/stats")
 async def db_stats():
     try:
