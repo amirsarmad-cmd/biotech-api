@@ -29,6 +29,111 @@ async def refresh_universe():
         raise HTTPException(500, f"universe refresh error: {e}")
 
 
+@router.get("/news/sa-probe")
+async def sa_probe(ticker: str = "MRNA"):
+    """One-shot SA login diagnostic. Returns final page URL, title,
+    cookie names, paywall indicators, and selector counts so we can
+    tell whether login worked, whether SA is blocking us, or whether
+    the article-list selectors are stale.
+
+    Runs the sync Playwright in a worker thread (same pattern as
+    fetch_sa_logged_in) so it works from this async route.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _probe():
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError as e:
+            return {"error": "playwright not installed", "detail": str(e)}
+
+        user, pwd = os.getenv("SA_USER"), os.getenv("SA_PASS")
+        if not user or not pwd:
+            return {"error": "SA_USER/SA_PASS not set"}
+
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=["--no-sandbox", "--disable-dev-shm-usage"],
+                )
+                ctx = browser.new_context(user_agent=(
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "Chrome/120.0.0.0 Safari/537.36"))
+                page = ctx.new_page()
+
+                report: Dict = {"steps": []}
+
+                # Step 1 — login page
+                page.goto("https://seekingalpha.com/login", timeout=25000)
+                report["steps"].append({
+                    "step": "login_page_loaded",
+                    "url": page.url, "title": page.title()[:120],
+                    "email_inputs": len(page.query_selector_all(
+                        "input[type=email], input[name=email]")),
+                    "password_inputs": len(page.query_selector_all(
+                        "input[type=password], input[name=password]")),
+                    "submit_buttons": len(page.query_selector_all(
+                        "button[type=submit]")),
+                })
+
+                # Step 2 — submit credentials
+                try:
+                    page.fill("input[type=email], input[name=email]", user)
+                    page.fill("input[type=password], input[name=password]", pwd)
+                    page.click("button[type=submit]")
+                    page.wait_for_load_state("networkidle", timeout=20000)
+                except Exception as e:
+                    report["login_submit_error"] = str(e)[:200]
+
+                report["steps"].append({
+                    "step": "after_login_submit",
+                    "url": page.url, "title": page.title()[:120],
+                    "cookies_set": len(ctx.cookies()),
+                    "cookie_names": [c["name"] for c in ctx.cookies()][:20],
+                })
+
+                # Step 3 — go to a ticker news page
+                page.goto(f"https://seekingalpha.com/symbol/{ticker}/news",
+                          timeout=25000)
+                page.wait_for_load_state("networkidle", timeout=15000)
+
+                # Page state diagnostics
+                body_snippet = (page.content() or "")[:2000]
+                indicators = {
+                    "has_paywall_word": "paywall" in body_snippet.lower(),
+                    "has_subscribe_word": "subscribe" in body_snippet.lower(),
+                    "has_login_word": "log in" in body_snippet.lower() or "sign in" in body_snippet.lower(),
+                    "has_captcha_word": "captcha" in body_snippet.lower() or "recaptcha" in body_snippet.lower(),
+                    "has_cloudflare": "cloudflare" in body_snippet.lower(),
+                    "has_403_or_blocked": "403" in body_snippet or "blocked" in body_snippet.lower(),
+                }
+                selectors = {
+                    "article": len(page.query_selector_all("article")),
+                    "[class*='news']": len(page.query_selector_all("[class*='news']")),
+                    "[data-test-id='post-list-item']": len(page.query_selector_all("[data-test-id='post-list-item']")),
+                    "h2": len(page.query_selector_all("h2")),
+                    "h3": len(page.query_selector_all("h3")),
+                    "a[href*='/article/']": len(page.query_selector_all("a[href*='/article/']")),
+                    "a[href*='/news/']": len(page.query_selector_all("a[href*='/news/']")),
+                }
+                report["steps"].append({
+                    "step": "ticker_news_page",
+                    "url": page.url, "title": page.title()[:120],
+                    "body_first_400_chars": body_snippet[:400],
+                    "page_indicators": indicators,
+                    "selector_counts": selectors,
+                })
+
+                browser.close()
+                return report
+        except Exception as e:
+            return {"error": "playwright probe raised", "detail": str(e)[:300]}
+
+    with ThreadPoolExecutor(max_workers=1) as ex:
+        return ex.submit(_probe).result(timeout=120)
+
+
 @router.get("/news/auth-status")
 async def news_auth_status():
     """Boolean-only presence check for paywalled-news scraper credentials.
