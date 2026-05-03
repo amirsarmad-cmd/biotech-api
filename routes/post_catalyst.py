@@ -238,29 +238,46 @@ async def admin_features_coverage():
 
 @router.get("/admin/features/polygon-debug")
 async def admin_polygon_debug():
-    """Probe the Polygon key inside the running container — confirms whether
-    the env var the worker sees matches the value in Railway's variables UI.
-    Tests the three endpoints used by the feature_store backfiller. Returns
-    masked key + per-endpoint status. Temporary diagnostic; remove after
-    Polygon coverage is healthy."""
+    """Probe Polygon + Finviz inside the running container. Compares
+    `os.getenv` to actual API responses + character-by-character key
+    inspection so trailing whitespace / hidden chars are visible."""
     import os, requests
-    key = os.getenv("POLYGON_API_KEY")
-    if not key:
-        return {"error": "POLYGON_API_KEY not in env"}
-    masked = f"{key[:6]}...{key[-4:]}" if len(key) > 12 else "<short>"
-    results = {"key_masked": masked, "key_len": len(key), "tests": {}}
+    out: Dict[str, object] = {}
+    # Polygon
+    raw = os.getenv("POLYGON_API_KEY", "")
+    key = raw.strip()
+    out["polygon"] = {
+        "raw_repr": repr(raw),  # surfaces any \n / \r / hidden whitespace
+        "stripped_len": len(key),
+        "tests": {},
+    }
     try:
         r = requests.get("https://api.polygon.io/v3/snapshot/options/NTLA",
                          params={"limit": 3, "apiKey": key}, timeout=15)
-        results["tests"]["current_snapshot"] = {"status": r.status_code, "body_head": r.text[:200]}
+        out["polygon"]["tests"]["current_snapshot"] = {"status": r.status_code, "body_head": r.text[:300]}
     except Exception as e:
-        results["tests"]["current_snapshot"] = {"error": f"{type(e).__name__}: {str(e)[:100]}"}
+        out["polygon"]["tests"]["current_snapshot"] = {"error": f"{type(e).__name__}: {str(e)[:120]}"}
+    # Try with header auth (Polygon also accepts Authorization: Bearer)
     try:
-        r = requests.get("https://api.polygon.io/v3/reference/options/contracts",
-                         params={"underlying_ticker": "NTLA", "as_of": "2025-01-15",
-                                 "limit": 3, "apiKey": key},
-                         timeout=15)
-        results["tests"]["historical_contracts"] = {"status": r.status_code, "body_head": r.text[:200]}
+        r = requests.get(
+            "https://api.polygon.io/v3/snapshot/options/NTLA",
+            params={"limit": 3},
+            headers={"Authorization": f"Bearer {key}"},
+            timeout=15,
+        )
+        out["polygon"]["tests"]["bearer_header"] = {"status": r.status_code, "body_head": r.text[:200]}
     except Exception as e:
-        results["tests"]["historical_contracts"] = {"error": f"{type(e).__name__}: {str(e)[:100]}"}
-    return results
+        out["polygon"]["tests"]["bearer_header"] = {"error": str(e)[:120]}
+
+    # Finviz
+    fv_raw = os.getenv("FINVIZ_API_KEY", "")
+    fv_key = fv_raw.strip()
+    out["finviz"] = {"raw_repr": repr(fv_raw), "stripped_len": len(fv_key)}
+    try:
+        url = f"https://elite.finviz.com/quote_export.ashx?t=NTLA&auth={fv_key}"
+        r = requests.get(url, timeout=20)
+        out["finviz"]["status"] = r.status_code
+        out["finviz"]["body_head"] = r.text[:600]
+    except Exception as e:
+        out["finviz"]["error"] = str(e)[:120]
+    return out
