@@ -191,11 +191,27 @@ def _run_playwright_login(ticker, site):
     except Exception as e:
         logger.warning(f"{site} login {ticker}: {e}"); return []
 
+def _run_playwright_login_threaded(ticker, site, timeout_s=90):
+    """Wrap the sync Playwright call in a worker thread.
+
+    Without this, calling _run_playwright_login from an asyncio context
+    (any FastAPI async route) raises "Playwright Sync API inside the
+    asyncio loop". The thread isolates the sync API from the event loop.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    try:
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            return ex.submit(_run_playwright_login, ticker, site).result(timeout=timeout_s)
+    except Exception as e:
+        logger.warning(f"{site} threaded login {ticker} failed: {e}")
+        return []
+
+
 def fetch_tipranks_logged_in(ticker, cap=10):
-    return _run_playwright_login(ticker, "tipranks")[:cap]
+    return _run_playwright_login_threaded(ticker, "tipranks")[:cap]
 
 def fetch_sa_logged_in(ticker, cap=10):
-    return _run_playwright_login(ticker, "sa")[:cap]
+    return _run_playwright_login_threaded(ticker, "sa")[:cap]
 
 
 def fetch_all_sources(ticker, company, catalyst):
