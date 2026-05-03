@@ -419,6 +419,23 @@ async def admin_data_feed_debug():
                 start = max(0, m.start() - 30)
                 end = min(len(body), m.end() + 800)
                 out["finviz"][f"snippet_{needle.replace('-','_')}"] = body[start:end]
+        # Snippets specifically of the FULL ratings table + first 2 insider rows
+        rm = _re.search(r'class="js-table-ratings[^"]*"', body)
+        if rm:
+            tab_start = body.rfind("<table", 0, rm.start())
+            if tab_start != -1:
+                tab_end = body.find("</table>", tab_start)
+                if tab_end != -1:
+                    out["finviz"]["ratings_table_html"] = body[tab_start:tab_end + 8][:3000]
+        # First insider row: search for trans codes 'P' or 'S' in body-table cells
+        for hit in _re.finditer(r'<table[^>]*class="[^"]*body-table[^"]*"', body):
+            tab_start = hit.start()
+            tab_end = body.find("</table>", tab_start)
+            if tab_end != -1:
+                snippet = body[tab_start:tab_end + 8]
+                if "Insider" in snippet or "/insidertrading/" in snippet:
+                    out["finviz"]["insider_table_html"] = snippet[:3000]
+                    break
     except Exception as e:
         out["finviz"]["error"] = str(e)[:200]
     return out
