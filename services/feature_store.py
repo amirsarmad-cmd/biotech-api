@@ -307,18 +307,36 @@ def _massive_historical_snapshot(
     if not contracts:
         return {"_status": "massive_no_contracts_at_date"}
 
-    # Step 2: underlying close on target_str
+    # Step 2: underlying close on target_str.
+    # Try massive.com /v2/aggs first; fall back to yfinance because
+    # Stocks Basic plan returns 403 for dates >2y old. yfinance has
+    # unlimited history and we already use it for price_action.
+    underlying_price = None
     r = requests.get(
         f"https://api.massive.com/v2/aggs/ticker/{ticker}/range/1/day/{target_str}/{target_str}",
         params={"apiKey": api_key},
         timeout=15,
     )
-    if r.status_code != 200:
-        return {"_status": f"massive_underlying_status_{r.status_code}"}
-    px_data = (r.json() or {}).get("results") or []
-    if not px_data:
-        return {"_status": "massive_no_underlying_price"}
-    underlying_price = px_data[0].get("c")
+    if r.status_code == 200:
+        px_data = (r.json() or {}).get("results") or []
+        if px_data:
+            underlying_price = px_data[0].get("c")
+    if underlying_price is None:
+        try:
+            import yfinance as yf
+            cd = datetime.fromisoformat(target_str)
+            hist = yf.Ticker(ticker).history(
+                start=cd.strftime("%Y-%m-%d"),
+                end=(cd + timedelta(days=3)).strftime("%Y-%m-%d"),
+            )
+            for c in hist["Close"]:
+                if not math.isnan(c):
+                    underlying_price = float(c)
+                    break
+        except Exception:
+            pass
+    if underlying_price is None:
+        return {"_status": f"underlying_unavailable_for_{target_str}"}
 
     # Step 3: filter to front-month (20-60 days to expiry from target)
     target_min_exp = (target_date + timedelta(days=20)).date()
@@ -631,7 +649,9 @@ def _fill_finviz(
         body = r.text or ""
         if not body or "<html" in body[:200].lower() or "login" in body[:200].lower():
             return {"_status": "finviz_auth_returned_html (check FINVIZ_API_KEY)"}
-        # CSV — header row + one data row for our single-ticker filter
+        # CSV — header row + one data row for our single-ticker filter.
+        # Parse by NAME (case-insensitive) — Finviz column codes are
+        # quirky and depend on the v= view; reading by name is resilient.
         import csv, io
         reader = csv.DictReader(io.StringIO(body))
         row = next(reader, None) or {}
@@ -646,22 +666,29 @@ def _fill_finviz(
             except Exception:
                 return None
 
-        recom = _to_float(row.get("Recom"))
-        target = _to_float(row.get("Target Price"))
-        price = _to_float(row.get("Price"))
+        # Build a case-insensitive lookup of header → value
+        norm = {(k or "").strip().lower(): v for k, v in row.items()}
+        def _get(*candidates):
+            for name in candidates:
+                v = norm.get(name.lower())
+                if v not in (None, "", "-", "N/A"):
+                    return v
+            return None
+
+        recom  = _to_float(_get("Recom", "Analyst Recom", "Recommendation"))
+        target = _to_float(_get("Target Price", "Target", "Price Target"))
+        price  = _to_float(_get("Price"))
         out = {
             "analyst_recommendation_avg": recom,
             "analyst_target_price_usd": target,
             "analyst_target_upside_pct": ((target - price) / price * 100) if (target and price) else None,
-            "finviz_perf_ytd_pct": _to_float(row.get("Perf YTD")),
+            "finviz_perf_ytd_pct": _to_float(_get("Perf YTD", "Performance YTD")),
             "finviz_data_source": "finviz_elite_export_v151",
-            "_status": "ok",
-            # Bonus columns we now have access to (not in schema yet — add via
-            # migration 023 if a section chat wants them as feature columns):
-            "_extra_short_float_pct": _to_float(row.get("Short Float")),
-            "_extra_short_ratio": _to_float(row.get("Short Ratio")),
-            "_extra_inst_own_pct": _to_float(row.get("Inst Own")),
-            "_extra_insider_trans_pct": _to_float(row.get("Insider Trans")),
+            "_status": (
+                "ok" if (recom or target or price) else
+                f"finviz_returned_{len(norm)}_cols_but_no_recom_target_price"
+            ),
+            "_extra_columns_seen": list(norm.keys()),  # surfaces what we DID get
         }
         return out
     except Exception as e:
