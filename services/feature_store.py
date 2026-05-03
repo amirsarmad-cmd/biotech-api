@@ -958,7 +958,17 @@ def compute_event_features(
     cols = [k for k in feats if k != "_status"]
     placeholders = ", ".join(["%s"] * len(cols))
     col_names = ", ".join(cols)
-    update_clause = ", ".join(f"{c} = EXCLUDED.{c}" for c in cols if c != "catalyst_id")
+    # COALESCE: don't clobber existing populated columns when a source
+    # transiently fails (returns NULL). Without this, a flaky SEC EDGAR
+    # call on refresh=true would erase previously-populated cash/debt.
+    # Bookkeeping cols always overwrite (they should reflect latest run).
+    BOOKKEEPING = {"backfill_source_status", "backfilled_at", "updated_at",
+                   "backfill_version", "llm_enriched_at"}
+    update_clause = ", ".join(
+        (f"{c} = EXCLUDED.{c}" if c in BOOKKEEPING
+         else f"{c} = COALESCE(EXCLUDED.{c}, catalyst_event_features.{c})")
+        for c in cols if c != "catalyst_id"
+    )
     sql = f"""
         INSERT INTO catalyst_event_features ({col_names}, updated_at)
         VALUES ({placeholders}, NOW())

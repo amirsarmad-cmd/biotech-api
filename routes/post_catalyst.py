@@ -236,6 +236,77 @@ async def admin_features_coverage():
         raise HTTPException(500, f"coverage error: {e}")
 
 
+@router.get("/admin/features/per-ticker-coverage")
+async def admin_features_per_ticker_coverage(
+    limit: int = Query(0, ge=0, le=5000, description="0 = no limit"),
+):
+    """Per-ticker boolean coverage matrix for the Data Control Center.
+
+    Collapses the 8762-event feature store to ~1500 ticker rows; each row
+    has BOOL_OR(col IS NOT NULL) flags per source plus labeled / pending /
+    error event counts. On-demand single SQL pass — expected <300ms.
+    """
+    from services.database import BiotechDatabase
+    db = BiotechDatabase()
+    sql = """
+        SELECT
+          cef.ticker,
+          COUNT(*)                                               AS events,
+          BOOL_OR(cef.runup_pct_30d         IS NOT NULL)         AS has_yfinance,
+          BOOL_OR(cef.xbi_runup_30d         IS NOT NULL)         AS has_peers,
+          BOOL_OR(cef.short_interest_pct_at_date IS NOT NULL)    AS has_microstructure,
+          BOOL_OR(cef.cash_at_date_m        IS NOT NULL)         AS has_sec_capital,
+          BOOL_OR(cef.atm_iv_at_date        IS NOT NULL)         AS has_massive_options,
+          BOOL_OR(cef.analyst_recommendation_avg IS NOT NULL OR
+                  cef.analyst_target_price_usd  IS NOT NULL OR
+                  cef.finviz_perf_ytd_pct       IS NOT NULL)     AS has_finviz,
+          BOOL_OR(cef.trial_count_active_at_date IS NOT NULL OR
+                  cef.trial_total_enrollment     IS NOT NULL)    AS has_ctgov,
+          BOOL_OR(cef.adverse_event_count_90d_pre  IS NOT NULL OR
+                  cef.adverse_event_count_365d_pre IS NOT NULL)  AS has_faers,
+          BOOL_OR(cef.outcome_label_gemini  IS NOT NULL)         AS has_label_gemini,
+          BOOL_OR(cef.outcome_label_price_proxy IS NOT NULL)     AS has_label_proxy,
+          BOOL_OR(cef.drug_npv_b_at_date    IS NOT NULL)         AS has_drug_npv,
+          COUNT(*) FILTER (
+            WHERE pco.outcome_label_class IS NOT NULL
+          )                                                      AS labeled_events,
+          COUNT(*) FILTER (
+            WHERE pco.outcome_labeled_at IS NULL
+              AND COALESCE(pco.outcome_label_attempts, 0) < 3
+              AND cef.catalyst_date IS NOT NULL
+          )                                                      AS pending_events,
+          COUNT(*) FILTER (
+            WHERE pco.outcome_labeled_at IS NULL
+              AND COALESCE(pco.outcome_label_attempts, 0) >= 3
+          )                                                      AS error_events,
+          MAX(cef.backfilled_at)                                 AS last_backfilled_at,
+          MAX(cef.llm_enriched_at)                               AS last_enriched_at
+        FROM catalyst_event_features cef
+        LEFT JOIN post_catalyst_outcomes pco ON pco.catalyst_id = cef.catalyst_id
+        GROUP BY cef.ticker
+        ORDER BY cef.ticker
+    """
+    if limit > 0:
+        sql += f"\n        LIMIT {int(limit)}"
+    try:
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(sql)
+            cols = [d[0] for d in cur.description]
+            rows = []
+            for raw in cur.fetchall():
+                row = dict(zip(cols, raw))
+                # JSON-friendly: ints/bools/None pass through; timestamps → ISO
+                for k in ("last_backfilled_at", "last_enriched_at"):
+                    if row.get(k) is not None and hasattr(row[k], "isoformat"):
+                        row[k] = row[k].isoformat()
+                rows.append(row)
+        return {"count": len(rows), "rows": rows}
+    except Exception as e:
+        logger.exception("per-ticker coverage failed")
+        raise HTTPException(500, f"per-ticker coverage error: {e}")
+
+
 @router.get("/admin/features/data-feed-debug")
 async def admin_data_feed_debug():
     """Probe massive.com (options) + Finviz Elite inside the running
@@ -277,14 +348,15 @@ async def admin_data_feed_debug():
     fv_key = fv_raw.strip()
     out["finviz"] = {"raw_repr": repr(fv_raw), "stripped_len": len(fv_key)}
     try:
-        # Use the proper export.ashx endpoint with snapshot column codes
+        # Match _fill_finviz: v=111 with the documented column codes that
+        # actually return Recom (64) and Target Price (65).
         url = (
             "https://elite.finviz.com/export.ashx"
-            f"?v=151&t=NTLA&c=1,65,67,68,50,31,32,30,13,12&auth={fv_key}"
+            f"?v=111&t=NTLA&c=1,6,25,26,27,28,29,30,31,47,48,50,60,61,64,65&auth={fv_key}"
         )
         r = requests.get(url, timeout=20)
         out["finviz"]["status"] = r.status_code
-        out["finviz"]["body_head"] = r.text[:600]
+        out["finviz"]["body_head"] = r.text[:800]
     except Exception as e:
         out["finviz"]["error"] = str(e)[:120]
     return out
