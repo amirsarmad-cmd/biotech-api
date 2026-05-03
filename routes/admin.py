@@ -292,6 +292,70 @@ async def sa_xml_inspect(ticker: str = "MRNA", with_cookies: bool = True):
     return out
 
 
+@router.get("/news/stat-direct-test")
+async def stat_direct_test(slug: Optional[str] = None):
+    """Test direct STAT+ paywalled-body fetch from Railway with cookies.
+
+    Tries:
+      1. Public RSS at /category/biotech/feed/  — should always work
+      2. STAT homepage — sanity check no anti-bot
+      3. A paywalled article page using cookies — the real test of whether
+         the stat_paywall_token JWT works from Railway's IP. Pass ?slug=
+         to test a specific URL slug.
+
+    Returns response code, content-type, byte length, paywall indicators.
+    """
+    import requests
+    from services.fetcher_news import _decode_cookies_b64
+
+    cookies_list = _decode_cookies_b64("STAT_PLUS_COOKIES_B64")
+    jar = {c["name"]: c["value"] for c in cookies_list} if cookies_list else {}
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    # Recent biotech URL fragments — pick the first one if no slug provided.
+    # Use a STAT+ tagged article (paywalled) so we can detect the difference
+    # between "free read" and "paywalled needs auth"
+    tries = [
+        ("rss_biotech",
+         "https://www.statnews.com/category/biotech/feed/"),
+        ("homepage",
+         "https://www.statnews.com/"),
+        ("paywall_test_article",
+         f"https://www.statnews.com/{slug}/" if slug
+         else "https://www.statnews.com/2024/12/30/the-best-stat-stories-of-2024/"),
+    ]
+
+    out = {"cookies_loaded": len(cookies_list or []), "tries": []}
+    for name, url in tries:
+        entry = {"name": name, "url": url}
+        try:
+            r = requests.get(url, cookies=jar, headers=headers, timeout=20)
+            entry["status"] = r.status_code
+            entry["content_type"] = r.headers.get("Content-Type", "")[:80]
+            entry["bytes"] = len(r.content)
+            body_text = r.text or ""
+            bl = body_text.lower()
+            entry["paywall_indicators"] = {
+                "has_paywall_word": "paywall" in bl,
+                "has_subscribe_now": "subscribe now" in bl or "start your free trial" in bl,
+                "has_register_word": "register to read" in bl,
+                "has_login_required": "log in to continue" in bl,
+                "has_stat_plus_marker": "stat+" in bl or "stat_plus" in bl,
+            }
+            entry["body_first_500"] = body_text[:500]
+            entry["body_size_kb"] = round(len(body_text) / 1024, 1)
+        except Exception as e:
+            entry["error"] = f"{type(e).__name__}: {str(e)[:200]}"
+        out["tries"].append(entry)
+    return out
+
+
 @router.get("/news/auth-status")
 async def news_auth_status():
     """Boolean-only presence check for paywalled-news scraper credentials.
