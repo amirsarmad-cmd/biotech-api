@@ -58,6 +58,21 @@ async def post_catalyst_accuracy():
     return get_aggregate_accuracy()
 
 
+@router.get("/v2/stocks/{ticker}/drug-programs")
+async def stock_drug_programs(ticker: str):
+    """Group all catalysts for the ticker by drug program (with substring-
+    aware aliasing so NTLA-2001 / nex-z / nexiguran ziclumeran collapse
+    into one program), sequence them by milestone (Phase 1 → Phase 2 →
+    Phase 3 → Submission → FDA Decision), compute % completion, and
+    surface per-event price action + v2 prediction columns.
+
+    Replaces the user-flagged problem of "too much individual dates and
+    sub-catalysts" with a drug-centric tree view.
+    """
+    from services.drug_programs import get_drug_programs_for_ticker
+    return get_drug_programs_for_ticker(ticker)
+
+
 # ---- Admin ----
 
 @router.post("/admin/post-catalyst/backfill")
