@@ -14,7 +14,7 @@ $Script    = Join-Path $ScriptDir "home_pc_sa_scraper.py"
 $LogFile   = Join-Path $env:USERPROFILE ".biotech-news-scraper\last-run.log"
 
 if (-not (Test-Path $Script)) {
-    Write-Error "Could not find $Script — run this script from biotech-api/scripts/"
+    Write-Error "Could not find $Script - run this script from biotech-api/scripts/"
     exit 1
 }
 
@@ -27,15 +27,19 @@ foreach ($f in @("sa-cookies.json", "ingest-token.txt")) {
     }
 }
 
-# Action: redirect both stdout and stderr to the log
-$argLine = "-u `"$Script`" >> `"$LogFile`" 2>&1"
-$Action = New-ScheduledTaskAction -Execute $Python -Argument $argLine
+# Action: cmd.exe wrapper because >> redirection is a shell feature, not
+# something python.exe parses. Without cmd, Python sees ">>" and "log_path"
+# as argv and argparse rejects them with exit 2.
+$cmdLine = "/c `"`"$Python`" -u `"$Script`" >> `"$LogFile`" 2>&1`""
+$Action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument $cmdLine
 
-# Trigger every 6 hours starting 5 minutes from now
+# Trigger every 6 hours starting 5 minutes from now.
+# Use a long but finite RepetitionDuration; Task Scheduler rejects
+# [TimeSpan]::MaxValue (P99999999...). 10 years = 3650 days is plenty.
 $Start  = (Get-Date).AddMinutes(5)
 $Trigger = New-ScheduledTaskTrigger -Once -At $Start `
     -RepetitionInterval (New-TimeSpan -Hours 6) `
-    -RepetitionDuration ([TimeSpan]::MaxValue)
+    -RepetitionDuration (New-TimeSpan -Days 3650)
 
 # Settings: don't run if on battery, allow start if missed, run as current user
 $Settings = New-ScheduledTaskSettingsSet `
@@ -55,12 +59,12 @@ if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
 
 Register-ScheduledTask -TaskName $TaskName `
     -Action $Action -Trigger $Trigger -Settings $Settings -Principal $Principal `
-    -Description "Biotech SA scraper — pulls Premium article bodies via residential IP"
+    -Description "Biotech SA scraper - pulls Premium article bodies via residential IP"
 
 Write-Host ""
-Write-Host "✓ Task '$TaskName' registered. First run at: $Start" -ForegroundColor Green
+Write-Host "[OK] Task '$TaskName' registered. First run at: $Start" -ForegroundColor Green
 Write-Host "  Log: $LogFile"
 Write-Host ""
-Write-Host "Manage via:  Get-ScheduledTask -TaskName $TaskName | Get-ScheduledTaskInfo"
-Write-Host "Run now:     Start-ScheduledTask -TaskName $TaskName"
-Write-Host "Remove:      Unregister-ScheduledTask -TaskName $TaskName -Confirm:`$false"
+Write-Host 'Manage via:  Get-ScheduledTask -TaskName BiotechSAScraper | Get-ScheduledTaskInfo'
+Write-Host 'Run now:     Start-ScheduledTask -TaskName BiotechSAScraper'
+Write-Host 'Remove:      Unregister-ScheduledTask -TaskName BiotechSAScraper -Confirm:$false'
