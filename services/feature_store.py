@@ -202,7 +202,9 @@ def _fill_polygon_options(
       - /v3/snapshot/options/{ticker}/{contract}?as_of=        — historical per-contract IV
       - /v2/aggs/ticker/{ticker}/range/1/day/{date}/{date}     — underlying close
     """
-    api_key = os.getenv("POLYGON_API_KEY")
+    # Strip whitespace defensively — Railway's variableUpsert sometimes
+    # stores values with trailing newlines (verified 2026-05-03 via diag).
+    api_key = (os.getenv("POLYGON_API_KEY") or "").strip()
     if not api_key:
         return {"_status": "no_polygon_key"}
 
@@ -459,11 +461,201 @@ def _fill_sec_insider(
     Stub — full implementation calls SEC EDGAR `/cgi-bin/browse-edgar` filtered
     to ownership filings + parses the XML. Leaving structured shell so a
     future chat can implement without touching the orchestrator.
+
+    NOTE: now superseded by Finviz Elite insider feed (_fill_finviz) which
+    is faster + cleaner than parsing SEC Form 4 XML. Keep this as a backup
+    for tickers Finviz doesn't cover.
     """
     return {
-        "_status": "deferred_to_section_chat",
-        "_note": "Form 4 parser implementation deferred. Schema columns reserved.",
+        "_status": "deferred_to_section_chat (use Finviz instead)",
+        "_note": "Form 4 parser implementation deferred. Finviz preferred.",
     }
+
+
+# ────────────────────────────────────────────────────────────
+# Free / paid source fillers added 2026-05-03
+# ────────────────────────────────────────────────────────────
+
+def _fill_openfda_faers(
+    *, ticker: str, drug_name: Optional[str], catalyst_date: str,
+) -> Dict[str, Any]:
+    """OpenFDA FAERS adverse event report counts in 90d / 365d windows
+    pre-catalyst. Free REST API at https://api.fda.gov/drug/event.json.
+    Searches `patient.drug.medicinalproduct=DRUG_NAME` (case-insensitive)
+    + `receivedate:[start TO end]`.
+    """
+    if not drug_name:
+        return {"_status": "no_drug_name", "faers_data_source": None}
+    try:
+        import requests
+        cd = datetime.fromisoformat(catalyst_date[:10])
+        d90_start = (cd - timedelta(days=90)).strftime("%Y%m%d")
+        d365_start = (cd - timedelta(days=365)).strftime("%Y%m%d")
+        end = cd.strftime("%Y%m%d")
+        # Sanitize drug name — FAERS uses uppercase + escaping for spaces
+        clean = (drug_name or "").upper().split("(")[0].strip().replace(" ", "+")
+        if not clean:
+            return {"_status": "drug_name_unusable", "faers_data_source": None}
+        out: Dict[str, Any] = {"faers_data_source": "openfda"}
+        # 90d count (results.count = total report count via meta.results.total)
+        url = "https://api.fda.gov/drug/event.json"
+        for window_label, start in (("90d", d90_start), ("365d", d365_start)):
+            params = {
+                "search": f'patient.drug.medicinalproduct:"{clean}"+AND+receivedate:[{start}+TO+{end}]',
+                "limit": 1,
+            }
+            r = requests.get(url, params=params, timeout=15)
+            if r.status_code == 404:
+                count = 0
+            elif r.status_code != 200:
+                continue
+            else:
+                meta = (r.json() or {}).get("meta", {}) or {}
+                count = (meta.get("results") or {}).get("total", 0)
+            if window_label == "90d":
+                out["adverse_event_count_90d_pre"] = count
+            else:
+                out["adverse_event_count_365d_pre"] = count
+        # Serious AE % requires a second query with seriousness filter — skip
+        # for v1 to keep the call budget low. Section chat can add it.
+        out["_status"] = "ok"
+        return out
+    except Exception as e:
+        return {"_status": f"faers_error:{type(e).__name__}", "faers_data_source": None}
+
+
+def _fill_clinicaltrials_gov(
+    *, ticker: str, drug_name: Optional[str], catalyst_date: str,
+) -> Dict[str, Any]:
+    """clinicaltrials.gov v2 API — count of active trials at catalyst_date,
+    total enrollment, count of protocol amendments in the 180 days pre-event.
+    Free at https://clinicaltrials.gov/api/v2/studies.
+    """
+    if not drug_name:
+        return {"_status": "no_drug_name", "ctgov_data_source": None}
+    try:
+        import requests
+        clean = (drug_name or "").split("(")[0].strip()
+        if not clean:
+            return {"_status": "drug_name_unusable"}
+        url = "https://clinicaltrials.gov/api/v2/studies"
+        # Free-text search on intervention name
+        params = {
+            "query.intr": clean,
+            "fields": "NCTId,EnrollmentCount,OverallStatus,LastUpdateSubmitDate,StudyFirstSubmitDate",
+            "pageSize": 100,
+        }
+        r = requests.get(url, params=params, timeout=20)
+        if r.status_code != 200:
+            return {"_status": f"ctgov_status_{r.status_code}", "ctgov_data_source": None}
+        data = r.json() or {}
+        studies = data.get("studies", []) or []
+        cd = datetime.fromisoformat(catalyst_date[:10]).date()
+        amendments_180d = 0
+        active_count = 0
+        total_enrollment = 0
+        for s in studies:
+            proto = s.get("protocolSection", {}) or {}
+            status_module = proto.get("statusModule", {}) or {}
+            status = status_module.get("overallStatus")
+            enr = (proto.get("designModule", {}) or {}).get("enrollmentInfo", {}).get("count")
+            if isinstance(enr, int):
+                total_enrollment += enr
+            if status in ("RECRUITING", "ACTIVE_NOT_RECRUITING", "ENROLLING_BY_INVITATION"):
+                active_count += 1
+            # Last update date
+            last_update = status_module.get("lastUpdateSubmitDate")
+            if last_update:
+                try:
+                    lu = datetime.fromisoformat(last_update).date()
+                    if (cd - timedelta(days=180)) <= lu <= cd:
+                        amendments_180d += 1
+                except Exception:
+                    pass
+        return {
+            "trial_count_active_at_date": active_count,
+            "trial_total_enrollment": total_enrollment,
+            "trial_amendments_180d_pre": amendments_180d,
+            "ctgov_data_source": "clinicaltrials.gov_v2",
+            "_status": "ok",
+        }
+    except Exception as e:
+        return {"_status": f"ctgov_error:{type(e).__name__}", "ctgov_data_source": None}
+
+
+def _fill_finviz(
+    *, ticker: str,
+) -> Dict[str, Any]:
+    """Finviz Elite analyst recommendation + perf snapshot via the Elite
+    `quote_export` endpoint. Also surfaces target price upside vs current.
+
+    Insider-transactions backfill is a separate Finviz endpoint
+    (`insider_export.ashx`) — wired here as a follow-up; column shells
+    (insider_buys_count_30d_pre etc.) are reserved in the schema and will
+    be filled by a later commit. v1 just gets analyst recs + target price.
+    """
+    api_key = (os.getenv("FINVIZ_API_KEY") or "").strip()
+    if not api_key:
+        return {"_status": "no_finviz_key"}
+    try:
+        import requests
+        url = f"https://elite.finviz.com/quote_export.ashx?t={ticker}&auth={api_key}"
+        r = requests.get(url, timeout=20)
+        if r.status_code != 200:
+            return {"_status": f"finviz_status_{r.status_code}"}
+        body = r.text or ""
+        if "Login" in body or "<html" in body[:200]:
+            return {"_status": "finviz_auth_returned_html (key may be invalid or wrong endpoint)"}
+        # quote_export returns CSV — header + one row
+        lines = body.strip().splitlines()
+        if len(lines) < 2:
+            return {"_status": "finviz_empty_response"}
+        import csv, io
+        reader = csv.DictReader(io.StringIO(body))
+        row = next(reader, None) or {}
+        # Finviz columns of interest: 'Recom' (1=Strong Buy 5=Strong Sell),
+        # 'Target Price', 'Perf YTD', 'Price'
+        def _to_float(s):
+            if not s or s in ("-", "N/A"):
+                return None
+            try:
+                return float(str(s).replace("%", "").replace("$", "").replace(",", ""))
+            except Exception:
+                return None
+        recom = _to_float(row.get("Recom"))
+        target = _to_float(row.get("Target Price"))
+        price = _to_float(row.get("Price"))
+        out = {
+            "analyst_recommendation_avg": recom,
+            "analyst_target_price_usd": target,
+            "analyst_target_upside_pct": ((target - price) / price * 100) if (target and price) else None,
+            "finviz_perf_ytd_pct": _to_float(row.get("Perf YTD")),
+            "finviz_data_source": "finviz_elite_quote_export",
+            "_status": "ok",
+        }
+        return out
+    except Exception as e:
+        return {"_status": f"finviz_error:{type(e).__name__}:{str(e)[:60]}"}
+
+
+def _fill_pubmed(*, drug_name: Optional[str], catalyst_date: str) -> Dict[str, Any]:
+    """PubMed publication count per drug — deferred. NCBI E-utilities API:
+    https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term=DRUG&datetype=pdat&mindate=YYYY/MM/DD
+    """
+    return {"_status": "deferred_v2"}
+
+
+def _fill_uspto_patent(*, drug_name: Optional[str]) -> Dict[str, Any]:
+    """USPTO patent runway — deferred. Drug-to-patent mapping is non-trivial
+    without Orange Book wrapper; openFDA Orange Book API is the better path
+    when we wire it later.
+    """
+    return {"_status": "deferred_v2"}
+
+
+def _fill_nih_reporter(*, drug_name: Optional[str], ticker: str) -> Dict[str, Any]:
+    """NIH RePORTER active grants — deferred."""
+    return {"_status": "deferred_v2"}
 
 
 def _fill_sec_institutional(
@@ -588,7 +780,7 @@ def compute_event_features(
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT id, ticker, catalyst_date::text, catalyst_type
+            SELECT id, ticker, catalyst_date::text, catalyst_type, drug_name
             FROM catalyst_universe WHERE id = %s
             """,
             (catalyst_id,),
@@ -596,7 +788,7 @@ def compute_event_features(
         row = cur.fetchone()
     if not row:
         return {"error": f"catalyst_id {catalyst_id} not found"}
-    cid, ticker, catalyst_date, catalyst_type = row
+    cid, ticker, catalyst_date, catalyst_type, drug_name = row
 
     # Skip if already backfilled and refresh=False
     if not refresh:
@@ -660,6 +852,24 @@ def compute_event_features(
     om = _fill_outcomes_mirror(catalyst_id=cid, db=db)
     statuses["outcomes_mirror"] = om.pop("_status", "")
     feats.update(om)
+
+    # New sources added 2026-05-03
+    fae = _fill_openfda_faers(ticker=ticker, drug_name=drug_name, catalyst_date=catalyst_date)
+    statuses["openfda_faers"] = fae.pop("_status", "")
+    feats.update({k: v for k, v in fae.items() if not k.startswith("_")})
+
+    ct = _fill_clinicaltrials_gov(ticker=ticker, drug_name=drug_name, catalyst_date=catalyst_date)
+    statuses["clinicaltrials_gov"] = ct.pop("_status", "")
+    feats.update({k: v for k, v in ct.items() if not k.startswith("_")})
+
+    fv = _fill_finviz(ticker=ticker)
+    statuses["finviz"] = fv.pop("_status", "")
+    feats.update({k: v for k, v in fv.items() if not k.startswith("_")})
+
+    # Stubs for v2:
+    statuses["pubmed"] = _fill_pubmed(drug_name=drug_name, catalyst_date=catalyst_date)["_status"]
+    statuses["uspto_patent"] = _fill_uspto_patent(drug_name=drug_name)["_status"]
+    statuses["nih_reporter"] = _fill_nih_reporter(drug_name=drug_name, ticker=ticker)["_status"]
 
     # Days-until-catalyst (negative for past events)
     try:

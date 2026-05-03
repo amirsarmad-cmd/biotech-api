@@ -148,34 +148,53 @@ async def admin_scenario_algo_backtest(
 
 # ─── Feature store (catalyst_event_features) ────────────────
 
+def _apply_migration_module(filename: str):
+    """Run a single alembic migration file's upgrade() inline. Bypasses the
+    alembic Operations proxy (which requires env loading) by running the raw
+    SQL via BiotechDatabase. Idempotent — relies on each migration using
+    IF NOT EXISTS / IF EXISTS guards."""
+    import importlib.util, pathlib, re
+    path = pathlib.Path(__file__).resolve().parent.parent / "alembic" / "versions" / filename
+    if not path.exists():
+        raise HTTPException(404, f"migration file {filename} not found")
+    src = path.read_text(encoding="utf-8")
+    # Extract every op.execute("""...""") block via regex (cheap parser)
+    blocks = re.findall(r'op\.execute\(\s*"""(.*?)"""\s*\)', src, flags=re.DOTALL)
+    if not blocks:
+        raise HTTPException(500, f"no op.execute() blocks in {filename}")
+    from services.database import BiotechDatabase
+    db = BiotechDatabase()
+    with db.get_conn() as conn:
+        cur = conn.cursor()
+        for sql in blocks:
+            # Skip blocks that look like DROP-only (downgrade)
+            if "DROP" in sql.upper() and "CREATE" not in sql.upper() and "ADD COLUMN" not in sql.upper():
+                continue
+            cur.execute(sql)
+        conn.commit()
+
+
 @router.post("/admin/features/apply-migration-021")
 async def admin_apply_migration_021():
-    """Create the catalyst_event_features table (idempotent — uses CREATE
-    TABLE IF NOT EXISTS). Run once after deploying migration 021. Returns
-    table existence + row count."""
+    """Create the catalyst_event_features table (idempotent). Runs the raw
+    DDL from alembic/versions/021_catalyst_event_features.py. Returns row count."""
+    _apply_migration_module("021_catalyst_event_features.py")
     from services.database import BiotechDatabase
-    try:
-        # Inline the CREATE TABLE so we don't need to invoke alembic from a
-        # FastAPI endpoint (alembic env loading is finicky in serverless).
-        # The migration file is the source of truth; this is the same DDL.
-        from alembic.versions import _021_catalyst_event_features  # type: ignore
-        _021_catalyst_event_features.upgrade()
-    except Exception:
-        # Fallback: load and exec the module directly via importlib.
-        import importlib.util, pathlib
-        path = pathlib.Path(__file__).resolve().parent.parent / "alembic" / "versions" / "021_catalyst_event_features.py"
-        spec = importlib.util.spec_from_file_location("migration_021", path)
-        if spec is None or spec.loader is None:
-            raise HTTPException(500, "could not load migration 021 module")
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        mod.upgrade()
     db = BiotechDatabase()
     with db.get_conn() as conn:
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) FROM catalyst_event_features")
         n = cur.fetchone()[0]
     return {"ok": True, "rows_in_table": int(n)}
+
+
+@router.post("/admin/features/apply-migration-022")
+async def admin_apply_migration_022():
+    """Add the FAERS / ct.gov / Finviz / PubMed / USPTO / NIH RePORTER
+    columns to catalyst_event_features (idempotent ALTER TABLE ADD IF
+    NOT EXISTS)."""
+    _apply_migration_module("022_event_features_extended.py")
+    return {"ok": True}
 
 
 @router.post("/admin/features/backfill-batch")
