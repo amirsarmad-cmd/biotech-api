@@ -664,18 +664,25 @@ def _fill_finviz(
         if "snapshot-td" not in html:
             return {"_status": "finviz_no_snapshot_table (page format may have changed)"}
 
-        # The snapshot table is structured: <td class="snapshot-td2-cp">Label</td>
-        # immediately followed by <td class="snapshot-td2 ..."><b>Value</b></td>.
-        # Cheap regex pair extraction:
+        # Finviz's modern (2025+) snapshot table uses inner divs:
+        #   <td class="snapshot-td2 cursor-pointer ...">
+        #     <div class="snapshot-td-label">LABEL</div>
+        #   </td>
+        #   <td class="snapshot-td2 ...">
+        #     <div class="snapshot-td-content"><b>VALUE</b></div>
+        #   </td>
+        # Match each label-div followed by the next content-div.
         pairs = re.findall(
-            r'class="snapshot-td2-cp[^"]*"[^>]*>([^<]+)</td>'
-            r'\s*<td[^>]*class="snapshot-td2[^"]*"[^>]*>(.*?)</td>',
+            r'<div class="snapshot-td-label[^"]*">([^<]+)</div>'
+            r'.*?<div class="snapshot-td-content[^"]*">(.*?)</div>',
             html, flags=re.DOTALL,
         )
-        # Strip HTML tags from values (some have <b>, <span>, links)
+
+        # Strip nested HTML tags (<b>, <span class="color-text...">, <small>, links)
+        # from values, decode common entities.
         def _clean(s):
             s = re.sub(r"<[^>]+>", "", s).strip()
-            s = s.replace("&nbsp;", " ")
+            s = s.replace("&nbsp;", " ").replace("&amp;", "&")
             return s
 
         snap = {label.strip(): _clean(val) for label, val in pairs}
