@@ -121,7 +121,8 @@ def format_library_for_prompt(items: List[Dict[str, Any]]) -> str:
 
 # ── Prompts ──────────────────────────────────────────────────
 
-_OUTCOME_SCHEMA = """{
+# Note: braces are doubled because this string gets .format()'d after concat.
+_OUTCOME_SCHEMA = """{{
   "outcome_class": "APPROVED" | "REJECTED" | "MET_ENDPOINT" | "MISSED_ENDPOINT" | "DELAYED" | "WITHDRAWN" | "MIXED" | "UNKNOWN",
   "endpoint_met": true | false | null,
   "approval_granted": true | false | null,
@@ -130,7 +131,7 @@ _OUTCOME_SCHEMA = """{
   "evidence": "<short verbatim quote from the source (under 50 words)>",
   "confidence": 0.0 - 1.0,
   "reasoning": "<1-2 sentences explaining the classification>"
-}"""
+}}"""
 
 LIBRARY_LABELER_PROMPT = """You are a biotech outcome classifier. Below is a catalyst event and a news library of articles published around that catalyst date. Read the library carefully and classify what happened.
 

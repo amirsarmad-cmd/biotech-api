@@ -601,6 +601,21 @@ async def consensus_batch(n: int = 5, only_with_library: bool = True):
                                 "consensus_class": (r.get("majority_reader_class") if r else None),
                                 "votes_received": (r.get("votes_received") if r else 0)})
             except Exception as e:
+                # Bump attempt counter so a poison row doesn't block the queue forever
+                try:
+                    with db.get_conn() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute("""
+                                UPDATE post_catalyst_outcomes
+                                SET outcome_label_consensus_attempts =
+                                      COALESCE(outcome_label_consensus_attempts, 0) + 1,
+                                    outcome_label_consensus_last_attempt_at = NOW(),
+                                    outcome_label_consensus_last_error = %s
+                                WHERE id = %s
+                            """, (str(e)[:500], oid))
+                            conn.commit()
+                except Exception:
+                    pass
                 results.append({"outcome_id": oid, "ok": False, "error": str(e)[:200]})
         return {"processed": len(ids), "results": results}
     except Exception as e:
