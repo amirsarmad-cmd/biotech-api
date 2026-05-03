@@ -697,20 +697,34 @@ def _fill_finviz(
             except Exception:
                 return None
 
-        recom  = _to_float(snap.get("Recom"))
-        target = _to_float(snap.get("Target Price"))
-        price  = _to_float(snap.get("Price"))
+        # Try multiple label variants Finviz has used for these fields
+        def _get(*candidates):
+            for n in candidates:
+                v = snap.get(n)
+                if v not in (None, "", "-"):
+                    return v
+            return None
+
+        recom  = _to_float(_get("Recom", "Analyst Recom", "Recommendation"))
+        target = _to_float(_get("Target Price", "Price Target", "Target"))
+        price  = _to_float(_get("Price"))
+        ytd    = _to_float(_get("Perf YTD", "Performance YTD"))
+        # When Recom/Target are missing, surface which keys we DID see so
+        # we can adjust the variant list (or confirm the ticker really has
+        # no analyst coverage on Finviz).
+        sample_keys = sorted(snap.keys())[:30]
         out = {
             "analyst_recommendation_avg": recom,
             "analyst_target_price_usd": target,
             "analyst_target_upside_pct": ((target - price) / price * 100) if (target and price) else None,
-            "finviz_perf_ytd_pct": _to_float(snap.get("Perf YTD")),
+            "finviz_perf_ytd_pct": ytd,
             "finviz_data_source": "finviz_quote_html_scrape",
             "_status": (
                 "ok" if (recom is not None or target is not None) else
-                f"finviz_no_recom_target (snapshot had {len(snap)} fields)"
+                f"finviz_no_recom_target_in_{len(snap)}_fields"
             ),
             "_snapshot_field_count": len(snap),
+            "_snapshot_sample_keys": sample_keys,
         }
         return out
     except Exception as e:
