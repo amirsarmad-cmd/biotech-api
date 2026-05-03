@@ -249,9 +249,12 @@ _READER_CONFIGS = [
      "feature": "consensus_pass2_gpt55",
      "model_overrides": {"openai": ["gpt-5.5", "gpt-4o"]},
      "fallback_chain": ["openai"]},
+    # Gemini-3 isn't yet released as a public model (gemini-3.0-pro 404s
+    # in v1beta as of 2026-05). Fall through to gemini-2.5-pro until
+    # the new ID is available; switch back when announced.
     {"name": "gemini3",
      "feature": "consensus_pass2_gemini3",
-     "model_overrides": {"google": ["gemini-3.0-pro", "gemini-2.5-pro"]},
+     "model_overrides": {"google": ["gemini-2.5-pro"]},
      "fallback_chain": ["google"]},
 ]
 
