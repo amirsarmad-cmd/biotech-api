@@ -159,6 +159,74 @@ async def sa_probe(ticker: str = "MRNA"):
         return ex.submit(_probe).result(timeout=120)
 
 
+@router.get("/news/sa-direct-test")
+async def sa_direct_test(ticker: str = "MRNA"):
+    """Try several SA URL patterns via plain `requests.get` (no browser).
+
+    PerimeterX often only enforces on browser-fingerprinted requests; the
+    SA-API endpoints used by their own SPA accept cookie-auth and return
+    JSON without going through the captcha layer. Tries a few likely
+    endpoints; reports response code, content-type, byte length, and the
+    first 600 chars so we can see if any returned real article data.
+    """
+    import requests
+    from services.fetcher_news import _decode_cookies_b64
+
+    cookies_list = _decode_cookies_b64("SA_COOKIES_B64")
+    if not cookies_list:
+        return {"error": "SA_COOKIES_B64 not set"}
+
+    # Build a requests-style cookie jar from the Playwright cookie list
+    jar = {c["name"]: c["value"] for c in cookies_list if c.get("name") and c.get("value")}
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/html;q=0.9, */*;q=0.5",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": f"https://seekingalpha.com/symbol/{ticker}/news",
+        "Origin": "https://seekingalpha.com",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+
+    candidates = [
+        # Public SA-API used by their SPA (most likely path)
+        ("sapi_news_v3", "GET",
+         f"https://seekingalpha.com/api/v3/symbols/{ticker}/news?include=primaryTickers,secondaryTickers&isMounting=true&page[size]=40"),
+        # Combined news feed (legacy XML)
+        ("xml_combined", "GET",
+         f"https://seekingalpha.com/api/sa/combined/{ticker}.xml"),
+        # Articles filter
+        ("api_articles_filter", "GET",
+         f"https://seekingalpha.com/api/v3/articles?filter[since]=0&filter[symbols]={ticker}&filter[type]=news&page[size]=20&page[number]=1"),
+        # Atom-ish news endpoint
+        ("symbol_news_html_short", "GET",
+         f"https://seekingalpha.com/symbol/{ticker}/news?limit=5"),
+    ]
+
+    out = {"ticker": ticker, "tries": []}
+    for name, method, url in candidates:
+        entry = {"name": name, "url": url}
+        try:
+            r = requests.request(method, url, cookies=jar, headers=headers,
+                                 timeout=15, allow_redirects=True)
+            entry["status"] = r.status_code
+            entry["content_type"] = r.headers.get("Content-Type", "")[:80]
+            entry["bytes"] = len(r.content)
+            entry["final_url"] = r.url
+            body_text = r.text or ""
+            entry["body_first_600"] = body_text[:600]
+            bl = body_text.lower()
+            entry["px_captcha"] = "px-captcha" in bl or "perimeter" in bl
+            entry["denied"] = "access to this page has been denied" in bl
+            entry["looks_like_json"] = body_text.lstrip().startswith(("{", "["))
+            entry["looks_like_xml"] = body_text.lstrip().startswith("<?xml") or "<rss" in bl[:200] or "<feed" in bl[:200]
+        except Exception as e:
+            entry["error"] = f"{type(e).__name__}: {str(e)[:200]}"
+        out["tries"].append(entry)
+    return out
+
+
 @router.get("/news/auth-status")
 async def news_auth_status():
     """Boolean-only presence check for paywalled-news scraper credentials.
