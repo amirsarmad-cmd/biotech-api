@@ -443,6 +443,17 @@ def _call_anthropic(api_key, model, prompt, messages, system,
     return text, tin, tout
 
 
+def _openai_uses_max_completion_tokens(model: str) -> bool:
+    """Newer OpenAI models (GPT-5/5.5, o-series) reject `max_tokens` and
+    require `max_completion_tokens`. Older models (gpt-4o, gpt-4-turbo,
+    gpt-3.5-turbo) still take `max_tokens`. Heuristic by model name."""
+    m = (model or "").lower()
+    return (
+        m.startswith("gpt-5") or
+        m.startswith("o1") or m.startswith("o3") or m.startswith("o4")
+    )
+
+
 def _call_openai(api_key, model, prompt, messages, system,
                  max_tokens, temperature, timeout_s,
                  response_format_json: bool) -> Tuple[str, int, int]:
@@ -454,13 +465,32 @@ def _call_openai(api_key, model, prompt, messages, system,
     msgs.extend(_coerce_messages(prompt, messages))
     kwargs = {
         "model": model,
-        "max_tokens": max_tokens,
         "temperature": temperature,
         "messages": msgs,
     }
+    if _openai_uses_max_completion_tokens(model):
+        kwargs["max_completion_tokens"] = max_tokens
+    else:
+        kwargs["max_tokens"] = max_tokens
     if response_format_json:
         kwargs["response_format"] = {"type": "json_object"}
-    resp = client.chat.completions.create(**kwargs)
+    try:
+        resp = client.chat.completions.create(**kwargs)
+    except Exception as e:
+        # Fallback: if the heuristic guessed wrong (model returns
+        # "Unsupported parameter: 'max_tokens'" or vice versa), retry
+        # with the other param. Cheap insurance against new model IDs.
+        msg = str(e)
+        if "max_completion_tokens" in msg and "max_tokens" in kwargs:
+            kwargs.pop("max_tokens", None)
+            kwargs["max_completion_tokens"] = max_tokens
+            resp = client.chat.completions.create(**kwargs)
+        elif "max_tokens" in msg and "max_completion_tokens" in kwargs:
+            kwargs.pop("max_completion_tokens", None)
+            kwargs["max_tokens"] = max_tokens
+            resp = client.chat.completions.create(**kwargs)
+        else:
+            raise
     text = resp.choices[0].message.content or ""
     usage = getattr(resp, "usage", None)
     tin = (getattr(usage, "prompt_tokens", 0) or 0) if usage else 0
