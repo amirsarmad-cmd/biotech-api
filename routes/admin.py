@@ -4712,6 +4712,65 @@ _v2_reclassify_scheduler_state: dict = {
 }
 
 
+# prediction_v2: nightly populator + lazy NPV refresh.
+# Independent from v2_reclassify so the two can be enabled/disabled
+# independently. Default disabled; flip PREDICTION_V2_SCHEDULER_ENABLED=1
+# in Railway env once shadow validation passes.
+_prediction_v2_scheduler_state: dict = {
+    "started": False,
+    "last_run_at": None,
+    "last_result": None,
+    "runs_total": 0,
+}
+
+
+def _start_prediction_v2_scheduler_once() -> None:
+    """Daily refresh of historical_catalyst_moves + lazy NPV compute.
+    Idempotent. Only runs if PREDICTION_V2_SCHEDULER_ENABLED=1."""
+    if _prediction_v2_scheduler_state.get("started"):
+        return
+    if os.getenv("PREDICTION_V2_SCHEDULER_ENABLED", "0") != "1":
+        return
+    _prediction_v2_scheduler_state["started"] = True
+
+    import asyncio
+    interval_hours = float(os.getenv("PREDICTION_V2_SCHEDULER_HOURS", "24"))
+    npv_max_per_run = int(os.getenv("PREDICTION_V2_LAZY_NPV_MAX", "50"))
+
+    async def _loop():
+        await asyncio.sleep(180)  # 3-min startup grace
+        from datetime import datetime as _dt
+        while True:
+            try:
+                logger.info("[prediction_v2-scheduler] running")
+                # Step 1: refresh the statistical lookup table from
+                # the latest labeled outcomes
+                refresh_result = await refresh_historical_moves()
+                # Step 2: lazy NPV compute for upcoming high-priority
+                # catalysts (PDUFA + Phase 3 + Phase 2 within 90 days)
+                npv_result = await lazy_npv_refresh(max_n=npv_max_per_run)
+                _prediction_v2_scheduler_state["last_run_at"] = _dt.utcnow().isoformat()
+                _prediction_v2_scheduler_state["last_result"] = {
+                    "moves_refresh": refresh_result,
+                    "npv_refresh": npv_result,
+                }
+                _prediction_v2_scheduler_state["runs_total"] += 1
+            except Exception as e:
+                logger.exception(f"[prediction_v2-scheduler] error: {e}")
+            await asyncio.sleep(interval_hours * 3600)
+
+    asyncio.create_task(_loop())
+    logger.info(
+        f"[prediction_v2-scheduler] started, interval={interval_hours}h, "
+        f"npv_max={npv_max_per_run}"
+    )
+
+
+@router.get("/post-catalyst/prediction-v2-scheduler-status")
+async def prediction_v2_scheduler_status():
+    return _prediction_v2_scheduler_state
+
+
 def _start_v2_reclassify_scheduler_once() -> None:
     """Start a background asyncio task that runs V2 reclassify + snapshot
     evaluation on a schedule. Idempotent — multiple calls are no-ops.

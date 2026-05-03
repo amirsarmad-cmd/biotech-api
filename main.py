@@ -126,6 +126,12 @@ async def lifespan(app: FastAPI):
         _start_v2_reclassify_scheduler_once()
     except Exception as e:
         logger.warning(f"v2 reclassify scheduler start failed: {e}")
+    # Start prediction_v2 nightly scheduler (no-op if env var not set)
+    try:
+        from routes.admin import _start_prediction_v2_scheduler_once
+        _start_prediction_v2_scheduler_once()
+    except Exception as e:
+        logger.warning(f"prediction_v2 scheduler start failed: {e}")
     # Start news_count refresher (no-op if env var not set)
     try:
         from routes.admin import _start_news_refresher_once
