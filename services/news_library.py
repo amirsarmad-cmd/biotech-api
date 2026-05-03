@@ -80,8 +80,31 @@ _INSERT_SQL = """
         %(headline)s, %(summary)s, %(body)s, %(published_at)s,
         %(discovery_path)s, %(ticker_mention_method)s
     )
-    ON CONFLICT (ticker, url_hash) DO NOTHING
-    RETURNING id
+    ON CONFLICT (ticker, url_hash) DO UPDATE SET
+        -- Enrich existing row with body when a body-fetcher (e.g. home-PC
+        -- SA Premium scraper) finds one. Don't downgrade an existing body
+        -- to NULL by overwriting with EXCLUDED.body unconditionally.
+        body = COALESCE(EXCLUDED.body, catalyst_event_news.body),
+        -- Backfill summary if the new row has one and the existing doesn't.
+        summary = COALESCE(catalyst_event_news.summary, EXCLUDED.summary),
+        -- Mark the source as the "richer" one — premium > xml feed.
+        source = CASE
+            WHEN EXCLUDED.body IS NOT NULL AND catalyst_event_news.body IS NULL
+            THEN EXCLUDED.source
+            ELSE catalyst_event_news.source
+        END
+    -- Return the row ID only when we actually changed something (body
+    -- was added). xmax=0 means it was inserted (not updated); we treat
+    -- updates that added body as "newly enriched" by checking if body
+    -- changed. Simpler: return the id when EXCLUDED.body is not null
+    -- and the existing body was null.
+    RETURNING (
+        CASE
+            WHEN xmax = 0 THEN 'inserted'
+            WHEN body IS NOT NULL THEN 'enriched'
+            ELSE 'untouched'
+        END
+    ) AS action, id
 """
 
 
@@ -131,27 +154,35 @@ def insert_news_row(
         with conn.cursor() as cur:
             cur.execute(_INSERT_SQL, params)
             row = cur.fetchone()
-            return row[0] if row else None
+            if not row:
+                return None
+            # Row is (action, id) — action ∈ {inserted, enriched, untouched}
+            return {"action": row[0], "id": row[1]}
     except Exception as e:
         logger.warning(f"insert_news_row({ticker}, {source}) failed: {e}")
         return None
 
 
-def insert_news_rows_bulk(conn, rows: list) -> Tuple[int, int]:
+def insert_news_rows_bulk(conn, rows: list) -> Tuple[int, int, int]:
     """Convenience: bulk-insert a list of dicts (same keys as
-    insert_news_row's kwargs). Returns (inserted_count, skipped_count).
+    insert_news_row's kwargs). Returns (inserted, enriched, untouched).
     Single transaction; caller commits.
     """
     inserted = 0
-    skipped = 0
+    enriched = 0
+    untouched = 0
     for r in rows:
         try:
-            new_id = insert_news_row(conn, **r)
-            if new_id is not None:
+            res = insert_news_row(conn, **r)
+            if res is None:
+                untouched += 1
+            elif res["action"] == "inserted":
                 inserted += 1
+            elif res["action"] == "enriched":
+                enriched += 1
             else:
-                skipped += 1
+                untouched += 1
         except Exception as e:
             logger.warning(f"bulk insert row failed: {e}")
-            skipped += 1
-    return inserted, skipped
+            untouched += 1
+    return inserted, enriched, untouched

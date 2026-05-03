@@ -95,9 +95,9 @@ def collect_to_library(conn, ticker: str, *, catalyst_id: Optional[int] = None,
     from services.news_library import insert_news_row
 
     items = fetch_sa_xml(ticker)
-    inserted = 0
+    inserted = enriched = untouched = 0
     for it in items:
-        new_id = insert_news_row(
+        res = insert_news_row(
             conn,
             ticker=ticker,
             source="seeking_alpha_xml",
@@ -110,6 +110,13 @@ def collect_to_library(conn, ticker: str, *, catalyst_id: Optional[int] = None,
             discovery_path="sa_xml_per_ticker",
             ticker_mention_method="sa_xml_ticker",
         )
-        if new_id is not None:
+        if res is None:
+            untouched += 1
+        elif res.get("action") == "inserted":
             inserted += 1
-    return {"fetched": len(items), "inserted": inserted, "skipped": len(items) - inserted}
+        elif res.get("action") == "enriched":
+            enriched += 1
+        else:
+            untouched += 1
+    return {"fetched": len(items), "inserted": inserted,
+            "enriched": enriched, "untouched": untouched}

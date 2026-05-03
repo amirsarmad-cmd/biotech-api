@@ -471,8 +471,7 @@ async def news_ingest(payload: IngestPayload, request: Request):
 
     from services.news_library import insert_news_row
 
-    inserted = 0
-    skipped = 0
+    inserted = enriched = untouched = 0
     errors: list[str] = []
     with _pg_conn() as conn:
         for art in payload.articles:
@@ -484,7 +483,7 @@ async def news_ingest(payload: IngestPayload, request: Request):
                         pub_dt = _dt.fromisoformat(art.published_at.replace("Z", "+00:00"))
                     except Exception:
                         pub_dt = None
-                new_id = insert_news_row(
+                res = insert_news_row(
                     conn,
                     ticker=art.ticker,
                     source=art.source,
@@ -496,17 +495,22 @@ async def news_ingest(payload: IngestPayload, request: Request):
                     discovery_path=art.discovery_path or "external_scraper",
                     ticker_mention_method=art.ticker_mention_method,
                 )
-                if new_id is not None:
+                if res is None:
+                    untouched += 1
+                elif res.get("action") == "inserted":
                     inserted += 1
+                elif res.get("action") == "enriched":
+                    enriched += 1
                 else:
-                    skipped += 1
+                    untouched += 1
             except Exception as e:
                 errors.append(f"{art.ticker}/{art.url[:60]}: {str(e)[:120]}")
         conn.commit()
     return {
         "received": len(payload.articles),
         "inserted": inserted,
-        "skipped": skipped,
+        "enriched": enriched,
+        "untouched": untouched,
         "errors": errors[:5],
     }
 
