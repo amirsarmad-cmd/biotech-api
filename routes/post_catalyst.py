@@ -361,16 +361,18 @@ async def admin_data_feed_debug():
         # Surface enough of the snapshot table region so we can see the
         # actual class names + structure to fix the regex.
         body = r.text or ""
-        idx = body.find("snapshot-table")
-        if idx == -1:
-            idx = body.find("snapshot-td")
-        if idx == -1:
-            out["finviz"]["body_head"] = body[:500]
-            out["finviz"]["snapshot_marker"] = "NOT_FOUND"
-        else:
-            out["finviz"]["snapshot_marker_at"] = idx
-            out["finviz"]["snapshot_window"] = body[idx:idx + 1500]
         out["finviz"]["body_total_len"] = len(body)
+        # Show 200-char window around every occurrence of "Recom" /
+        # "Target Price" so we can see EXACTLY how those labels are
+        # rendered (different HTML structure than the snapshot table?).
+        import re as _re
+        for needle in ("Recom", "Target Price", "Price Target", "Recommendation"):
+            for m in _re.finditer(_re.escape(needle), body):
+                start = max(0, m.start() - 50)
+                end = min(len(body), m.end() + 200)
+                out["finviz"].setdefault(f"context_{needle.replace(' ','_')}", []).append(body[start:end])
+                if len(out["finviz"][f"context_{needle.replace(' ','_')}"]) >= 2:
+                    break  # limit to 2 per needle
     except Exception as e:
         out["finviz"]["error"] = str(e)[:200]
     return out
