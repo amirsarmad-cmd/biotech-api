@@ -227,6 +227,71 @@ async def sa_direct_test(ticker: str = "MRNA"):
     return out
 
 
+@router.get("/news/sa-xml-inspect")
+async def sa_xml_inspect(ticker: str = "MRNA", with_cookies: bool = True):
+    """Hit the SA combined XML feed (we found this bypasses PerimeterX).
+
+    with_cookies=True replays SA_COOKIES_B64. with_cookies=False sends a
+    bare request — tells us whether the endpoint is public or requires
+    auth. Returns parsed item count, oldest/newest dates, sample titles
+    and links so we can characterise what's actually in the feed.
+    """
+    import requests, feedparser
+    from services.fetcher_news import _decode_cookies_b64
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+        "Accept": "application/xml, text/xml, */*",
+    }
+    cookies = {}
+    if with_cookies:
+        cookies_list = _decode_cookies_b64("SA_COOKIES_B64")
+        if cookies_list:
+            cookies = {c["name"]: c["value"] for c in cookies_list}
+
+    url = f"https://seekingalpha.com/api/sa/combined/{ticker}.xml"
+    try:
+        r = requests.get(url, cookies=cookies, headers=headers, timeout=15)
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {str(e)[:200]}"}
+
+    out = {"ticker": ticker, "with_cookies": with_cookies,
+           "status": r.status_code, "content_type": r.headers.get("Content-Type", "")[:80],
+           "bytes": len(r.content)}
+    body = r.text or ""
+    out["px_captcha"] = "px-captcha" in body.lower()
+
+    if r.status_code == 200 and out["bytes"] > 1000:
+        try:
+            feed = feedparser.parse(body)
+            out["feed_title"] = (feed.feed.get("title") or "")[:120]
+            out["item_count"] = len(feed.entries)
+            if feed.entries:
+                dates = sorted([(e.get("published") or "")[:19] for e in feed.entries
+                                if e.get("published")])
+                out["oldest_date"] = dates[0] if dates else None
+                out["newest_date"] = dates[-1] if dates else None
+                # Detect any premium/paywalled items by category or sa: namespace fields
+                premium_count = sum(1 for e in feed.entries if any(
+                    "premium" in str(t).lower() for t in (e.get("tags") or [])))
+                out["premium_tagged_items"] = premium_count
+                out["samples"] = [
+                    {
+                        "title": (e.get("title") or "")[:100],
+                        "link": (e.get("link") or "")[:120],
+                        "date": (e.get("published") or "")[:19],
+                        "summary_first_120": (e.get("summary") or "")[:120],
+                    }
+                    for e in feed.entries[:5]
+                ]
+        except Exception as e:
+            out["parse_error"] = str(e)[:200]
+    else:
+        out["body_first_300"] = body[:300]
+    return out
+
+
 @router.get("/news/auth-status")
 async def news_auth_status():
     """Boolean-only presence check for paywalled-news scraper credentials.
