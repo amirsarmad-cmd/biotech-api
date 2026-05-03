@@ -19,6 +19,9 @@ from services.post_catalyst_tracker import (
     backfill_one, backfill_batch,
 )
 from services.scenario_algo import backtest_scenario_algo
+from services.feature_store import (
+    backfill_features_batch, compute_event_features, get_coverage_report,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -141,3 +144,74 @@ async def admin_scenario_algo_backtest(
     except Exception as e:
         logger.exception("scenario-algo-backtest failed")
         raise HTTPException(500, f"backtest error: {e}")
+
+
+# ─── Feature store (catalyst_event_features) ────────────────
+
+@router.post("/admin/features/apply-migration-021")
+async def admin_apply_migration_021():
+    """Create the catalyst_event_features table (idempotent — uses CREATE
+    TABLE IF NOT EXISTS). Run once after deploying migration 021. Returns
+    table existence + row count."""
+    from services.database import BiotechDatabase
+    try:
+        # Inline the CREATE TABLE so we don't need to invoke alembic from a
+        # FastAPI endpoint (alembic env loading is finicky in serverless).
+        # The migration file is the source of truth; this is the same DDL.
+        from alembic.versions import _021_catalyst_event_features  # type: ignore
+        _021_catalyst_event_features.upgrade()
+    except Exception:
+        # Fallback: load and exec the module directly via importlib.
+        import importlib.util, pathlib
+        path = pathlib.Path(__file__).resolve().parent.parent / "alembic" / "versions" / "021_catalyst_event_features.py"
+        spec = importlib.util.spec_from_file_location("migration_021", path)
+        if spec is None or spec.loader is None:
+            raise HTTPException(500, "could not load migration 021 module")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod.upgrade()
+    db = BiotechDatabase()
+    with db.get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM catalyst_event_features")
+        n = cur.fetchone()[0]
+    return {"ok": True, "rows_in_table": int(n)}
+
+
+@router.post("/admin/features/backfill-batch")
+async def admin_features_backfill_batch(
+    limit: int = Query(100, ge=1, le=2000),
+    only_labeled: bool = Query(False),
+    refresh: bool = Query(False, description="Recompute existing rows"),
+):
+    """Backfill catalyst_event_features for catalysts that don't yet have a
+    row (or refresh existing rows). Idempotent. Returns batch summary +
+    error samples.
+    """
+    try:
+        return backfill_features_batch(
+            limit=limit, only_labeled=only_labeled, refresh=refresh,
+        )
+    except Exception as e:
+        logger.exception("features backfill failed")
+        raise HTTPException(500, f"backfill error: {e}")
+
+
+@router.post("/admin/features/event/{catalyst_id}")
+async def admin_features_compute_one(catalyst_id: int, refresh: bool = Query(True)):
+    """Compute / refresh feature row for a single catalyst event."""
+    try:
+        return compute_event_features(catalyst_id, refresh=refresh)
+    except Exception as e:
+        logger.exception("compute_event_features(%s) failed", catalyst_id)
+        raise HTTPException(500, f"compute error: {e}")
+
+
+@router.get("/admin/features/coverage")
+async def admin_features_coverage():
+    """Population stats: total rows, % vs universe + labeled, per-column %."""
+    try:
+        return get_coverage_report()
+    except Exception as e:
+        logger.exception("coverage report failed")
+        raise HTTPException(500, f"coverage error: {e}")
