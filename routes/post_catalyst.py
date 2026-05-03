@@ -236,45 +236,52 @@ async def admin_features_coverage():
         raise HTTPException(500, f"coverage error: {e}")
 
 
-@router.get("/admin/features/polygon-debug")
-async def admin_polygon_debug():
-    """Probe Polygon + Finviz inside the running container. Compares
-    `os.getenv` to actual API responses + character-by-character key
-    inspection so trailing whitespace / hidden chars are visible."""
+@router.get("/admin/features/data-feed-debug")
+async def admin_data_feed_debug():
+    """Probe massive.com (options) + Finviz Elite inside the running
+    container. Compares `os.getenv` to actual API responses + char-level
+    key inspection so trailing whitespace / hidden chars are visible.
+
+    Renamed from /polygon-debug because the vendor is massive.com
+    (Polygon-compatible REST). MASSIVE_API_KEY is canonical;
+    POLYGON_API_KEY is a legacy alias (read as fallback only)."""
     import os, requests
     out: Dict[str, object] = {}
-    # Polygon
-    raw = os.getenv("POLYGON_API_KEY", "")
+    # massive.com
+    raw = os.getenv("MASSIVE_API_KEY", "") or os.getenv("POLYGON_API_KEY", "")
     key = raw.strip()
-    out["polygon"] = {
-        "raw_repr": repr(raw),  # surfaces any \n / \r / hidden whitespace
+    out["massive"] = {
+        "key_source": "MASSIVE_API_KEY" if os.getenv("MASSIVE_API_KEY") else "POLYGON_API_KEY (legacy)",
+        "raw_repr": repr(raw),
         "stripped_len": len(key),
         "tests": {},
     }
     try:
-        r = requests.get("https://api.polygon.io/v3/snapshot/options/NTLA",
+        r = requests.get("https://api.massive.com/v3/snapshot/options/NTLA",
                          params={"limit": 3, "apiKey": key}, timeout=15)
-        out["polygon"]["tests"]["current_snapshot"] = {"status": r.status_code, "body_head": r.text[:300]}
+        out["massive"]["tests"]["current_snapshot"] = {"status": r.status_code, "body_head": r.text[:300]}
     except Exception as e:
-        out["polygon"]["tests"]["current_snapshot"] = {"error": f"{type(e).__name__}: {str(e)[:120]}"}
-    # Try with header auth (Polygon also accepts Authorization: Bearer)
+        out["massive"]["tests"]["current_snapshot"] = {"error": f"{type(e).__name__}: {str(e)[:120]}"}
     try:
         r = requests.get(
-            "https://api.polygon.io/v3/snapshot/options/NTLA",
-            params={"limit": 3},
-            headers={"Authorization": f"Bearer {key}"},
+            "https://api.massive.com/v3/reference/options/contracts",
+            params={"underlying_ticker": "NTLA", "as_of": "2025-01-15", "limit": 3, "apiKey": key},
             timeout=15,
         )
-        out["polygon"]["tests"]["bearer_header"] = {"status": r.status_code, "body_head": r.text[:200]}
+        out["massive"]["tests"]["historical_contracts"] = {"status": r.status_code, "body_head": r.text[:200]}
     except Exception as e:
-        out["polygon"]["tests"]["bearer_header"] = {"error": str(e)[:120]}
+        out["massive"]["tests"]["historical_contracts"] = {"error": str(e)[:120]}
 
-    # Finviz
+    # Finviz Elite
     fv_raw = os.getenv("FINVIZ_API_KEY", "")
     fv_key = fv_raw.strip()
     out["finviz"] = {"raw_repr": repr(fv_raw), "stripped_len": len(fv_key)}
     try:
-        url = f"https://elite.finviz.com/quote_export.ashx?t=NTLA&auth={fv_key}"
+        # Use the proper export.ashx endpoint with snapshot column codes
+        url = (
+            "https://elite.finviz.com/export.ashx"
+            f"?v=151&t=NTLA&c=1,65,67,68,50,31,32,30,13,12&auth={fv_key}"
+        )
         r = requests.get(url, timeout=20)
         out["finviz"]["status"] = r.status_code
         out["finviz"]["body_head"] = r.text[:600]

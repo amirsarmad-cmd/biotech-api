@@ -190,11 +190,14 @@ def _fill_peer_relative(
     return out
 
 
-def _fill_polygon_options(
+def _fill_massive_options(
     *, ticker: str, catalyst_date: str,
 ) -> Dict[str, Any]:
-    """Polygon options — current snapshot for upcoming events; two-step
-    historical (contracts list + per-contract snapshot) for past events.
+    """massive.com options chain — current snapshot for upcoming events;
+    two-step historical (contracts list + per-contract snapshot) for past
+    events. Vendor is massive.com (Polygon-compatible REST endpoints; both
+    api.massive.com and api.polygon.io accept the key, we use api.massive.com
+    as canonical to avoid the polygon/massive naming confusion).
 
     Endpoints used:
       - /v3/snapshot/options/{ticker}                          — current chain
@@ -204,24 +207,24 @@ def _fill_polygon_options(
     """
     # Strip whitespace defensively — Railway's variableUpsert sometimes
     # stores values with trailing newlines (verified 2026-05-03 via diag).
-    api_key = (os.getenv("POLYGON_API_KEY") or "").strip()
+    api_key = (os.getenv("MASSIVE_API_KEY") or os.getenv("POLYGON_API_KEY") or "").strip()
     if not api_key:
-        return {"_status": "no_polygon_key"}
+        return {"_status": "no_massive_api_key"}
 
     try:
         import requests
         cd = datetime.fromisoformat(catalyst_date[:10])
         days_from_today = abs((cd - datetime.now()).days)
         if days_from_today <= 7:
-            return _polygon_current_snapshot(ticker, api_key, requests)
-        return _polygon_historical_snapshot(ticker, cd, api_key, requests)
+            return _massive_current_snapshot(ticker, api_key, requests)
+        return _massive_historical_snapshot(ticker, cd, api_key, requests)
     except Exception as e:
-        return {"_status": f"polygon_error:{type(e).__name__}:{str(e)[:80]}"}
+        return {"_status": f"massive_error:{type(e).__name__}:{str(e)[:80]}"}
 
 
-def _polygon_aggregate_chain(results: list, underlying_price: Optional[float]) -> Dict[str, Any]:
+def _massive_aggregate_chain(results: list, underlying_price: Optional[float]) -> Dict[str, Any]:
     """Common aggregation logic for both current + historical chain results."""
-    out: Dict[str, Any] = {"options_source": "polygon"}
+    out: Dict[str, Any] = {"options_source": "massive"}
     call_oi = put_oi = call_volume = put_volume = 0
     atm_calls: List[Tuple[float, float]] = []
     atm_puts: List[Tuple[float, float]] = []
@@ -269,21 +272,21 @@ def _polygon_aggregate_chain(results: list, underlying_price: Optional[float]) -
     return out
 
 
-def _polygon_current_snapshot(ticker: str, api_key: str, requests) -> Dict[str, Any]:
+def _massive_current_snapshot(ticker: str, api_key: str, requests) -> Dict[str, Any]:
     """Current chain — works on Options Starter+ plans."""
-    url = f"https://api.polygon.io/v3/snapshot/options/{ticker}"
+    url = f"https://api.massive.com/v3/snapshot/options/{ticker}"
     r = requests.get(url, params={"limit": 250, "apiKey": api_key}, timeout=20)
     if r.status_code != 200:
-        return {"_status": f"polygon_current_status_{r.status_code}"}
+        return {"_status": f"massive_current_status_{r.status_code}"}
     results = (r.json() or {}).get("results", []) or []
     if not results:
-        return {"_status": "polygon_empty_chain_current"}
-    out = _polygon_aggregate_chain(results, underlying_price=None)
+        return {"_status": "massive_empty_chain_current"}
+    out = _massive_aggregate_chain(results, underlying_price=None)
     out["_status"] = "ok_current"
     return out
 
 
-def _polygon_historical_snapshot(
+def _massive_historical_snapshot(
     ticker: str, target_date: datetime, api_key: str, requests,
     max_atm_contracts: int = 8,
 ) -> Dict[str, Any]:
@@ -294,27 +297,27 @@ def _polygon_historical_snapshot(
 
     # Step 1: front-month contracts as_of target
     r = requests.get(
-        "https://api.polygon.io/v3/reference/options/contracts",
+        "https://api.massive.com/v3/reference/options/contracts",
         params={"underlying_ticker": ticker, "as_of": target_str, "limit": 250, "apiKey": api_key},
         timeout=20,
     )
     if r.status_code != 200:
-        return {"_status": f"polygon_contracts_status_{r.status_code}"}
+        return {"_status": f"massive_contracts_status_{r.status_code}"}
     contracts = (r.json() or {}).get("results", []) or []
     if not contracts:
-        return {"_status": "polygon_no_contracts_at_date"}
+        return {"_status": "massive_no_contracts_at_date"}
 
     # Step 2: underlying close on target_str
     r = requests.get(
-        f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{target_str}/{target_str}",
+        f"https://api.massive.com/v2/aggs/ticker/{ticker}/range/1/day/{target_str}/{target_str}",
         params={"apiKey": api_key},
         timeout=15,
     )
     if r.status_code != 200:
-        return {"_status": f"polygon_underlying_status_{r.status_code}"}
+        return {"_status": f"massive_underlying_status_{r.status_code}"}
     px_data = (r.json() or {}).get("results") or []
     if not px_data:
-        return {"_status": "polygon_no_underlying_price"}
+        return {"_status": "massive_no_underlying_price"}
     underlying_price = px_data[0].get("c")
 
     # Step 3: filter to front-month (20-60 days to expiry from target)
@@ -332,7 +335,7 @@ def _polygon_historical_snapshot(
         if target_min_exp <= exp_d <= target_max_exp and c.get("strike_price"):
             front.append(c)
     if not front:
-        return {"_status": "polygon_no_front_month_contracts"}
+        return {"_status": "massive_no_front_month_contracts"}
 
     # Step 4: pick the ATM band (closest strikes to underlying), fetch per-contract IV
     front.sort(key=lambda c: abs((c.get("strike_price") or 0) - (underlying_price or 0)))
@@ -344,14 +347,14 @@ def _polygon_historical_snapshot(
         if not ctk:
             continue
         rr = requests.get(
-            f"https://api.polygon.io/v3/snapshot/options/{ticker}/{ctk}",
+            f"https://api.massive.com/v3/snapshot/options/{ticker}/{ctk}",
             params={"as_of": target_str, "apiKey": api_key},
             timeout=12,
         )
         if rr.status_code != 200:
             continue
         snap = (rr.json() or {}).get("results") or {}
-        # Inject the contract details in the shape _polygon_aggregate_chain expects
+        # Inject the contract details in the shape _massive_aggregate_chain expects
         snap["details"] = {
             "contract_type": c.get("contract_type"),
             "strike_price": c.get("strike_price"),
@@ -359,9 +362,9 @@ def _polygon_historical_snapshot(
         chain_results.append(snap)
 
     if not chain_results:
-        return {"_status": "polygon_no_per_contract_iv"}
+        return {"_status": "massive_no_per_contract_iv"}
 
-    out = _polygon_aggregate_chain(chain_results, underlying_price=underlying_price)
+    out = _massive_aggregate_chain(chain_results, underlying_price=underlying_price)
     out["_status"] = f"ok_historical (n_contracts_sampled={len(chain_results)})"
     return out
 
@@ -586,42 +589,63 @@ def _fill_clinicaltrials_gov(
 def _fill_finviz(
     *, ticker: str,
 ) -> Dict[str, Any]:
-    """Finviz Elite analyst recommendation + perf snapshot via the Elite
-    `quote_export` endpoint. Also surfaces target price upside vs current.
+    """Finviz Elite snapshot via `export.ashx` with explicit column codes.
 
-    Insider-transactions backfill is a separate Finviz endpoint
-    (`insider_export.ashx`) — wired here as a follow-up; column shells
-    (insider_buys_count_30d_pre etc.) are reserved in the schema and will
-    be filled by a later commit. v1 just gets analyst recs + target price.
+    The previous attempt used `quote_export.ashx` which returns historical
+    OHLC CSV — wrong endpoint for snapshot data. The correct Elite endpoint
+    is `https://elite.finviz.com/export.ashx?v=151&t=TICKER&c=CODES&auth=KEY`
+    where CODES is a comma-separated list of column numbers from Finviz's
+    snapshot screener.
+
+    Column codes (Finviz Elite snapshot view v=151):
+      1   Ticker             68  Price
+      11  Insider Own        69  Change
+      12  Insider Trans      70  Volume
+      13  Inst Own           65  Recom (1=Strong Buy ... 5=Strong Sell)
+      14  Inst Trans         44  52W Range / 52W High / 52W Low
+      30  Float              57  Beta
+      31  Short Float        66  Average Volume
+      32  Short Ratio        50  Perf YTD
+      67  Target Price       49  Perf Year
+
+    Insider-transactions backfill uses a separate `insider_export.ashx`
+    endpoint and stays deferred (column shells reserved).
     """
     api_key = (os.getenv("FINVIZ_API_KEY") or "").strip()
     if not api_key:
         return {"_status": "no_finviz_key"}
     try:
         import requests
-        url = f"https://elite.finviz.com/quote_export.ashx?t={ticker}&auth={api_key}"
+        # Columns we want:
+        #   1=Ticker, 65=Recom, 67=Target Price, 68=Price, 50=Perf YTD,
+        #   31=Short Float, 32=Short Ratio, 30=Float, 13=Inst Own,
+        #   12=Insider Trans
+        cols = "1,65,67,68,50,31,32,30,13,12"
+        url = (
+            "https://elite.finviz.com/export.ashx"
+            f"?v=151&t={ticker}&c={cols}&auth={api_key}"
+        )
         r = requests.get(url, timeout=20)
         if r.status_code != 200:
             return {"_status": f"finviz_status_{r.status_code}"}
         body = r.text or ""
-        if "Login" in body or "<html" in body[:200]:
-            return {"_status": "finviz_auth_returned_html (key may be invalid or wrong endpoint)"}
-        # quote_export returns CSV — header + one row
-        lines = body.strip().splitlines()
-        if len(lines) < 2:
-            return {"_status": "finviz_empty_response"}
+        if not body or "<html" in body[:200].lower() or "login" in body[:200].lower():
+            return {"_status": "finviz_auth_returned_html (check FINVIZ_API_KEY)"}
+        # CSV — header row + one data row for our single-ticker filter
         import csv, io
         reader = csv.DictReader(io.StringIO(body))
         row = next(reader, None) or {}
-        # Finviz columns of interest: 'Recom' (1=Strong Buy 5=Strong Sell),
-        # 'Target Price', 'Perf YTD', 'Price'
+        if not row:
+            return {"_status": "finviz_empty_response"}
+
         def _to_float(s):
-            if not s or s in ("-", "N/A"):
+            if s is None or s in ("", "-", "N/A"):
                 return None
             try:
                 return float(str(s).replace("%", "").replace("$", "").replace(",", ""))
             except Exception:
                 return None
+
         recom = _to_float(row.get("Recom"))
         target = _to_float(row.get("Target Price"))
         price = _to_float(row.get("Price"))
@@ -630,12 +654,18 @@ def _fill_finviz(
             "analyst_target_price_usd": target,
             "analyst_target_upside_pct": ((target - price) / price * 100) if (target and price) else None,
             "finviz_perf_ytd_pct": _to_float(row.get("Perf YTD")),
-            "finviz_data_source": "finviz_elite_quote_export",
+            "finviz_data_source": "finviz_elite_export_v151",
             "_status": "ok",
+            # Bonus columns we now have access to (not in schema yet — add via
+            # migration 023 if a section chat wants them as feature columns):
+            "_extra_short_float_pct": _to_float(row.get("Short Float")),
+            "_extra_short_ratio": _to_float(row.get("Short Ratio")),
+            "_extra_inst_own_pct": _to_float(row.get("Inst Own")),
+            "_extra_insider_trans_pct": _to_float(row.get("Insider Trans")),
         }
         return out
     except Exception as e:
-        return {"_status": f"finviz_error:{type(e).__name__}:{str(e)[:60]}"}
+        return {"_status": f"finviz_error:{type(e).__name__}:{str(e)[:80]}"}
 
 
 def _fill_pubmed(*, drug_name: Optional[str], catalyst_date: str) -> Dict[str, Any]:
@@ -837,8 +867,8 @@ def compute_event_features(
     statuses["capital_structure"] = cs.pop("_status", "")
     feats.update(cs)
 
-    po = _fill_polygon_options(ticker=ticker, catalyst_date=catalyst_date)
-    statuses["polygon_options"] = po.pop("_status", "")
+    po = _fill_massive_options(ticker=ticker, catalyst_date=catalyst_date)
+    statuses["massive_options"] = po.pop("_status", "")
     feats.update(po)
 
     ins = _fill_sec_insider(ticker=ticker, catalyst_date=catalyst_date)
@@ -1014,7 +1044,7 @@ def get_coverage_report() -> Dict[str, Any]:
               ROUND(100.0 * COUNT(xbi_runup_30d)                / NULLIF(COUNT(*), 0), 1) AS pct_xbi_runup,
               ROUND(100.0 * COUNT(cash_at_date_m)               / NULLIF(COUNT(*), 0), 1) AS pct_cash,
               ROUND(100.0 * COUNT(short_interest_pct_at_date)   / NULLIF(COUNT(*), 0), 1) AS pct_short_interest,
-              ROUND(100.0 * COUNT(atm_iv_at_date)               / NULLIF(COUNT(*), 0), 1) AS pct_polygon_options,
+              ROUND(100.0 * COUNT(atm_iv_at_date)               / NULLIF(COUNT(*), 0), 1) AS pct_massive_options,
               ROUND(100.0 * COUNT(p_approval_at_pred)           / NULLIF(COUNT(*), 0), 1) AS pct_p_approval,
               ROUND(100.0 * COUNT(product_class)                / NULLIF(COUNT(*), 0), 1) AS pct_product_class,
               ROUND(100.0 * COUNT(actual_move_pct_7d)           / NULLIF(COUNT(*), 0), 1) AS pct_actual_7d,
