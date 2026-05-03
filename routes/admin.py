@@ -5612,10 +5612,15 @@ async def refresh_historical_moves():
                 WITH labeled AS (
                   SELECT pco.catalyst_type,
                          LOWER(TRIM(pco.indication)) AS indication,
+                         -- screener_stocks.market_cap is in MILLIONS USD
+                         -- (verified 2026-05-03: LLY=870631 ≈ $870B real).
+                         -- v1 of this query used the wrong unit and put
+                         -- every event in micro_lt500m. Fixed alongside
+                         -- services/move_lookup.py:_bucketize_market_cap.
                          CASE
                            WHEN s.market_cap IS NULL OR s.market_cap = 0 THEN 'unknown'
-                           WHEN s.market_cap < 500000 THEN 'micro_lt500m'
-                           WHEN s.market_cap < 2000000 THEN 'small_500m_2b'
+                           WHEN s.market_cap < 500 THEN 'micro_lt500m'
+                           WHEN s.market_cap < 2000 THEN 'small_500m_2b'
                            ELSE 'mid_or_above'
                          END AS market_cap_bucket,
                          CASE

@@ -1500,27 +1500,21 @@ def get_npv_scenarios(
 ) -> Optional[Dict]:
     """Read the most recent (any params_hash, TTL-non-expired)
     catalyst_npv_cache row for a (ticker, catalyst_id) and return the
-    full payload, augmented with the headline scenario fields the
-    NPV-driven prediction needs.
+    headline scenario fields the NPV-driven prediction needs.
 
-    Returns None if no cache row exists or all rows are expired.
-    Does NOT trigger an LLM compute — that's the lazy-npv-refresh
-    endpoint's job. compute_prediction_v2 calls this; if None, falls
-    back to the statistical model.
+    The actual cached shape (produced by routes/analyze.py:analyze_npv)
+    stores percent moves under `move_estimates` and `npv` subkeys;
+    this function normalises into approval_price/rejection_price for
+    services/prediction_npv.py.
 
-    Returns shape (subset of full_payload, plus normalized fields):
-      {
-        "approval_price": float,         # current_price × (1 + remaining_upside_pct/100)
-        "rejection_price": float,        # max(0.01, current_price × (1 + rejection_pct/100))
-        "current_price": float,
-        "p_approval_used": float,
-        "expected_pct": float,
-        "drug_npv_b": float,             # risked NPV in $B
-        "drug_npv_unrisked_b": float,    # before risk
-        "computed_at": datetime,
-        "params_hash": str,
-        "_full": dict,                   # the original full payload
-      }
+    Lookup precedence:
+      1. (ticker, catalyst_id) exact match if catalyst_id given
+      2. (ticker, catalyst_id IS NULL) fallback — covers events where
+         the cache row was written via a generic /analyze/npv call
+         that didn't set catalyst_id
+      3. (ticker) any non-zero-NPV row, most recent
+
+    Returns None if no usable row exists.
     """
     if not ticker:
         return None
@@ -1529,20 +1523,24 @@ def get_npv_scenarios(
         db = BiotechDatabase()
         with db.get_conn() as conn:
             cur = conn.cursor()
-            # Most recent row, regardless of params_hash, that hasn't TTL'd.
+            # Try exact catalyst_id match first; fallback to ticker-only.
+            # ORDER BY puts exact matches ahead of NULL-catalyst rows.
             cur.execute("""
-                SELECT full_payload, computed_at, ttl, drug_npv_b, params_hash
+                SELECT full_payload, computed_at, ttl, drug_npv_b, params_hash, catalyst_id
                 FROM catalyst_npv_cache
                 WHERE ticker = %s
-                  AND (catalyst_id = %s OR (%s IS NULL AND catalyst_id IS NULL))
+                  AND (catalyst_id = %s OR catalyst_id IS NULL OR %s IS NULL)
+                  AND drug_npv_b IS NOT NULL
                   AND (ttl IS NULL OR ttl > NOW())
-                ORDER BY computed_at DESC
+                ORDER BY (catalyst_id = %s) DESC NULLS LAST,
+                         (drug_npv_b > 0) DESC,
+                         computed_at DESC
                 LIMIT 1
-            """, (ticker, catalyst_id, catalyst_id))
+            """, (ticker, catalyst_id, catalyst_id, catalyst_id))
             row = cur.fetchone()
             if not row:
                 return None
-            payload, computed_at, _ttl, drug_npv_b, params_hash = row
+            payload, computed_at, _ttl, drug_npv_b, params_hash, matched_cat_id = row
 
         if isinstance(payload, str):
             try:
@@ -1552,32 +1550,63 @@ def get_npv_scenarios(
         if not isinstance(payload, dict):
             return None
 
-        # The legacy compute_npv_estimate writes these subkeys:
-        # payload['approval_price'], payload['rejection_price'],
-        # payload['current_price'], payload['p_approval_used'],
-        # payload['expected_pct'].
-        # Some older payloads may not have them — return None so the
-        # caller falls back to statistical instead of returning bogus
-        # numbers.
-        approval_price = payload.get("approval_price")
-        rejection_price = payload.get("rejection_price")
-        current_price = payload.get("current_price")
-        if approval_price is None or rejection_price is None or current_price is None:
+        # Real cache shape: scenario percentages live under move_estimates.
+        # Convert to approval_price / rejection_price so the v2 prediction
+        # math stays simple.
+        npv = payload.get("npv") or {}
+        moves = payload.get("move_estimates") or {}
+
+        current_price = (
+            npv.get("current")
+            or payload.get("current_price")  # legacy direct key, kept for compat
+        )
+        if current_price is None or current_price <= 0:
             return None
 
+        # Prefer move_estimates.scenario_*_pct (the rNPV-derived figures).
+        # Fall back to npv.upside_pct / npv.downside_pct.
+        upside_pct = (
+            moves.get("scenario_upside_pct")
+            if moves.get("scenario_upside_pct") is not None
+            else npv.get("upside_pct")
+        )
+        downside_pct = (
+            moves.get("scenario_downside_pct")
+            if moves.get("scenario_downside_pct") is not None
+            else npv.get("downside_pct")
+        )
+        if upside_pct is None or downside_pct is None:
+            return None
+
+        approval_price = current_price * (1 + float(upside_pct) / 100.0)
+        rejection_price = max(0.01, current_price * (1 + float(downside_pct) / 100.0))
+
         rnpv = payload.get("rnpv", {}) if isinstance(payload, dict) else {}
-        unrisked = (rnpv.get("unrisked_rnpv_m") or 0) / 1000.0
+        unrisked_b = (rnpv.get("unrisked_rnpv_m") or 0) / 1000.0
+        p_approval_used = (
+            moves.get("p_approval_used")
+            or npv.get("p_approval")
+            or payload.get("p_approval_used")
+            or 0.5
+        )
+        expected_pct = (
+            moves.get("expected_value_scenario_pct")
+            or moves.get("expected_value_move_pct")
+            or npv.get("expected_pct")
+            or 0.0
+        )
 
         return {
             "approval_price": float(approval_price),
             "rejection_price": float(rejection_price),
             "current_price": float(current_price),
-            "p_approval_used": float(payload.get("p_approval_used") or 0.5),
-            "expected_pct": float(payload.get("expected_pct") or 0.0),
+            "p_approval_used": float(p_approval_used),
+            "expected_pct": float(expected_pct),
             "drug_npv_b": float(drug_npv_b or 0.0),
-            "drug_npv_unrisked_b": float(unrisked),
+            "drug_npv_unrisked_b": float(unrisked_b),
             "computed_at": computed_at,
             "params_hash": params_hash,
+            "matched_catalyst_id": matched_cat_id,  # NULL means ticker-fallback
             "_full": payload,
         }
     except Exception as e:

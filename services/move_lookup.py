@@ -49,17 +49,25 @@ class MoveDistribution:
 
 
 def _bucketize_market_cap(market_cap: Optional[float]) -> str:
-    """Three-bucket cap-size bucket (matches the population SQL).
+    """Three-bucket cap-size bucket (matches the population SQL in
+    routes/admin.py:refresh_historical_moves).
 
-    The data is 97.8% <500M small-caps; >$2B has essentially no labeled
-    events. Three buckets give all the resolution the data supports.
+    `screener_stocks.market_cap` is denominated in **millions of USD**
+    (verified 2026-05-03: LLY=870631 ≈ $870B real, NTLA=1610 ≈ $1.6B
+    real). v1 of this function mistakenly assumed thousands and put
+    every event in the micro_lt500m bucket; fixed alongside the SQL.
+
+    Boundaries:
+      < $500M      → micro_lt500m
+      $500M - $2B  → small_500m_2b
+      >= $2B       → mid_or_above
     """
     if market_cap is None or market_cap == 0:
         return "unknown"
-    # market_cap is in thousands per screener_stocks convention
-    if market_cap < 500_000:
+    # market_cap is in millions (USD)
+    if market_cap < 500:
         return "micro_lt500m"
-    if market_cap < 2_000_000:
+    if market_cap < 2000:
         return "small_500m_2b"
     return "mid_or_above"
 

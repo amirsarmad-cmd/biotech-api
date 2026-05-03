@@ -130,9 +130,10 @@ def _compute_priced_in_via_cap_npv_ratio(
     if not market_cap or market_cap <= 0:
         return None, "market_cap unavailable from screener_stocks"
 
-    # screener_stocks.market_cap is in thousands. Convert to $B for math.
-    market_cap_b = market_cap / 1_000_000.0
-    cash_b = (cash / 1_000_000.0) if cash else 0.0
+    # screener_stocks.market_cap is in MILLIONS USD (verified 2026-05-03:
+    # LLY=870631 ≈ $870B). Convert to $B for math.
+    market_cap_b = market_cap / 1000.0
+    cash_b = (cash / 1000.0) if cash else 0.0
     enterprise_value_b = max(0.001, market_cap_b - cash_b)
 
     siblings = _fetch_pipeline_npvs(ticker, catalyst_id)
