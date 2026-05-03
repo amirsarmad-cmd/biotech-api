@@ -220,6 +220,55 @@ as empirical, none cited from a backtest.
 
 ---
 
+## Feature store update (2026-05-03 evening)
+
+`alembic/021_catalyst_event_features.py` + `services/feature_store.py` shipped.
+**Use this as the single source of features for all future algo iterations
+— don't recompute features per-algo, query the table.**
+
+Coverage on first 51 backfilled labeled events:
+
+| Column | % populated | Notes |
+|---|---|---|
+| market_cap_at_date_m | 100% | screener_stocks + yfinance fallback |
+| runup_pct_30d/90d | 100% | yfinance live |
+| xbi/ibb_runup_30d | 100% | peer index from yfinance |
+| cash / debt / runway | 96% | SEC EDGAR via `fetch_capital_structure` |
+| short_interest_pct | 98% | yfinance .info |
+| catalyst metadata (p_approval, regime, product_class, cap_bucket) | 100% | catalyst_universe + classifiers |
+| outcome_label_gemini | 100% (mirrored from pco) | |
+| outcome_label_price_proxy | 86% (= pct with actual_move_pct_7d) | derived from 7d move |
+| **atm_iv / iv_skew / put_call_ratio (Polygon)** | 0% | Polygon plan returns 401 on `as_of=` historical chain — needs Options Advanced ($200/mo) for backfill. Current snapshot works on Stocks Starter so upcoming-event coverage is fine. |
+| **drug_npv_b / priced_in_fraction** | 0% | Gemini-bound; fills when cap resets ~2026-05-05 |
+
+Endpoints (admin):
+- `POST /admin/features/apply-migration-021` — idempotent CREATE TABLE
+- `POST /admin/features/backfill-batch?limit=N&only_labeled=true&refresh=false` — incremental, run periodically via cron
+- `POST /admin/features/event/{catalyst_id}?refresh=true` — single event recompute
+- `GET /admin/features/coverage` — population stats per column
+
+To complete the labeled-set backfill (~5790 events): run the batch endpoint
+in `limit=500` chunks every few minutes, or schedule via APScheduler. Each
+event is ~3-5s of yfinance fetches.
+
+## Open decisions surfaced by the backtest + feature store work
+
+1. **Polygon plan upgrade ($200/mo for Options Advanced)?** Without this we
+   can't backfill historical IV / skew / put-call ratios — the priced-in
+   calculator's options-implied side stays the v1 stub returning 0.5. Current
+   snapshots still work on the existing plan for upcoming events.
+2. **NPV cache backfill priority** — only 302 of 5790 labeled events have a
+   cached NPV. Even after Gemini cap resets, the priority is to backfill NPV
+   for events with non-zero `actual_move_pct_7d` so the V2 scenario backtest
+   has training data.
+3. **V2 scenario formula bug** — `drug_npv_b_at_p_now × (0.95/p_now)` extrapolation
+   double-counts risk. The fix is to use `raw_drug_npv_b` from cache (already
+   stored). Will be applied in the section chat that owns the cockpit/scenario.
+4. **Multi-LLM cross-validation labels** — `outcome_label_anthropic` and
+   `outcome_label_openai` columns exist in the schema but aren't filled. Wait
+   until Gemini is back so the load on alternate providers is intentional, not
+   forced.
+
 ## What this spec is NOT
 
 - A defense of the current 80% clamp. The clamp is bad. The point of
