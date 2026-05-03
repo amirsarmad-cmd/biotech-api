@@ -526,6 +526,143 @@ async def db_stats():
         raise HTTPException(500, f"stats error: {e}")
 
 
+# ─── Multi-LLM consensus orchestrator endpoints ───────────────────────────
+
+@router.post("/post-catalyst/consensus-one")
+async def consensus_one(outcome_id: int):
+    """Run the full multi-LLM consensus pipeline on a single
+    post_catalyst_outcomes row. Costs ~$0.05-0.08 per call (with Opus
+    arbiter). Idempotent — won't re-call any LLM whose JSON is already
+    persisted on the row.
+    """
+    try:
+        from services.database import BiotechDatabase
+        from services.multi_llm_consensus import consensus_label_for_outcome
+        db = BiotechDatabase()
+        result = consensus_label_for_outcome(db, outcome_id)
+        if result is None:
+            return {"ok": False, "outcome_id": outcome_id,
+                    "reason": "insufficient_votes (row remains retry-eligible)"}
+        return {"ok": True, "outcome_id": outcome_id, "consensus": result}
+    except Exception as e:
+        logger.exception(f"consensus-one {outcome_id}")
+        raise HTTPException(500, f"consensus-one error: {e}")
+
+
+@router.post("/post-catalyst/consensus-batch")
+async def consensus_batch(n: int = 5, only_with_library: bool = True):
+    """Run consensus on N rows where consensus hasn't been computed yet.
+
+    Picks rows with outcome_label_consensus_at IS NULL,
+    outcome_label_consensus_attempts < 3, ordered by catalyst_date DESC.
+    Runs serially (each row internally parallelizes its 3 readers).
+
+    only_with_library=True (default): also requires that the news library
+    has at least 1 article for that ticker — keeps cost focused on rows
+    where the readers will actually have something to read.
+    """
+    try:
+        from services.database import BiotechDatabase
+        from services.multi_llm_consensus import consensus_label_for_outcome
+        db = BiotechDatabase()
+        with db.get_conn() as conn:
+            with conn.cursor() as cur:
+                if only_with_library:
+                    cur.execute("""
+                        SELECT pco.id
+                        FROM post_catalyst_outcomes pco
+                        WHERE pco.outcome_labeled_at IS NOT NULL
+                          AND pco.outcome_label_consensus_at IS NULL
+                          AND COALESCE(pco.outcome_label_consensus_attempts, 0) < 3
+                          AND pco.catalyst_date IS NOT NULL
+                          AND EXISTS (
+                              SELECT 1 FROM catalyst_event_news cen
+                              WHERE cen.ticker = pco.ticker
+                          )
+                        ORDER BY pco.catalyst_date DESC
+                        LIMIT %s
+                    """, (n,))
+                else:
+                    cur.execute("""
+                        SELECT id FROM post_catalyst_outcomes
+                        WHERE outcome_labeled_at IS NOT NULL
+                          AND outcome_label_consensus_at IS NULL
+                          AND COALESCE(outcome_label_consensus_attempts, 0) < 3
+                          AND catalyst_date IS NOT NULL
+                        ORDER BY catalyst_date DESC
+                        LIMIT %s
+                    """, (n,))
+                ids = [r[0] for r in cur.fetchall()]
+        results = []
+        for oid in ids:
+            try:
+                r = consensus_label_for_outcome(db, oid)
+                results.append({"outcome_id": oid, "ok": r is not None,
+                                "consensus_class": (r.get("majority_reader_class") if r else None),
+                                "votes_received": (r.get("votes_received") if r else 0)})
+            except Exception as e:
+                results.append({"outcome_id": oid, "ok": False, "error": str(e)[:200]})
+        return {"processed": len(ids), "results": results}
+    except Exception as e:
+        logger.exception("consensus-batch")
+        raise HTTPException(500, f"consensus-batch: {e}")
+
+
+@router.get("/post-catalyst/consensus-status")
+async def consensus_status():
+    """Aggregate stats on the consensus pipeline: row counts per
+    consensus class, per-reader agreement-with-Opus rates, avg library
+    size, attempt-failure stats."""
+    try:
+        with _pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                      COUNT(*) FILTER (WHERE outcome_label_consensus_at IS NOT NULL) AS done,
+                      COUNT(*) FILTER (WHERE outcome_label_consensus_at IS NULL
+                                        AND outcome_labeled_at IS NOT NULL
+                                        AND catalyst_date IS NOT NULL) AS pending,
+                      COUNT(*) FILTER (WHERE outcome_label_consensus_attempts >= 3) AS dead_letter,
+                      AVG(news_library_size_at_consensus) FILTER (WHERE news_library_size_at_consensus IS NOT NULL) AS avg_library_size
+                    FROM post_catalyst_outcomes
+                """)
+                done, pending, dead, avg_lib = cur.fetchone()
+                cur.execute("""
+                    SELECT outcome_label_consensus_class, COUNT(*) AS n
+                    FROM post_catalyst_outcomes
+                    WHERE outcome_label_consensus_class IS NOT NULL
+                    GROUP BY outcome_label_consensus_class
+                    ORDER BY n DESC
+                """)
+                by_class = [{"class": r[0], "count": r[1]} for r in cur.fetchall()]
+                # Reader-vs-Opus agreement
+                cur.execute("""
+                    SELECT
+                      SUM(CASE WHEN outcome_label_sonnet_class  = outcome_label_opus_class THEN 1 ELSE 0 END)::float
+                      / NULLIF(COUNT(*) FILTER (WHERE outcome_label_sonnet_class IS NOT NULL AND outcome_label_opus_class IS NOT NULL), 0)
+                        AS sonnet_v_opus,
+                      SUM(CASE WHEN outcome_label_gpt55_class   = outcome_label_opus_class THEN 1 ELSE 0 END)::float
+                      / NULLIF(COUNT(*) FILTER (WHERE outcome_label_gpt55_class IS NOT NULL AND outcome_label_opus_class IS NOT NULL), 0)
+                        AS gpt55_v_opus,
+                      SUM(CASE WHEN outcome_label_gemini3_class = outcome_label_opus_class THEN 1 ELSE 0 END)::float
+                      / NULLIF(COUNT(*) FILTER (WHERE outcome_label_gemini3_class IS NOT NULL AND outcome_label_opus_class IS NOT NULL), 0)
+                        AS gemini3_v_opus
+                    FROM post_catalyst_outcomes
+                    WHERE outcome_label_consensus_at IS NOT NULL
+                """)
+                agr = cur.fetchone()
+        return {
+            "done": done, "pending": pending, "dead_letter": dead,
+            "avg_library_size_at_consensus": float(avg_lib) if avg_lib else None,
+            "by_consensus_class": by_class,
+            "reader_agreement_with_opus": {
+                "sonnet": agr[0], "gpt55": agr[1], "gemini3": agr[2],
+            } if agr else None,
+        }
+    except Exception as e:
+        raise HTTPException(500, f"consensus-status: {e}")
+
+
 # ─── Migration inspection & repair ─────────────────────────────────────────
 
 def _pg_conn():

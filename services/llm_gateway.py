@@ -124,6 +124,16 @@ class LLMResult:
     tokens_input: int
     tokens_output: int
     duration_ms: int
+    # Populated only when capability='grounded_search' AND provider='google'.
+    # grounding_chunks: list of {"uri", "title"} dicts from
+    # response.candidates[0].grounding_metadata.grounding_chunks. These
+    # are the URLs Gemini consulted; the multi-LLM consensus orchestrator
+    # writes them into catalyst_event_news so all downstream readers see
+    # the same enriched library.
+    grounding_chunks: Optional[List[Dict]] = None
+    # search_queries: the actual queries Gemini issued during grounding.
+    # Useful for "why didn't grounded search find X" debugging.
+    search_queries: Optional[List[str]] = None
 
 
 @dataclass
@@ -460,7 +470,13 @@ def _call_openai(api_key, model, prompt, messages, system,
 
 def _call_google(api_key, model, prompt, messages, system,
                  max_tokens, temperature, timeout_s,
-                 grounded: bool) -> Tuple[str, int, int]:
+                 grounded: bool) -> Tuple[str, int, int, Optional[List[Dict]], Optional[List[str]]]:
+    """Returns (text, tokens_in, tokens_out, grounding_chunks, search_queries).
+
+    grounding_chunks/search_queries are populated only when grounded=True
+    and the response had grounding_metadata (Gemini's grounded search did
+    find sources). Both default to None for non-grounded calls.
+    """
     from google import genai as g
     from google.genai import types as gt
     client = g.Client(
@@ -490,7 +506,32 @@ def _call_google(api_key, model, prompt, messages, system,
     usage = getattr(resp, "usage_metadata", None)
     tin = (getattr(usage, "prompt_token_count", 0) or 0) if usage else 0
     tout = (getattr(usage, "candidates_token_count", 0) or 0) if usage else 0
-    return text, tin, tout
+
+    chunks: Optional[List[Dict]] = None
+    queries: Optional[List[str]] = None
+    if grounded:
+        try:
+            cands = getattr(resp, "candidates", None) or []
+            gm = getattr(cands[0], "grounding_metadata", None) if cands else None
+            if gm:
+                raw_chunks = getattr(gm, "grounding_chunks", None) or []
+                # Coerce typed objects into plain dicts
+                chunks = []
+                for c in raw_chunks:
+                    web = getattr(c, "web", None)
+                    if web and getattr(web, "uri", None):
+                        chunks.append({
+                            "uri": web.uri,
+                            "title": getattr(web, "title", None) or "",
+                        })
+                queries = list(getattr(gm, "web_search_queries", None) or []) or None
+                if not chunks:
+                    chunks = None
+        except Exception as e:
+            logger.warning(f"grounding_metadata extract failed: {e}")
+            chunks = None
+            queries = None
+    return text, tin, tout, chunks, queries
 
 
 def _call_openai_embeddings(api_key, model, texts: List[str],
@@ -629,6 +670,8 @@ def llm_call(
                 break
             provider_tries += 1
             t0 = time.time()
+            grounding_chunks: Optional[List[Dict]] = None
+            search_queries: Optional[List[str]] = None
             try:
                 if provider == "anthropic":
                     text, tin, tout = _call_anthropic(
@@ -642,7 +685,7 @@ def llm_call(
                         response_format_json,
                     )
                 elif provider == "google":
-                    text, tin, tout = _call_google(
+                    text, tin, tout, grounding_chunks, search_queries = _call_google(
                         api_key, model, prompt, messages, system,
                         max_tokens, temperature, timeout_s,
                         grounded,
@@ -668,6 +711,8 @@ def llm_call(
                     key_label=label, model=model,
                     tokens_input=tin, tokens_output=tout,
                     duration_ms=duration_ms,
+                    grounding_chunks=grounding_chunks,
+                    search_queries=search_queries,
                 )
 
             except Exception as e:
