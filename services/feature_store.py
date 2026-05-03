@@ -875,15 +875,23 @@ def _fill_finviz_ratings(*, ticker: str, catalyst_date: str, html: Optional[str]
             return {"_status": "no_ratings_table"}
         block = m.group(1)
 
-        # Each row: <td>Date</td> <td>Action</td> <td>Firm</td> <td>RatingChange</td>
-        # <td>Price Target Change</td>
+        # Each row: <td>Date</td> <td><span>Action</span></td> <td>Firm</td>
+        # <td>RatingChange</td> <td>Price Target Change</td>
+        # NOTE: action is wrapped in <span class="fv-label ...">; firm/rating/PT
+        # cells have inline color classes. Use (.*?) + _clean() to handle
+        # nested HTML.
+        def _clean_cell(s):
+            s = re.sub(r"<[^>]+>", "", s).strip()
+            s = s.replace("&nbsp;", " ").replace("&rarr;", "→").replace("&amp;", "&")
+            return s
+
         rows = re.findall(
             r'<tr[^>]*>\s*'
             r'<td[^>]*>([A-Za-z]{3}-\d{1,2}-\d{2})</td>\s*'
-            r'<td[^>]*>([^<]*)</td>\s*'
-            r'<td[^>]*>([^<]*)</td>\s*'
-            r'<td[^>]*>([^<]*)</td>\s*'
-            r'<td[^>]*>([^<]*)</td>',
+            r'<td[^>]*>(.*?)</td>\s*'
+            r'<td[^>]*>(.*?)</td>\s*'
+            r'<td[^>]*>(.*?)</td>\s*'
+            r'<td[^>]*>(.*?)</td>',
             block, re.DOTALL,
         )
         if not rows:
@@ -902,8 +910,9 @@ def _fill_finviz_ratings(*, ticker: str, catalyst_date: str, html: Optional[str]
                 ).date()
             except Exception:
                 continue
-            action = action.strip()
-            firm = firm.strip()
+            action = _clean_cell(action)
+            firm = _clean_cell(firm)
+            pt_change_clean = _clean_cell(pt_change)
             if latest_action is None:
                 latest_action = action
                 latest_firm = firm
@@ -913,7 +922,7 @@ def _fill_finviz_ratings(*, ticker: str, catalyst_date: str, html: Optional[str]
                     upgrades += 1
                 elif "Downgrade" in action:
                     downgrades += 1
-                if pt_change.strip() and pt_change.strip() not in ("-", "&nbsp;"):
+                if pt_change_clean and pt_change_clean not in ("-", ""):
                     pt_changes += 1
 
         return {
@@ -960,17 +969,24 @@ def _fill_finviz_insider_full(*, ticker: str, catalyst_date: str, html: Optional
             return {"_status": "no_insider_table_found"}
         block = m.group(1)
 
-        # Match rows: insider name, relationship/title, date, transaction, cost,
-        # shares, value, total, link. Tolerant regex.
+        # Match rows: insider name (wrapped in <a> with no closing </a>),
+        # relationship, date (format "Mar 02 '26"), transaction (wrapped in
+        # <span>), cost, shares, value, etc. Use (.*?) + clean for cells
+        # with nested HTML.
+        def _clean_cell(s):
+            s = re.sub(r"<[^>]+>", "", s).strip()
+            s = s.replace("&nbsp;", " ").replace("&amp;", "&")
+            return s
+
         rows = re.findall(
-            r'<tr[^>]*>\s*'
-            r'<td[^>]*>(?:<a[^>]*>)?([^<]+)(?:</a>)?</td>\s*'   # insider name
-            r'<td[^>]*>([^<]+)</td>\s*'                          # relationship
-            r'<td[^>]*>([A-Za-z]{3}\s+\d{1,2})</td>\s*'          # date (e.g. "Apr 15")
-            r'<td[^>]*>([^<]+)</td>\s*'                          # transaction
-            r'<td[^>]*>([^<]+)</td>\s*'                          # cost
-            r'<td[^>]*>([^<]+)</td>\s*'                          # shares
-            r'<td[^>]*>([^<]+)</td>',                            # value $
+            r'<tr[^>]*class="fv-insider-row[^"]*"[^>]*>\s*'
+            r'<td[^>]*>(.*?)</td>\s*'                                # insider name (in <a>)
+            r'<td[^>]*>(.*?)</td>\s*'                                # relationship
+            r'<td[^>]*>([A-Za-z]{3}\s+\d{1,2}\s+\'\d{2})</td>\s*'   # date "Mar 02 '26"
+            r'<td[^>]*>(.*?)</td>\s*'                                # transaction (in <span>)
+            r'<td[^>]*>(.*?)</td>\s*'                                # cost
+            r'<td[^>]*>(.*?)</td>\s*'                                # shares
+            r'<td[^>]*>(.*?)</td>',                                  # value $
             block, re.DOTALL,
         )
         if not rows:
@@ -980,15 +996,16 @@ def _fill_finviz_insider_full(*, ticker: str, catalyst_date: str, html: Optional
         cd_only = cd.date()
         d30_cutoff = cd_only - timedelta(days=30)
 
-        def _parse_finviz_short_date(s: str) -> Optional[date]:
-            # e.g. "Apr 15" — needs year inference (closest year ≤ catalyst_date)
+        def _parse_finviz_insider_date(s: str) -> Optional[date]:
+            # Format: "Mar 02 '26" — year is the apostrophe-2-digit
             try:
-                month_day = datetime.strptime(s.strip(), "%b %d")
-                year = cd.year
-                candidate = month_day.replace(year=year).date()
-                if candidate > cd_only:
-                    candidate = candidate.replace(year=year - 1)
-                return candidate
+                m = re.match(r"([A-Za-z]{3})\s+(\d{1,2})\s+'(\d{2})", s.strip())
+                if not m:
+                    return None
+                month_str, day_str, year_str = m.groups()
+                return datetime.strptime(
+                    f"{month_str} {int(day_str)} 20{year_str}", "%b %d %Y"
+                ).date()
             except Exception:
                 return None
 
@@ -1012,22 +1029,22 @@ def _fill_finviz_insider_full(*, ticker: str, catalyst_date: str, html: Optional
         top_buyer_value = 0.0
 
         for name, rel, date_str, tx, cost, shares, value in rows:
-            d = _parse_finviz_short_date(date_str)
+            d = _parse_finviz_insider_date(date_str)
             if d is None or d > cd_only or d < d30_cutoff:
                 continue
-            tx_clean = tx.strip()
-            value_usd = _to_float(value)
-            rel_clean = rel.strip()
+            tx_clean = _clean_cell(tx)
+            value_usd = _to_float(_clean_cell(value))
+            rel_clean = _clean_cell(rel)
             is_named = any(t.lower() in rel_clean.lower() for t in _NAMED_OFFICER_TITLES)
             if not is_named:
                 continue
-            if any(c in tx_clean for c in _INSIDER_BUY_CODES):
+            if any(c.lower() in tx_clean.lower() for c in _INSIDER_BUY_CODES):
                 named_buys += 1
                 named_buy_value += value_usd
                 if value_usd > top_buyer_value:
                     top_buyer_value = value_usd
                     top_buyer_title = rel_clean[:60]
-            elif any(c in tx_clean for c in _INSIDER_SELL_CODES):
+            elif any(c.lower() in tx_clean.lower() for c in _INSIDER_SELL_CODES):
                 named_sells += 1
 
         return {
