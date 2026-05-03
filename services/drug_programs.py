@@ -322,18 +322,24 @@ def _milestone_for(catalyst_type: Optional[str]) -> Optional[str]:
 
 def _status_from_outcome(
     outcome_label_class: Optional[str],
-    actual_move_pct_30d: Optional[float],
+    actual_move_pct_calibration: Optional[float],
     is_future: bool,
 ) -> str:
-    """Status for a single event: pending | success | mixed | failure | delayed | unknown."""
+    """Status for a single event: pending | success | mixed | failure | delayed | unknown.
+
+    `actual_move_pct_calibration` should be the 7d move (or whatever calibration
+    window the caller chooses) — 7d is the practitioner consensus for biotech
+    catalysts because 1d misses analyst revisions + hedge unwind, while 30d
+    is contaminated by exogenous news.
+    """
     if is_future:
         return "pending"
     if not outcome_label_class or outcome_label_class == "UNKNOWN":
         # Fall back on price action if available
-        if actual_move_pct_30d is not None:
-            if actual_move_pct_30d > 15:
+        if actual_move_pct_calibration is not None:
+            if actual_move_pct_calibration > 15:
                 return "success"
-            if actual_move_pct_30d < -15:
+            if actual_move_pct_calibration < -15:
                 return "failure"
             return "mixed"
         return "unknown"
@@ -404,7 +410,8 @@ def get_drug_programs_for_ticker(ticker: str) -> dict[str, Any]:
               -- joined outcome row (may be null for upcoming events)
               pco.id AS outcome_id, pco.pre_event_price, pco.day1_price,
               pco.day7_price, pco.day30_price, pco.actual_move_pct_1d,
-              pco.actual_move_pct_30d, pco.predicted_move_pct, pco.predicted_prob,
+              pco.actual_move_pct_7d, pco.actual_move_pct_30d,
+              pco.predicted_move_pct, pco.predicted_prob,
               pco.outcome_label_class, pco.outcome_label_confidence,
               pco.options_implied_move_pct,
               -- v2 columns (may be null until shadow mode populates them)
@@ -489,9 +496,12 @@ def get_drug_programs_for_ticker(ticker: str) -> dict[str, Any]:
             except Exception:
                 is_future = False
             milestone = _milestone_for_with_class(e.get("catalyst_type"), product_class)
+            # Prefer 7d for the calibration-window fallback; 30d as a backstop
+            # if 7d hasn't been backfilled yet.
+            calib_move = e.get("actual_move_pct_7d") if e.get("actual_move_pct_7d") is not None else e.get("actual_move_pct_30d")
             status = _status_from_outcome(
                 e.get("outcome_label_class"),
-                float(e["actual_move_pct_30d"]) if e.get("actual_move_pct_30d") is not None else None,
+                float(calib_move) if calib_move is not None else None,
                 is_future,
             )
             clean_events.append({
@@ -512,7 +522,11 @@ def get_drug_programs_for_ticker(ticker: str) -> dict[str, Any]:
                 "day1_price": float(e["day1_price"]) if e.get("day1_price") is not None else None,
                 "day30_price": float(e["day30_price"]) if e.get("day30_price") is not None else None,
                 "actual_move_pct_1d": float(e["actual_move_pct_1d"]) if e.get("actual_move_pct_1d") is not None else None,
+                # 7d move: better calibration than 1d for biotech catalysts —
+                # captures analyst revisions + hedge unwind + approval-halo fade.
+                "actual_move_pct_7d": float(e["actual_move_pct_7d"]) if e.get("actual_move_pct_7d") is not None else None,
                 "actual_move_pct_30d": float(e["actual_move_pct_30d"]) if e.get("actual_move_pct_30d") is not None else None,
+                "day7_price": float(e["day7_price"]) if e.get("day7_price") is not None else None,
                 "options_implied_move_pct": float(e["options_implied_move_pct"]) if e.get("options_implied_move_pct") is not None else None,
                 # Predictions (legacy + v2)
                 "predicted_move_pct": float(e["predicted_move_pct"]) if e.get("predicted_move_pct") is not None else None,
