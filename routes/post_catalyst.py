@@ -197,6 +197,14 @@ async def admin_apply_migration_022():
     return {"ok": True}
 
 
+@router.post("/admin/features/apply-migration-023")
+async def admin_apply_migration_023():
+    """Add Finnhub-sourced columns (insider, price-target dispersion,
+    recommendation trends, news sentiment) to catalyst_event_features."""
+    _apply_migration_module("023_finnhub_columns.py")
+    return {"ok": True}
+
+
 @router.post("/admin/features/backfill-batch")
 async def admin_features_backfill_batch(
     limit: int = Query(100, ge=1, le=2000),

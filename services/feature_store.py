@@ -733,6 +733,178 @@ def _fill_finviz(
         return {"_status": f"finviz_error:{type(e).__name__}:{str(e)[:80]}"}
 
 
+# ────────────────────────────────────────────────────────────
+# Finnhub (insider transactions, price-target dispersion, news sentiment)
+# ────────────────────────────────────────────────────────────
+
+def _fill_finnhub_insider(
+    *, ticker: str, catalyst_date: str,
+) -> Dict[str, Any]:
+    """Insider transactions (Form 4) + sentiment from Finnhub.
+    Endpoint: /stock/insider-transactions?symbol=&from=&to= and /stock/insider-sentiment.
+    Replaces the SEC Form 4 stub — Finnhub already parses the raw filings.
+    """
+    api_key = (os.getenv("FINNHUB_API_KEY") or "").strip()
+    if not api_key:
+        return {"_status": "no_finnhub_key"}
+    try:
+        import requests
+        cd = datetime.fromisoformat(catalyst_date[:10])
+        d30_start = (cd - timedelta(days=30)).strftime("%Y-%m-%d")
+        d90_start = (cd - timedelta(days=90)).strftime("%Y-%m-%d")
+        end = cd.strftime("%Y-%m-%d")
+        out: Dict[str, Any] = {"finnhub_data_source": "finnhub_v1"}
+
+        # 1. Insider transactions in 30d window pre-catalyst
+        r = requests.get(
+            "https://finnhub.io/api/v1/stock/insider-transactions",
+            params={"symbol": ticker, "from": d30_start, "to": end, "token": api_key},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            return {"_status": f"insider_status_{r.status_code}", **out}
+        txs = (r.json() or {}).get("data", []) or []
+        # transactionCode: P=purchase, S=sale, A=award/grant, D=disposition
+        buys = [t for t in txs if (t.get("transactionCode") or "").upper() == "P"]
+        sells = [t for t in txs if (t.get("transactionCode") or "").upper() == "S"]
+        out["finnhub_insider_buys_30d_pre"] = len(buys)
+        out["finnhub_insider_sells_30d_pre"] = len(sells)
+        # Net value: sum(buy_value) - sum(sell_value); value = share × transactionPrice
+        def _val(t):
+            sh = t.get("share") or 0
+            pr = t.get("transactionPrice") or 0
+            return float(sh) * float(pr)
+        buy_value = sum(_val(t) for t in buys)
+        sell_value = sum(_val(t) for t in sells)
+        out["finnhub_insider_net_value_usd_30d_pre"] = round(buy_value - sell_value, 2)
+
+        # 2. Insider sentiment (mspr = monthly share purchase ratio, avg over 3 months)
+        r = requests.get(
+            "https://finnhub.io/api/v1/stock/insider-sentiment",
+            params={"symbol": ticker, "from": d90_start, "to": end, "token": api_key},
+            timeout=15,
+        )
+        if r.status_code == 200:
+            sent_data = (r.json() or {}).get("data", []) or []
+            msprs = [d.get("mspr") for d in sent_data if d.get("mspr") is not None]
+            if msprs:
+                out["finnhub_insider_sentiment_3m"] = round(sum(msprs) / len(msprs), 3)
+
+        out["_status"] = "ok"
+        return out
+    except Exception as e:
+        return {"_status": f"finnhub_insider_error:{type(e).__name__}:{str(e)[:60]}"}
+
+
+def _fill_finnhub_price_target(
+    *, ticker: str,
+) -> Dict[str, Any]:
+    """Analyst price target dispersion. Endpoint: /stock/price-target.
+    Returns count + low/high/median — dispersion is a calibration signal
+    (narrow consensus = high analyst confidence; wide = uncertainty)."""
+    api_key = (os.getenv("FINNHUB_API_KEY") or "").strip()
+    if not api_key:
+        return {"_status": "no_finnhub_key"}
+    try:
+        import requests
+        r = requests.get(
+            "https://finnhub.io/api/v1/stock/price-target",
+            params={"symbol": ticker, "token": api_key},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            return {"_status": f"target_status_{r.status_code}"}
+        d = r.json() or {}
+        high = d.get("targetHigh")
+        low = d.get("targetLow")
+        median = d.get("targetMedian") or d.get("targetMean")
+        out = {
+            "finnhub_target_high_usd": float(high) if high else None,
+            "finnhub_target_low_usd": float(low) if low else None,
+            "finnhub_target_median_usd": float(median) if median else None,
+        }
+        if high and low and median and median > 0:
+            out["finnhub_target_dispersion_pct"] = round(
+                (float(high) - float(low)) / float(median) * 100, 2
+            )
+        out["_status"] = "ok" if any(out.values()) else "no_target_data"
+        return out
+    except Exception as e:
+        return {"_status": f"finnhub_target_error:{type(e).__name__}"}
+
+
+def _fill_finnhub_recommendation(
+    *, ticker: str, catalyst_date: str,
+) -> Dict[str, Any]:
+    """Analyst recommendation trends — buy/hold/sell counts, latest period
+    + change vs 3 months ago. Endpoint: /stock/recommendation."""
+    api_key = (os.getenv("FINNHUB_API_KEY") or "").strip()
+    if not api_key:
+        return {"_status": "no_finnhub_key"}
+    try:
+        import requests
+        r = requests.get(
+            "https://finnhub.io/api/v1/stock/recommendation",
+            params={"symbol": ticker, "token": api_key},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            return {"_status": f"recom_status_{r.status_code}"}
+        recs = r.json() or []
+        if not recs:
+            return {"_status": "no_recommendation_data"}
+        # Sort by period DESC (Finnhub usually returns sorted, but be safe)
+        recs.sort(key=lambda x: x.get("period", ""), reverse=True)
+        latest = recs[0]
+        out = {
+            "finnhub_buy_count": (latest.get("buy") or 0) + (latest.get("strongBuy") or 0),
+            "finnhub_hold_count": latest.get("hold") or 0,
+            "finnhub_sell_count": (latest.get("sell") or 0) + (latest.get("strongSell") or 0),
+        }
+        # 3-month delta in buy count (latest vs ~3 periods back, since Finnhub returns monthly)
+        if len(recs) >= 4:
+            three_ago = recs[3]
+            three_ago_buy = (three_ago.get("buy") or 0) + (three_ago.get("strongBuy") or 0)
+            out["finnhub_buy_count_change_3m"] = out["finnhub_buy_count"] - three_ago_buy
+        out["_status"] = "ok"
+        return out
+    except Exception as e:
+        return {"_status": f"finnhub_recom_error:{type(e).__name__}"}
+
+
+def _fill_finnhub_news_sentiment(
+    *, ticker: str,
+) -> Dict[str, Any]:
+    """News sentiment + buzz scores. Endpoint: /news-sentiment.
+    Totally new signal — we had no pre-event sentiment data before this."""
+    api_key = (os.getenv("FINNHUB_API_KEY") or "").strip()
+    if not api_key:
+        return {"_status": "no_finnhub_key"}
+    try:
+        import requests
+        r = requests.get(
+            "https://finnhub.io/api/v1/news-sentiment",
+            params={"symbol": ticker, "token": api_key},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            return {"_status": f"news_status_{r.status_code}"}
+        d = r.json() or {}
+        sent = d.get("sentiment") or {}
+        buzz = d.get("buzz") or {}
+        out = {
+            "finnhub_news_bullish_pct": (sent.get("bullishPercent") * 100) if sent.get("bullishPercent") is not None else None,
+            "finnhub_news_bearish_pct": (sent.get("bearishPercent") * 100) if sent.get("bearishPercent") is not None else None,
+            "finnhub_news_buzz_articles_week": buzz.get("articlesInLastWeek"),
+            "finnhub_news_buzz_score": buzz.get("buzz"),
+            "finnhub_company_news_score": d.get("companyNewsScore"),
+        }
+        out["_status"] = "ok" if any(v is not None for v in out.values()) else "no_news_sentiment_data"
+        return out
+    except Exception as e:
+        return {"_status": f"finnhub_news_error:{type(e).__name__}"}
+
+
 def _fill_pubmed(*, drug_name: Optional[str], catalyst_date: str) -> Dict[str, Any]:
     """PubMed publication count per drug — deferred. NCBI E-utilities API:
     https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term=DRUG&datetype=pdat&mindate=YYYY/MM/DD
@@ -960,6 +1132,23 @@ def compute_event_features(
     fv = _fill_finviz(ticker=ticker)
     statuses["finviz"] = fv.pop("_status", "")
     feats.update({k: v for k, v in fv.items() if not k.startswith("_")})
+
+    # Finnhub — insider, price-target dispersion, recommendation trends, news sentiment
+    fh_ins = _fill_finnhub_insider(ticker=ticker, catalyst_date=catalyst_date)
+    statuses["finnhub_insider"] = fh_ins.pop("_status", "")
+    feats.update({k: v for k, v in fh_ins.items() if not k.startswith("_")})
+
+    fh_tgt = _fill_finnhub_price_target(ticker=ticker)
+    statuses["finnhub_price_target"] = fh_tgt.pop("_status", "")
+    feats.update({k: v for k, v in fh_tgt.items() if not k.startswith("_")})
+
+    fh_rec = _fill_finnhub_recommendation(ticker=ticker, catalyst_date=catalyst_date)
+    statuses["finnhub_recommendation"] = fh_rec.pop("_status", "")
+    feats.update({k: v for k, v in fh_rec.items() if not k.startswith("_")})
+
+    fh_news = _fill_finnhub_news_sentiment(ticker=ticker)
+    statuses["finnhub_news"] = fh_news.pop("_status", "")
+    feats.update({k: v for k, v in fh_news.items() if not k.startswith("_")})
 
     # Stubs for v2:
     statuses["pubmed"] = _fill_pubmed(drug_name=drug_name, catalyst_date=catalyst_date)["_status"]
