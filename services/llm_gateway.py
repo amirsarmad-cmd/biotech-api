@@ -268,11 +268,15 @@ class ProviderPool:
             s["last_error_at"] = time.time()
             s["last_error_kind"] = kind
             s["last_error_text"] = (err_text or "")[:200]
-            if kind in ("rate_limit", "quota", "timeout", "auth"):
+            if kind in ("rate_limit", "quota", "timeout", "auth", "not_found"):
                 if model is not None:
                     # Cool only this (key, model) pair so the next
                     # model in the chain can still try this key.
-                    s["model_cooling"][model] = time.time() + _KEY_COOLDOWN_SECONDS
+                    # not_found is permanent for this model on the API;
+                    # use a long cooldown so the gateway doesn't waste
+                    # cycles re-trying it.
+                    cooldown = _KEY_COOLDOWN_SECONDS * (12 if kind == "not_found" else 1)
+                    s["model_cooling"][model] = time.time() + cooldown
                 else:
                     # Legacy callers without a model: cool the whole key
                     s["cooling_until"] = time.time() + _KEY_COOLDOWN_SECONDS
@@ -406,6 +410,11 @@ def classify_error(err_text: str) -> str:
         return "transient"
     if "401" in err_text or "403" in err_text or "permission" in e or "api key" in e or "unauthorized" in e:
         return "auth"
+    # 404 on a specific model means "this model ID doesn't exist for this
+    # API version" — try the next model in the chain instead of breaking
+    # out of the provider entirely.
+    if "404" in err_text or "not_found" in e or "is not found" in e or "not supported for" in e:
+        return "not_found"
     return "other"
 
 
@@ -465,10 +474,15 @@ def _call_openai(api_key, model, prompt, messages, system,
     msgs.extend(_coerce_messages(prompt, messages))
     kwargs = {
         "model": model,
-        "temperature": temperature,
         "messages": msgs,
     }
-    if _openai_uses_max_completion_tokens(model):
+    # GPT-5/o-series only accept the default temperature (1) — passing a
+    # custom value gets a 400 "Unsupported value". Older gpt-4o and
+    # earlier accept any 0.0-2.0.
+    is_new_series = _openai_uses_max_completion_tokens(model)
+    if not is_new_series:
+        kwargs["temperature"] = temperature
+    if is_new_series:
         kwargs["max_completion_tokens"] = max_tokens
     else:
         kwargs["max_tokens"] = max_tokens
@@ -477,17 +491,22 @@ def _call_openai(api_key, model, prompt, messages, system,
     try:
         resp = client.chat.completions.create(**kwargs)
     except Exception as e:
-        # Fallback: if the heuristic guessed wrong (model returns
-        # "Unsupported parameter: 'max_tokens'" or vice versa), retry
-        # with the other param. Cheap insurance against new model IDs.
+        # Fallbacks: retry with the alternate param shape if the API
+        # complains. Cheap insurance against new model IDs.
         msg = str(e)
+        retried = False
         if "max_completion_tokens" in msg and "max_tokens" in kwargs:
             kwargs.pop("max_tokens", None)
             kwargs["max_completion_tokens"] = max_tokens
-            resp = client.chat.completions.create(**kwargs)
+            retried = True
         elif "max_tokens" in msg and "max_completion_tokens" in kwargs:
             kwargs.pop("max_completion_tokens", None)
             kwargs["max_tokens"] = max_tokens
+            retried = True
+        if "temperature" in msg and "temperature" in kwargs:
+            kwargs.pop("temperature", None)
+            retried = True
+        if retried:
             resp = client.chat.completions.create(**kwargs)
         else:
             raise
@@ -767,11 +786,15 @@ def llm_call(
                 # If the error is non-key-specific (e.g. "other" — bad
                 # request shape), don't waste more keys/models on this
                 # provider; fall through to next provider.
+                # "not_found" is per-model: cool the (key, model) and let
+                # the loop pick the next model in the chain (e.g. fall
+                # gemini-3.0-pro → gemini-2.5-pro).
                 if kind == "other":
                     break
                 # Else loop and let pool.select() pick the next
                 # (key, model) combination — this is what gives us the
-                # Flash→Pro fallback within the same key.
+                # Flash→Pro fallback within the same key, AND the
+                # newer-model→stable-model fallback (gemini-3 → 2.5-pro).
 
         # Done with this provider's budget; loop to next provider.
 
