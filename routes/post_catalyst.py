@@ -21,6 +21,7 @@ from services.post_catalyst_tracker import (
 from services.scenario_algo import backtest_scenario_algo
 from services.feature_store import (
     backfill_features_batch, compute_event_features, get_coverage_report,
+    refresh_dynamic_columns_batch,
 )
 
 logger = logging.getLogger(__name__)
@@ -203,6 +204,31 @@ async def admin_apply_migration_023():
     recommendation trends, news sentiment) to catalyst_event_features."""
     _apply_migration_module("023_finnhub_columns.py")
     return {"ok": True}
+
+
+@router.post("/admin/features/apply-migration-024")
+async def admin_apply_migration_024():
+    """Add Finviz quote-page extension columns (news, ratings, insider full
+    table) + dynamic_refresh_at timestamp."""
+    _apply_migration_module("024_finviz_dynamic_columns.py")
+    return {"ok": True}
+
+
+@router.post("/admin/features/refresh-dynamic-columns")
+async def admin_refresh_dynamic_columns(
+    days_ahead: int = Query(90, ge=1, le=365),
+    limit: int = Query(200, ge=1, le=2000),
+):
+    """Refresh ONLY the rolling/dynamic columns (Finviz news, ratings,
+    insider; Finnhub recommendation + news sentiment) for upcoming events
+    within `days_ahead` days. These sources change continuously; past
+    events stay frozen at their backfill snapshot. Designed to be called
+    by a daily cron routine."""
+    try:
+        return refresh_dynamic_columns_batch(days_ahead=days_ahead, limit=limit)
+    except Exception as e:
+        logger.exception("refresh_dynamic_columns failed")
+        raise HTTPException(500, f"refresh error: {e}")
 
 
 @router.post("/admin/features/backfill-batch")

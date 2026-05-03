@@ -734,6 +734,314 @@ def _fill_finviz(
 
 
 # ────────────────────────────────────────────────────────────
+# Finviz quote-page extensions: news / ratings / insider full table
+# All three scrape from the same page — single fetch, three parses.
+# ────────────────────────────────────────────────────────────
+
+# Sources we treat as "high quality" for the news_high_quality_present flag
+_FINVIZ_HIGH_QUALITY_SOURCES = {
+    "Bloomberg", "Reuters", "WSJ", "Wall Street Journal", "FT",
+    "Financial Times", "Barron's", "CNBC", "Forbes", "MarketWatch",
+}
+
+
+def _fetch_finviz_quote_html(ticker: str) -> Optional[str]:
+    """Single fetch of the Finviz quote page — reused by news / ratings /
+    insider scrapers. Returns None on failure."""
+    try:
+        import requests
+        api_key = (os.getenv("FINVIZ_API_KEY") or "").strip()
+        url = (f"https://elite.finviz.com/quote.ashx?t={ticker}&auth={api_key}"
+               if api_key else f"https://finviz.com/quote.ashx?t={ticker}")
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+            ),
+        }
+        r = requests.get(url, headers=headers, timeout=20)
+        if r.status_code == 200:
+            return r.text
+        return None
+    except Exception:
+        return None
+
+
+def _fill_finviz_news(*, ticker: str, catalyst_date: str, html: Optional[str] = None) -> Dict[str, Any]:
+    """News-table scrape: count + source diversity + high-quality-source flag.
+    Date format on Finviz: 'May-01-26 04:01PM' for first of day, 'HH:MMAM/PM'
+    for subsequent same-day rows.
+    """
+    if html is None:
+        html = _fetch_finviz_quote_html(ticker)
+    if not html:
+        return {"_status": "no_html"}
+    try:
+        import re
+        # News table rows have onclick="trackAndOpenNews(event, 'SOURCE', '...')"
+        # paired with the date in the first <td>. Extract source + date pairs.
+        # Pattern matches: onclick="trackAndOpenNews(event, 'GlobeNewswire', '/news/...')"
+        # immediately following or preceding a <td> with date text.
+        # Simpler: parse the whole news-table block.
+        m = re.search(r'<table[^>]*id="news-table"[^>]*>(.*?)</table>', html, re.DOTALL)
+        if not m:
+            return {"_status": "no_news_table"}
+        block = m.group(1)
+
+        # Each row pairs a date-td with a source onclick handler.
+        rows = re.findall(
+            r'<td[^>]*align="right"[^>]*>\s*([A-Za-z]{3}-\d{1,2}-\d{2}\s+\d{1,2}:\d{2}[AP]M|\d{1,2}:\d{2}[AP]M)\s*</td>'
+            r'.*?trackAndOpenNews\(event,\s*[\'"]([^\'"]+)[\'"]',
+            block, re.DOTALL,
+        )
+        if not rows:
+            return {"_status": "news_table_empty_after_parse"}
+
+        # Forward-fill dates: rows with only HH:MMAM/PM inherit the previous full date
+        cd = datetime.fromisoformat(catalyst_date[:10])
+        cd_only = cd.date()
+        d7_cutoff = cd_only - timedelta(days=7)
+        d30_cutoff = cd_only - timedelta(days=30)
+        last_date: Optional[date] = None
+        count_7d = 0
+        count_30d = 0
+        sources_30d: List[str] = []
+        latest_date_str: Optional[str] = None
+
+        for raw_date, source in rows:
+            # If the date string contains a hyphenated month (e.g. "May-01-26"),
+            # parse fully; otherwise use the previously seen date.
+            full_date = None
+            mm = re.match(r'([A-Za-z]{3})-(\d{1,2})-(\d{2})', raw_date)
+            if mm:
+                month_str, day_str, year_str = mm.groups()
+                try:
+                    parsed = datetime.strptime(
+                        f"{month_str} {int(day_str)} 20{year_str}", "%b %d %Y"
+                    ).date()
+                    full_date = parsed
+                    last_date = parsed
+                    if latest_date_str is None:
+                        latest_date_str = parsed.isoformat()
+                except ValueError:
+                    pass
+            elif last_date:
+                full_date = last_date
+
+            if not full_date:
+                continue
+
+            if full_date <= cd_only and full_date >= d30_cutoff:
+                count_30d += 1
+                sources_30d.append(source)
+            if full_date <= cd_only and full_date >= d7_cutoff:
+                count_7d += 1
+
+        unique_sources = sorted(set(sources_30d))
+        from collections import Counter
+        top_sources = ", ".join(s for s, _ in Counter(sources_30d).most_common(5))
+        high_quality_present = any(
+            any(hq.lower() in src.lower() for hq in _FINVIZ_HIGH_QUALITY_SOURCES)
+            for src in unique_sources
+        )
+        return {
+            "finviz_news_count_7d_pre": count_7d,
+            "finviz_news_count_30d_pre": count_30d,
+            "finviz_news_source_count_30d": len(unique_sources),
+            "finviz_news_top_sources": top_sources,
+            "finviz_news_high_quality_present": high_quality_present,
+            "finviz_news_latest_date": latest_date_str,
+            "_status": f"ok ({count_30d} news in 30d pre)",
+        }
+    except Exception as e:
+        return {"_status": f"news_error:{type(e).__name__}:{str(e)[:60]}"}
+
+
+def _fill_finviz_ratings(*, ticker: str, catalyst_date: str, html: Optional[str] = None) -> Dict[str, Any]:
+    """Analyst ratings table — chronological upgrade/downgrade events with
+    firm names + price target changes.
+    """
+    if html is None:
+        html = _fetch_finviz_quote_html(ticker)
+    if not html:
+        return {"_status": "no_html"}
+    try:
+        import re
+        m = re.search(
+            r'<table[^>]*class="js-table-ratings[^"]*"[^>]*>(.*?)</table>',
+            html, re.DOTALL,
+        )
+        if not m:
+            return {"_status": "no_ratings_table"}
+        block = m.group(1)
+
+        # Each row: <td>Date</td> <td>Action</td> <td>Firm</td> <td>RatingChange</td>
+        # <td>Price Target Change</td>
+        rows = re.findall(
+            r'<tr[^>]*>\s*'
+            r'<td[^>]*>([A-Za-z]{3}-\d{1,2}-\d{2})</td>\s*'
+            r'<td[^>]*>([^<]*)</td>\s*'
+            r'<td[^>]*>([^<]*)</td>\s*'
+            r'<td[^>]*>([^<]*)</td>\s*'
+            r'<td[^>]*>([^<]*)</td>',
+            block, re.DOTALL,
+        )
+        if not rows:
+            return {"_status": "ratings_table_empty"}
+
+        cd_only = datetime.fromisoformat(catalyst_date[:10]).date()
+        d30_cutoff = cd_only - timedelta(days=30)
+        upgrades = downgrades = pt_changes = 0
+        latest_action = latest_firm = latest_date_str = None
+
+        for raw_date, action, firm, rating_change, pt_change in rows:
+            try:
+                month_str, day_str, year_str = raw_date.split("-")
+                d = datetime.strptime(
+                    f"{month_str} {int(day_str)} 20{year_str}", "%b %d %Y"
+                ).date()
+            except Exception:
+                continue
+            action = action.strip()
+            firm = firm.strip()
+            if latest_action is None:
+                latest_action = action
+                latest_firm = firm
+                latest_date_str = d.isoformat()
+            if d <= cd_only and d >= d30_cutoff:
+                if "Upgrade" in action:
+                    upgrades += 1
+                elif "Downgrade" in action:
+                    downgrades += 1
+                if pt_change.strip() and pt_change.strip() not in ("-", "&nbsp;"):
+                    pt_changes += 1
+
+        return {
+            "finviz_analyst_upgrades_30d_pre": upgrades,
+            "finviz_analyst_downgrades_30d_pre": downgrades,
+            "finviz_analyst_pt_changes_30d_pre": pt_changes,
+            "finviz_analyst_latest_action": latest_action,
+            "finviz_analyst_latest_firm": latest_firm,
+            "finviz_analyst_latest_date": latest_date_str,
+            "_status": f"ok (parsed {len(rows)} rows)",
+        }
+    except Exception as e:
+        return {"_status": f"ratings_error:{type(e).__name__}:{str(e)[:60]}"}
+
+
+# Insider transaction codes that count as a real BUY (not grant/option exercise)
+_INSIDER_BUY_CODES = {"P", "Buy"}
+_INSIDER_SELL_CODES = {"S", "Sale"}
+_NAMED_OFFICER_TITLES = {"CEO", "CFO", "Director", "President", "Chairman", "Chief"}
+
+
+def _fill_finviz_insider_full(*, ticker: str, catalyst_date: str, html: Optional[str] = None) -> Dict[str, Any]:
+    """Insider transactions full table — extract named-officer transactions
+    (filter out compensation grants). Finviz HTML structure: rows in the
+    table after the snapshot table, with columns: Insider | Relationship |
+    Date | Transaction | Cost | #Shares | Value ($) | #Shares Total | SEC Form 4.
+    """
+    if html is None:
+        html = _fetch_finviz_quote_html(ticker)
+    if not html:
+        return {"_status": "no_html"}
+    try:
+        import re
+        # Insider table is identified by 'body-table' class + 'insider' in the row classes
+        # OR by the 'Insider Trading' header. Conservative match: find table with
+        # 'Insider Trading' nearby.
+        # Easier path: find rows with class="cursor-pointer..." that come after
+        # an <a href> linking to /insidertrading/. Limited to 100 rows.
+        m = re.search(
+            r'<table[^>]*class="[^"]*body-table[^"]*"[^>]*>(.*?)</table>',
+            html, re.DOTALL,
+        )
+        if not m:
+            return {"_status": "no_insider_table_found"}
+        block = m.group(1)
+
+        # Match rows: insider name, relationship/title, date, transaction, cost,
+        # shares, value, total, link. Tolerant regex.
+        rows = re.findall(
+            r'<tr[^>]*>\s*'
+            r'<td[^>]*>(?:<a[^>]*>)?([^<]+)(?:</a>)?</td>\s*'   # insider name
+            r'<td[^>]*>([^<]+)</td>\s*'                          # relationship
+            r'<td[^>]*>([A-Za-z]{3}\s+\d{1,2})</td>\s*'          # date (e.g. "Apr 15")
+            r'<td[^>]*>([^<]+)</td>\s*'                          # transaction
+            r'<td[^>]*>([^<]+)</td>\s*'                          # cost
+            r'<td[^>]*>([^<]+)</td>\s*'                          # shares
+            r'<td[^>]*>([^<]+)</td>',                            # value $
+            block, re.DOTALL,
+        )
+        if not rows:
+            return {"_status": "insider_table_no_rows_parsed"}
+
+        cd = datetime.fromisoformat(catalyst_date[:10])
+        cd_only = cd.date()
+        d30_cutoff = cd_only - timedelta(days=30)
+
+        def _parse_finviz_short_date(s: str) -> Optional[date]:
+            # e.g. "Apr 15" — needs year inference (closest year ≤ catalyst_date)
+            try:
+                month_day = datetime.strptime(s.strip(), "%b %d")
+                year = cd.year
+                candidate = month_day.replace(year=year).date()
+                if candidate > cd_only:
+                    candidate = candidate.replace(year=year - 1)
+                return candidate
+            except Exception:
+                return None
+
+        def _to_int(s: str) -> int:
+            s = re.sub(r"[^\d-]", "", s)
+            try:
+                return int(s)
+            except Exception:
+                return 0
+
+        def _to_float(s: str) -> float:
+            s = re.sub(r"[^\d.\-]", "", s)
+            try:
+                return float(s)
+            except Exception:
+                return 0.0
+
+        named_buys = named_sells = 0
+        named_buy_value = 0.0
+        top_buyer_title: Optional[str] = None
+        top_buyer_value = 0.0
+
+        for name, rel, date_str, tx, cost, shares, value in rows:
+            d = _parse_finviz_short_date(date_str)
+            if d is None or d > cd_only or d < d30_cutoff:
+                continue
+            tx_clean = tx.strip()
+            value_usd = _to_float(value)
+            rel_clean = rel.strip()
+            is_named = any(t.lower() in rel_clean.lower() for t in _NAMED_OFFICER_TITLES)
+            if not is_named:
+                continue
+            if any(c in tx_clean for c in _INSIDER_BUY_CODES):
+                named_buys += 1
+                named_buy_value += value_usd
+                if value_usd > top_buyer_value:
+                    top_buyer_value = value_usd
+                    top_buyer_title = rel_clean[:60]
+            elif any(c in tx_clean for c in _INSIDER_SELL_CODES):
+                named_sells += 1
+
+        return {
+            "finviz_insider_buys_named_30d": named_buys,
+            "finviz_insider_sells_named_30d": named_sells,
+            "finviz_insider_buy_value_named_usd_30d": round(named_buy_value, 2) if named_buy_value else 0,
+            "finviz_insider_top_buyer_title": top_buyer_title,
+            "_status": f"ok (named: {named_buys} buys / {named_sells} sells in 30d)",
+        }
+    except Exception as e:
+        return {"_status": f"insider_full_error:{type(e).__name__}:{str(e)[:60]}"}
+
+
+# ────────────────────────────────────────────────────────────
 # Finnhub (insider transactions, price-target dispersion, news sentiment)
 # ────────────────────────────────────────────────────────────
 
@@ -1133,6 +1441,22 @@ def compute_event_features(
     statuses["finviz"] = fv.pop("_status", "")
     feats.update({k: v for k, v in fv.items() if not k.startswith("_")})
 
+    # Finviz quote-page extensions: news + ratings + insider full table.
+    # Single fetch shared across the three fillers (avoids triple-fetching
+    # the same ~250KB page).
+    finviz_html = _fetch_finviz_quote_html(ticker)
+    fv_news = _fill_finviz_news(ticker=ticker, catalyst_date=catalyst_date, html=finviz_html)
+    statuses["finviz_news"] = fv_news.pop("_status", "")
+    feats.update({k: v for k, v in fv_news.items() if not k.startswith("_")})
+
+    fv_ratings = _fill_finviz_ratings(ticker=ticker, catalyst_date=catalyst_date, html=finviz_html)
+    statuses["finviz_ratings"] = fv_ratings.pop("_status", "")
+    feats.update({k: v for k, v in fv_ratings.items() if not k.startswith("_")})
+
+    fv_ins_full = _fill_finviz_insider_full(ticker=ticker, catalyst_date=catalyst_date, html=finviz_html)
+    statuses["finviz_insider_full"] = fv_ins_full.pop("_status", "")
+    feats.update({k: v for k, v in fv_ins_full.items() if not k.startswith("_")})
+
     # Finnhub — insider, price-target dispersion, recommendation trends, news sentiment
     fh_ins = _fill_finnhub_insider(ticker=ticker, catalyst_date=catalyst_date)
     statuses["finnhub_insider"] = fh_ins.pop("_status", "")
@@ -1281,6 +1605,88 @@ def backfill_features_batch(
         "errors": errors,
         "error_samples": error_samples,
         "_filter": {"only_labeled": only_labeled, "refresh": refresh, "limit": limit},
+    }
+
+
+def refresh_dynamic_columns_batch(*, days_ahead: int = 90, limit: int = 200) -> Dict[str, Any]:
+    """Refresh ONLY the rolling/dynamic columns (Finviz news, ratings,
+    insider; Finnhub recommendation + news sentiment) for upcoming events
+    where catalyst_date is within the next `days_ahead` days. These sources
+    change continuously; past events stay frozen at their backfill snapshot.
+
+    Single fetch per ticker (the shared Finviz quote-page HTML); per-ticker
+    cost is the same as one full backfill but only touches ~9 columns,
+    not the full row.
+    """
+    db = BiotechDatabase()
+    today_iso = date.today().isoformat()
+    horizon_iso = (date.today() + timedelta(days=days_ahead)).isoformat()
+
+    with db.get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT cef.catalyst_id, cef.ticker, cef.catalyst_date::text
+            FROM catalyst_event_features cef
+            WHERE cef.catalyst_date >= %s
+              AND cef.catalyst_date <= %s
+            ORDER BY cef.catalyst_date ASC
+            LIMIT %s
+            """,
+            (today_iso, horizon_iso, limit),
+        )
+        targets = cur.fetchall()
+
+    if not targets:
+        return {"checked": 0, "refreshed": 0, "_note": f"no upcoming events between {today_iso} and {horizon_iso}"}
+
+    refreshed = errors = 0
+    error_samples: List[Dict[str, Any]] = []
+    for cid, ticker, cdate in targets:
+        try:
+            html = _fetch_finviz_quote_html(ticker)
+            updates: Dict[str, Any] = {}
+            updates.update({k: v for k, v in
+                            _fill_finviz_news(ticker=ticker, catalyst_date=cdate, html=html).items()
+                            if not k.startswith("_")})
+            updates.update({k: v for k, v in
+                            _fill_finviz_ratings(ticker=ticker, catalyst_date=cdate, html=html).items()
+                            if not k.startswith("_")})
+            updates.update({k: v for k, v in
+                            _fill_finviz_insider_full(ticker=ticker, catalyst_date=cdate, html=html).items()
+                            if not k.startswith("_")})
+            updates.update({k: v for k, v in
+                            _fill_finnhub_recommendation(ticker=ticker, catalyst_date=cdate).items()
+                            if not k.startswith("_")})
+            updates.update({k: v for k, v in
+                            _fill_finnhub_news_sentiment(ticker=ticker).items()
+                            if not k.startswith("_")})
+
+            if not updates:
+                continue
+            # COALESCE-style update: NULLs from a failed source don't clobber
+            set_clauses = ", ".join(
+                f"{c} = COALESCE(%s, {c})" for c in updates.keys()
+            )
+            sql = (f"UPDATE catalyst_event_features SET {set_clauses}, "
+                   f"dynamic_refresh_at = NOW(), updated_at = NOW() "
+                   f"WHERE catalyst_id = %s")
+            with db.get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute(sql, list(updates.values()) + [cid])
+                conn.commit()
+            refreshed += 1
+        except Exception as e:
+            errors += 1
+            if len(error_samples) < 5:
+                error_samples.append({"catalyst_id": cid, "error": f"{type(e).__name__}: {str(e)[:100]}"})
+
+    return {
+        "checked": len(targets),
+        "refreshed": refreshed,
+        "errors": errors,
+        "error_samples": error_samples,
+        "horizon_days": days_ahead,
     }
 
 
