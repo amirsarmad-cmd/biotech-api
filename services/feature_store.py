@@ -193,103 +193,174 @@ def _fill_peer_relative(
 def _fill_polygon_options(
     *, ticker: str, catalyst_date: str,
 ) -> Dict[str, Any]:
-    """Options chain via Polygon's `/v3/snapshot/options/{ticker}` endpoint.
+    """Polygon options — current snapshot for upcoming events; two-step
+    historical (contracts list + per-contract snapshot) for past events.
 
-    Strategy: for upcoming or recent events (catalyst_date within ±14 days
-    of today), use the CURRENT snapshot (no `as_of`) — works on Stocks
-    Starter+ plans. For older historical events, use `as_of=YYYY-MM-DD`
-    which requires Options Advanced plan; if the response is 401/403, we
-    accept NULL columns and report the status so the operator knows to
-    upgrade the plan if they want backfill of historical options chains.
+    Endpoints used:
+      - /v3/snapshot/options/{ticker}                          — current chain
+      - /v3/reference/options/contracts?as_of=                 — historical chain inventory
+      - /v3/snapshot/options/{ticker}/{contract}?as_of=        — historical per-contract IV
+      - /v2/aggs/ticker/{ticker}/range/1/day/{date}/{date}     — underlying close
     """
     api_key = os.getenv("POLYGON_API_KEY")
     if not api_key:
         return {"_status": "no_polygon_key"}
-    out: Dict[str, Any] = {}
+
     try:
         import requests
         cd = datetime.fromisoformat(catalyst_date[:10])
         days_from_today = abs((cd - datetime.now()).days)
-        url = f"https://api.polygon.io/v3/snapshot/options/{ticker}"
-        params: Dict[str, Any] = {"limit": 250, "apiKey": api_key}
-        if days_from_today > 14:
-            # Historical snapshot — requires Options Advanced plan
-            params["as_of"] = (cd - timedelta(days=1)).strftime("%Y-%m-%d")
-            mode = "historical_snapshot"
-        else:
-            mode = "current_snapshot"
-        r = requests.get(url, params=params, timeout=20)
-        if r.status_code in (401, 403):
-            return {
-                "_status": (
-                    f"polygon_{r.status_code}_{mode}: "
-                    "current snapshot needs Stocks Starter+; historical (as_of=) needs Options Advanced. "
-                    "Upgrade plan or accept NULL options columns for these dates."
-                ),
-            }
-        if r.status_code != 200:
-            return {"_status": f"polygon_status_{r.status_code}_{mode}"}
-        data = r.json()
-        results = data.get("results", []) or []
-        if not results:
-            return {"_status": "polygon_empty_chain"}
-
-        # Compute aggregates from the chain
-        call_oi = 0
-        put_oi = 0
-        call_volume = 0
-        put_volume = 0
-        atm_calls: List[Tuple[float, float]] = []   # (strike, iv)
-        atm_puts: List[Tuple[float, float]] = []
-        underlying_price = None
-        for opt in results:
-            details = opt.get("details") or {}
-            ctype = (details.get("contract_type") or "").lower()
-            strike = details.get("strike_price")
-            ua = opt.get("underlying_asset") or {}
-            if underlying_price is None:
-                underlying_price = ua.get("price")
-            day = opt.get("day") or {}
-            oi = day.get("open_interest") or 0
-            vol = day.get("volume") or 0
-            iv = (opt.get("implied_volatility") or 0) * 100  # to %
-            if ctype == "call":
-                call_oi += oi
-                call_volume += vol
-                if strike and iv > 0:
-                    atm_calls.append((strike, iv))
-            elif ctype == "put":
-                put_oi += oi
-                put_volume += vol
-                if strike and iv > 0:
-                    atm_puts.append((strike, iv))
-
-        out["put_call_oi_ratio"] = (put_oi / call_oi) if call_oi else None
-        out["put_call_volume_ratio"] = (put_volume / call_volume) if call_volume else None
-
-        # ATM IV: closest-strike IV per side, then average
-        if underlying_price and atm_calls and atm_puts:
-            atm_calls.sort(key=lambda x: abs(x[0] - underlying_price))
-            atm_puts.sort(key=lambda x: abs(x[0] - underlying_price))
-            atm_call_iv = atm_calls[0][1]
-            atm_put_iv = atm_puts[0][1]
-            out["atm_iv_at_date"] = (atm_call_iv + atm_put_iv) / 2
-
-            # 25-delta skew: approximate with strikes ±10% from spot
-            target_low = underlying_price * 0.90
-            target_high = underlying_price * 1.10
-            puts_25d = [iv for s, iv in atm_puts if s <= target_low]
-            calls_25d = [iv for s, iv in atm_calls if s >= target_high]
-            if puts_25d and calls_25d:
-                out["iv_skew_25d"] = sum(calls_25d) / len(calls_25d) - sum(puts_25d) / len(puts_25d)
-
-            # Implied move from straddle proxy
-            out["options_implied_move_pct"] = (atm_call_iv + atm_put_iv) / 2 * math.sqrt(7 / 252)
-
-        out["options_source"] = "polygon"
-        out["_status"] = "ok"
+        if days_from_today <= 7:
+            return _polygon_current_snapshot(ticker, api_key, requests)
+        return _polygon_historical_snapshot(ticker, cd, api_key, requests)
     except Exception as e:
-        return {"_status": f"polygon_error:{type(e).__name__}:{str(e)[:60]}"}
+        return {"_status": f"polygon_error:{type(e).__name__}:{str(e)[:80]}"}
+
+
+def _polygon_aggregate_chain(results: list, underlying_price: Optional[float]) -> Dict[str, Any]:
+    """Common aggregation logic for both current + historical chain results."""
+    out: Dict[str, Any] = {"options_source": "polygon"}
+    call_oi = put_oi = call_volume = put_volume = 0
+    atm_calls: List[Tuple[float, float]] = []
+    atm_puts: List[Tuple[float, float]] = []
+
+    for opt in results:
+        details = opt.get("details") or {}
+        ctype = (details.get("contract_type") or "").lower()
+        strike = details.get("strike_price")
+        if underlying_price is None:
+            ua = opt.get("underlying_asset") or {}
+            underlying_price = ua.get("price")
+        day = opt.get("day") or {}
+        oi = day.get("open_interest") or 0
+        vol = day.get("volume") or 0
+        iv = (opt.get("implied_volatility") or 0) * 100
+        if ctype == "call":
+            call_oi += oi
+            call_volume += vol
+            if strike and iv > 0:
+                atm_calls.append((strike, iv))
+        elif ctype == "put":
+            put_oi += oi
+            put_volume += vol
+            if strike and iv > 0:
+                atm_puts.append((strike, iv))
+
+    out["put_call_oi_ratio"] = (put_oi / call_oi) if call_oi else None
+    out["put_call_volume_ratio"] = (put_volume / call_volume) if call_volume else None
+
+    if underlying_price and atm_calls and atm_puts:
+        atm_calls.sort(key=lambda x: abs(x[0] - underlying_price))
+        atm_puts.sort(key=lambda x: abs(x[0] - underlying_price))
+        atm_call_iv = atm_calls[0][1]
+        atm_put_iv = atm_puts[0][1]
+        out["atm_iv_at_date"] = (atm_call_iv + atm_put_iv) / 2
+        # 25d skew approx — strikes ±10% from spot
+        target_low = underlying_price * 0.90
+        target_high = underlying_price * 1.10
+        puts_25d = [iv for s, iv in atm_puts if s <= target_low]
+        calls_25d = [iv for s, iv in atm_calls if s >= target_high]
+        if puts_25d and calls_25d:
+            out["iv_skew_25d"] = sum(calls_25d) / len(calls_25d) - sum(puts_25d) / len(puts_25d)
+        # Implied move = ATM IV × sqrt(days_to_expiry / 252); use 7 as the calibration window
+        out["options_implied_move_pct"] = (atm_call_iv + atm_put_iv) / 2 * math.sqrt(7 / 252)
+    return out
+
+
+def _polygon_current_snapshot(ticker: str, api_key: str, requests) -> Dict[str, Any]:
+    """Current chain — works on Options Starter+ plans."""
+    url = f"https://api.polygon.io/v3/snapshot/options/{ticker}"
+    r = requests.get(url, params={"limit": 250, "apiKey": api_key}, timeout=20)
+    if r.status_code != 200:
+        return {"_status": f"polygon_current_status_{r.status_code}"}
+    results = (r.json() or {}).get("results", []) or []
+    if not results:
+        return {"_status": "polygon_empty_chain_current"}
+    out = _polygon_aggregate_chain(results, underlying_price=None)
+    out["_status"] = "ok_current"
+    return out
+
+
+def _polygon_historical_snapshot(
+    ticker: str, target_date: datetime, api_key: str, requests,
+    max_atm_contracts: int = 8,
+) -> Dict[str, Any]:
+    """Historical chain via two-step: contracts list as_of, then per-contract
+    snapshot for the ATM-band contracts (limit to ~8 to control API spend).
+    """
+    target_str = (target_date - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    # Step 1: front-month contracts as_of target
+    r = requests.get(
+        "https://api.polygon.io/v3/reference/options/contracts",
+        params={"underlying_ticker": ticker, "as_of": target_str, "limit": 250, "apiKey": api_key},
+        timeout=20,
+    )
+    if r.status_code != 200:
+        return {"_status": f"polygon_contracts_status_{r.status_code}"}
+    contracts = (r.json() or {}).get("results", []) or []
+    if not contracts:
+        return {"_status": "polygon_no_contracts_at_date"}
+
+    # Step 2: underlying close on target_str
+    r = requests.get(
+        f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{target_str}/{target_str}",
+        params={"apiKey": api_key},
+        timeout=15,
+    )
+    if r.status_code != 200:
+        return {"_status": f"polygon_underlying_status_{r.status_code}"}
+    px_data = (r.json() or {}).get("results") or []
+    if not px_data:
+        return {"_status": "polygon_no_underlying_price"}
+    underlying_price = px_data[0].get("c")
+
+    # Step 3: filter to front-month (20-60 days to expiry from target)
+    target_min_exp = (target_date + timedelta(days=20)).date()
+    target_max_exp = (target_date + timedelta(days=60)).date()
+    front: List[Dict[str, Any]] = []
+    for c in contracts:
+        exp = c.get("expiration_date")
+        if not exp:
+            continue
+        try:
+            exp_d = datetime.fromisoformat(exp).date()
+        except Exception:
+            continue
+        if target_min_exp <= exp_d <= target_max_exp and c.get("strike_price"):
+            front.append(c)
+    if not front:
+        return {"_status": "polygon_no_front_month_contracts"}
+
+    # Step 4: pick the ATM band (closest strikes to underlying), fetch per-contract IV
+    front.sort(key=lambda c: abs((c.get("strike_price") or 0) - (underlying_price or 0)))
+    sample = front[:max_atm_contracts]
+
+    chain_results: List[Dict[str, Any]] = []
+    for c in sample:
+        ctk = c.get("ticker")
+        if not ctk:
+            continue
+        rr = requests.get(
+            f"https://api.polygon.io/v3/snapshot/options/{ticker}/{ctk}",
+            params={"as_of": target_str, "apiKey": api_key},
+            timeout=12,
+        )
+        if rr.status_code != 200:
+            continue
+        snap = (rr.json() or {}).get("results") or {}
+        # Inject the contract details in the shape _polygon_aggregate_chain expects
+        snap["details"] = {
+            "contract_type": c.get("contract_type"),
+            "strike_price": c.get("strike_price"),
+        }
+        chain_results.append(snap)
+
+    if not chain_results:
+        return {"_status": "polygon_no_per_contract_iv"}
+
+    out = _polygon_aggregate_chain(chain_results, underlying_price=underlying_price)
+    out["_status"] = f"ok_historical (n_contracts_sampled={len(chain_results)})"
     return out
 
 
